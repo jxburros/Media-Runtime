@@ -77,3 +77,21 @@
 - The TypeScript service is frozen at 0.3.0 when the rewrite starts and archived after 0.5.0.
 - Language split across the project: Go for the runtime, Python for the reference and owned
   Engine backends, Rust recommended for Engine's native backend (decided in Engine phase E6).
+- Dependency policy: standard library first; a third-party module is accepted only when it does
+  something unsafe or impractical to own, is pinned by checksum and isolated in one package. Every
+  module is listed in the ledger below with its justification; adding one is a recorded decision.
+
+## Dependency ledger — Go runtime (planned 0.4.0)
+
+| Module               | Why it is not owned code                                                   |
+| -------------------- | -------------------------------------------------------------------------- |
+| modernc.org/sqlite   | Durable atomic admission, idempotency and event sequences; pure Go, no cgo |
+
+Standard library only: `net/http` (API and SSE), `crypto/tls` (network mode and remote workers),
+`encoding/json`, `flag`, `os/exec` (owned worker supervision), `archive/zip` (frame archive
+checks), terminal dashboard via ANSI escapes. Rejected: `bubbletea`/`tview` (the 0.3.0 dashboard
+already needs no library), `cobra` (stdlib `flag` suffices), any HTTP router or validation
+framework (strict decoding with `DisallowUnknownFields` and hand-written range checks).
+
+The gateway client package keeps TypeScript's zero-dependency profile: it uses `fetch` and no
+third-party module.

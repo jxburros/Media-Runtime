@@ -181,6 +181,10 @@ Job events use `job_state`, `stage`, `progress`, `output` and `error`, each with
 
 Errors return `error.code`, a readable `error.message`, optional `error.field`, and `request_id`. Invalid requests use `400`, authorization uses `401/403`, inaccessible resources use `404`, conflicts use `409`, and unavailable backends use `503`. A returned error MUST NOT include secrets or uncontrolled worker stderr.
 
+## Dependency policy
+
+The runtime relies on other libraries and services as little as is practical. Standard library first. A third-party dependency is accepted only when it does something unsafe or impractical to own (SQLite durability, TLS), is pinned by checksum, and is isolated in one package so it can be replaced. Adding one is a recorded decision in [docs/decisions.md](docs/decisions.md), which keeps a ledger of every dependency with its justification. From 0.4.0 the service binary carries one third-party module, the SQLite driver; HTTP, SSE, TLS, JSON, the CLI and the terminal dashboard are standard library and owned code. No external service is used: no telemetry, no downloads, no registries.
+
 ## Storage and access
 
 Runtime metadata, active models and working files stay on local hot storage. Outputs are immutable after publication and include MIME type, size and digest. Export does not remove originals. Cleanup policies are explicit and configurable, preserve active jobs and undelivered worker outputs, and expose expiry in metadata. A formerly available output returns `410` when its authorized metadata survives but its bytes no longer do.
@@ -270,9 +274,10 @@ A worker entry may name a remote `https://` URL when it also names a client cert
 
 `image-to-video` is a recipe pipeline on the `svd` family (protocol 1.3). The default recipe `animate` takes an uploaded PNG whose dimensions MUST match the input and fall within the model's advertised sizes, and resolves `frames`, `fps`, `motion`, `noise_augmentation`, `steps`, `seed` and `decode_chunk` from request, recipe and worker defaults.
 
-- Outputs are `video` (`video/mp4`) and `poster` (`image/png`); both are verified by size and digest, and the MP4 by its container signature, before success. The job and manifest record frame count, frame rate and duration from the worker's output record.
-- The per-MIME output limit for video defaults to 256 MiB; export writes `.mp4` and `.png`. The dashboard shows frames and duration; images and videos open in an external viewer.
-- Studio imports the video as a Studio-owned file with provenance and the poster as its preview.
+- Outputs are `frames` (`application/zip`, one lossless PNG per frame plus `frames.json`) and `poster` (`image/png`); both are verified by size and digest, the archive by its ZIP signature and the presence of `frames.json`, before success. The job and manifest record frame count, frame rate and duration from the worker's output record.
+- When the worker advertises `video/mp4` in its output formats, the job additionally commits `video`; the runtime never encodes video itself and never requires it.
+- The per-MIME output limit for the frame archive defaults to 256 MiB; export writes `.zip`, `.png` and, when present, `.mp4`. The dashboard shows frames and duration; frames and videos open in external tools.
+- Studio imports the archive (and the video when present) as Studio-owned files with provenance and the poster as the preview.
 
 ### Audio
 
@@ -284,7 +289,7 @@ Runtime 0.4.0 is a Go rewrite of the 0.3.0 service, delivered before any other d
 
 - The rewrite MUST preserve the HTTP API, error codes, SSE semantics, configuration file, environment variables, SQLite schema and state directory layout, manifest schema, CLI commands, flags, output and exit codes of 0.3.0. A 0.3.0 state directory MUST be served by 0.4.0 without migration.
 - Parity is proven by running the 0.3.0 integration and dashboard test suites against the Go binary with Engine 0.3.0 before those suites are ported to Go.
-- The service ships as one static binary with no cgo and a pure-Go SQLite driver; dependencies are pinned in the module files and the toolchain version is recorded with the release.
+- The service ships as one static binary with no cgo and exactly one third-party module, a pure-Go SQLite driver. The dashboard renders with ANSI escapes as the 0.3.0 dashboard does, and the CLI uses the standard flag package; dependencies are pinned in the module files and the toolchain version is recorded with the release.
 - The typed gateway client used by Studio remains a TypeScript package maintained in this repository; it is the only TypeScript retained, and it gains every later output, recipe and worker type.
 - 0.4.0 MUST NOT include any capability beyond 0.3.0. The TypeScript service is frozen when the rewrite starts and retired after the first Go feature release.
 

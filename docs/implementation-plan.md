@@ -73,10 +73,12 @@ goroutine per worker, mutual TLS from the standard library), so the rewrite land
 - SQLite through `modernc.org/sqlite` (pure Go) with the same schema, WAL mode and FULL
   synchronous setting as `src/store.ts`, so an existing 0.3.0 state directory opens unchanged.
 - `net/http` for the API and SSE; `encoding/json` with `DisallowUnknownFields` and hand-written
-  range checks replacing zod's `.strict()` schemas; `crypto/tls` reserved for R4; `bubbletea` for
-  the dashboard; stdlib `flag` with subcommands for the CLI, keeping every command, flag, exit
+  range checks replacing zod's `.strict()` schemas; `crypto/tls` reserved for R4; the dashboard rendered
+  with ANSI escapes and `os.Stdin` raw mode exactly as `src/tui.ts` does today, no TUI library;
+  stdlib `flag` with subcommands for the CLI, keeping every command, flag, exit
   code and `--json` shape from `src/cli.ts`.
-- Dependencies are pinned in `go.mod`/`go.sum`; the release records the Go toolchain version in
+- The SQLite driver is the only third-party module. Dependencies are pinned in
+  `go.mod`/`go.sum`; the release records the Go toolchain version and the dependency ledger in
   `docs/decisions.md` as the TypeScript release recorded Node.
 
 ### R0.2 Parity contract
@@ -159,11 +161,11 @@ this mapping; responsibilities move, names do not:
   `outputRecord` schema with optional `frames`, `fps`, `duration_seconds`, `sample_rate`,
   `channels` for later phases.
 - `src/config.ts`: `max_output_bytes` becomes `max_output_bytes: { "image/png": 33554432,
-  "video/mp4": 268435456, "audio/wav": 67108864 }` with a numeric form accepted as the PNG
+  "application/zip": 268435456, "video/mp4": 268435456, "audio/wav": 67108864 }` with a numeric form accepted as the PNG
   value for existing configs.
 - `src/runtime.ts` `commitOutputs()`: iterate `snapshot.outputs`, require the set of IDs the
   worker advertised for the task (`caps.task_parameters[task].outputs`), verify each by size,
-  SHA-256 and a per-MIME signature check (PNG today; MP4/WAV checks added in R5/R6 behind a
+  SHA-256 and a per-MIME signature check (PNG today; ZIP/MP4/WAV checks added in R5/R6 behind a
   `signatures` map in `contracts.ts`), write `outputs/<job>/<output_id>.<ext>`, fsync all, then
   the manifest, then the database. Record per-output seeds (`seed + k − 1`) in the job.
 - `src/server.ts`: `/v1/jobs/{id}/outputs/{output_id}` serves any committed ID with its MIME
@@ -356,16 +358,20 @@ a remote process, and no plain-HTTP non-loopback listener can be configured.
 - `src/contracts.ts`: `PROTOCOLS` adds 1.3; `TASKS` adds `image-to-video`; family `svd`;
   parameters `frames`, `fps`, `motion`, `noise_augmentation`, `decode_chunk`; default recipe
   `animate` (`inputs.image` required, defaults from the worker's `task_defaults`). `signatures`
-  gains an MP4 check (`ftyp` box at offset 4).
+  gains a ZIP check (`PK\x03\x04`, central directory present, `frames.json` entry) and an MP4
+  check (`ftyp` box at offset 4) for the optional output; both are owned code on `archive/zip`.
 - `src/runtime.ts` `resolve()`: width/height equal the input and must be in the worker's
   advertised `video_sizes`; forbid `count`, `adapters`, `tile`; `commitOutputs()` verifies
-  `video` and `poster` and records `frames`, `fps`, `duration_seconds`.
-- `src/server.ts`: outputs route serves `video/mp4` with `Content-Length`; manifest (schema 5)
-  includes the video facts. `src/cli.ts`: `run animate --model svd-xt --image frame.png
-  --frames 25 --fps 7`; export writes `.mp4` and `.png`. `src/tui.ts`: frames/duration column.
+  `frames` and `poster`, plus `video` when the worker's `output_formats` lists `video/mp4`,
+  and records `frames`, `fps`, `duration_seconds`. The runtime never encodes video.
+- `src/server.ts`: outputs route serves `application/zip` and `video/mp4` with
+  `Content-Length`; manifest (schema 5) includes the video facts. `src/cli.ts`: `run animate
+  --model svd-xt --image frame.png --frames 25 --fps 7`; export writes `.zip`, `.png` and `.mp4`
+  when present. `src/tui.ts`: frames/duration column.
 - `src/client.ts`: video output types for Studio's adapter; Studio imports the video and poster
   (tracked in Studio's repository).
-- Tests: the fixture's two-frame MP4 runs end-to-end, container signature verified, size limit
+- Tests: the fixture's two-frame archive runs end-to-end, archive signature and `frames.json`
+  verified, an optional `video` output committed when the fixture advertises it, size limit
   enforced from the per-MIME map, a 1.2 fixture refuses the task; `docs/decisions.md` 0.9.0
   records the reference bundle and the video output limit.
 
@@ -401,6 +407,8 @@ lists each tested combination.
   applied by `migrateJob()` in `src/store.ts`. Manifest schemas are versioned (3 in R1, 4 in R2,
   5 in R5) and older manifests are never rewritten. Config accepts the previous release's shape
   for one release before removal is even considered.
+- **Dependency ledger.** `docs/decisions.md` lists every Go module with its justification; the
+  binary stays at one third-party module unless a release records why another is accepted.
 - **Gateway client.** `src/client.ts` (after R0, `gateway-client/`) is Studio's typed entry point; every new output type,
   recipe shape and worker field is added there in the same change, and the Studio adapter work
   is listed in that phase's CHANGELOG entry as a companion task.
