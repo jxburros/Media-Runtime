@@ -12,11 +12,11 @@ import {
   ApiError,
   hash,
   recipeSchema,
-  PROTOCOL,
+  PROTOCOLS,
   terminal,
 } from "./contracts.js";
 import { Runtime } from "./runtime.js";
-import { buildBundle } from "./models.js";
+import { buildAdapter, buildBundle, inspectCatalog } from "./models.js";
 export function createRuntimeServer(runtime: Runtime) {
   const streams = new Set<ServerResponse>();
   const server = createServer(async (req, res) => {
@@ -27,13 +27,19 @@ export function createRuntimeServer(runtime: Runtime) {
       res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(body));
     }
-    async function body() {
-      let text = "";
+    async function raw(limit: number) {
+      const chunks: Buffer[] = [];
+      let size = 0;
       for await (const chunk of req) {
-        text += chunk.toString();
-        if (Buffer.byteLength(text) > 4 * 1024 * 1024)
-          throw new ApiError(400, "invalid_body", "Request body is too large");
+        size += chunk.length;
+        if (size > limit)
+          throw new ApiError(413, "invalid_body", "Request body is too large");
+        chunks.push(chunk);
       }
+      return Buffer.concat(chunks);
+    }
+    async function body() {
+      const text = (await raw(4 * 1024 * 1024)).toString("utf8");
       try {
         return JSON.parse(text);
       } catch {
@@ -105,9 +111,46 @@ export function createRuntimeServer(runtime: Runtime) {
         return send(200, {
           ...diagnostics,
           api_version: "1",
-          limits: { queue_capacity: runtime.config.queue_capacity },
-          protocols: [PROTOCOL],
+          limits: {
+            queue_capacity: runtime.config.queue_capacity,
+            max_input_bytes: runtime.config.max_input_bytes,
+            max_output_bytes: runtime.config.max_output_bytes,
+          },
+          protocols: [...PROTOCOLS],
         });
+      }
+      if (path === "/v1/catalog" && method === "GET") {
+        operator();
+        return send(
+          200,
+          await inspectCatalog(
+            runtime.config.artifact_catalog,
+            url.searchParams.get("handle") || undefined,
+          ),
+        );
+      }
+      if (path === "/v1/inputs" && method === "POST") {
+        if (req.headers["content-type"] !== "image/png")
+          throw new ApiError(
+            400,
+            "unsupported",
+            "Upload raw PNG bytes with Content-Type image/png",
+            "image",
+          );
+        const record = await runtime.storeInput(
+          await raw(runtime.config.max_input_bytes),
+          namespace,
+        );
+        return send(201, publicInput(record));
+      }
+      if (path === "/v1/inputs" && method === "GET")
+        return send(200, runtime.store.inputs(namespace).map(publicInput));
+      const inputMatch = path.match(/^\/v1\/inputs\/(input_[a-f0-9]{32})$/);
+      if (inputMatch && method === "GET")
+        return send(200, publicInput(runtime.ownedInput(inputMatch[1], namespace)));
+      if (inputMatch && method === "DELETE") {
+        await runtime.deleteInput(inputMatch[1], namespace);
+        return send(200, { deleted: true });
       }
       if (path === "/v1/models" && method === "GET") {
         const models = await Promise.all(
@@ -123,7 +166,7 @@ export function createRuntimeServer(runtime: Runtime) {
             return {
               model_id: model.model_id,
               family: model.bundle.family,
-              tasks: ["text-to-image"],
+              tasks: ["text-to-image", "image-to-image"],
               bundle_digest: model.bundle.bundle_digest,
               source: model.bundle.source,
               available,
@@ -132,15 +175,57 @@ export function createRuntimeServer(runtime: Runtime) {
         );
         return send(200, models);
       }
+      const modelMatch = path.match(/^\/v1\/models\/([a-zA-Z0-9_-]{1,80})$/);
+      if (modelMatch && method === "GET") {
+        const model = runtime.store.registry("models", modelMatch[1]);
+        if (!model) throw new ApiError(404, "not_found", "Model not found");
+        const detail: any = {
+          model_id: model.model_id,
+          artifact_handle: model.artifact_handle,
+          family: model.bundle.family,
+          bundle_digest: model.bundle.bundle_digest,
+          source: model.bundle.source,
+          components: model.bundle.components.map((c: any) => ({
+            role: c.role,
+            digest: c.digest,
+            tensor_format: c.tensor_format,
+            files: Object.keys(model.bundle.configuration.files).filter((f) =>
+              f.startsWith(c.role + "/"),
+            ).length,
+          })),
+          file_count: Object.keys(model.bundle.configuration.files).length,
+        };
+        if (url.searchParams.get("verify") === "1") {
+          // Re-verify every byte through the worker and report the load estimate.
+          operator();
+          const { caps, protocol } = await runtime.worker.probe();
+          try {
+            const result = await runtime.worker.json("/v1/validate", "POST", {
+              protocol,
+              bundle: model.bundle,
+              options: caps.load_defaults,
+            });
+            detail.verification = {
+              valid: true,
+              memory_estimate: result.memory_estimate ?? null,
+              load_defaults: caps.load_defaults,
+            };
+          } catch (e) {
+            if (!(e instanceof ApiError) || e.status >= 500) throw e;
+            detail.verification = { valid: false, error: e.code };
+          }
+        }
+        return send(200, detail);
+      }
       if (path === "/v1/models" && method === "POST") {
         operator();
         const model = await buildBundle(
           await body(),
           runtime.config.artifact_catalog,
         );
-        const { caps } = await runtime.worker.probe();
-        await runtime.worker.json("/v1/validate", "POST", {
-          protocol: PROTOCOL,
+        const { caps, protocol } = await runtime.worker.probe();
+        const validation = await runtime.worker.json("/v1/validate", "POST", {
+          protocol,
           bundle: model.bundle,
           options: caps.load_defaults,
         });
@@ -148,6 +233,39 @@ export function createRuntimeServer(runtime: Runtime) {
         return send(201, {
           model_id: model.model_id,
           bundle_digest: model.bundle.bundle_digest,
+          memory_estimate: validation?.memory_estimate ?? null,
+        });
+      }
+      if (path === "/v1/adapters" && method === "GET")
+        return send(
+          200,
+          runtime.store.registry("adapters").map((a: any) => ({
+            adapter_id: a.adapter_id,
+            artifact_handle: a.artifact_handle,
+            digest: a.digest,
+            source: a.source,
+            files: Object.keys(a.files).length,
+          })),
+        );
+      if (path === "/v1/adapters" && method === "POST") {
+        operator();
+        const adapter = await buildAdapter(await body(), runtime.config.artifact_catalog);
+        const { caps, protocol } = await runtime.worker.probe();
+        if (!caps.adapters || protocol === PROTOCOLS[0])
+          throw new ApiError(
+            503,
+            "unsupported",
+            "The connected worker does not advertise LoRA adapters",
+          );
+        const validation = await runtime.worker.json("/v1/validate", "POST", {
+          protocol,
+          adapters: [{ adapter, scale: 1 }],
+        });
+        runtime.store.register("adapters", adapter.adapter_id, adapter);
+        return send(201, {
+          adapter_id: adapter.adapter_id,
+          digest: adapter.digest,
+          layout: validation?.adapters?.[0]?.layout ?? null,
         });
       }
       if (path === "/v1/recipes" && method === "GET")
@@ -201,14 +319,18 @@ export function createRuntimeServer(runtime: Runtime) {
             "invalid_pagination",
             "Use limit 1–200 and a nonnegative cursor",
           );
+        const newest = url.searchParams.get("order") === "newest";
         const rows = runtime.store.db
           .prepare(
-            "SELECT ordinal,data FROM jobs WHERE namespace=? AND ordinal>? ORDER BY ordinal LIMIT ?",
+            newest
+              ? "SELECT ordinal,data FROM jobs WHERE namespace=? ORDER BY ordinal DESC LIMIT ?"
+              : "SELECT ordinal,data FROM jobs WHERE namespace=? AND ordinal>? ORDER BY ordinal LIMIT ?",
           )
-          .all(namespace, after, limit);
+          .all(...(newest ? [namespace, limit] : [namespace, after, limit]));
         return send(200, {
           jobs: rows.map((r: any) => publicJob(JSON.parse(r.data))),
-          next_cursor: rows.length === limit ? rows.at(-1)!.ordinal : null,
+          next_cursor:
+            !newest && rows.length === limit ? rows.at(-1)!.ordinal : null,
         });
       }
       const match = path.match(
@@ -345,10 +467,20 @@ export function createRuntimeServer(runtime: Runtime) {
   }) as typeof server.close;
   return server;
 }
+export function publicInput(record: any) {
+  const { namespace, ...rest } = record;
+  return rest;
+}
 export function publicJob(job: any) {
-  const { namespace, model, backend, recipe, manifest, ...rest } = job;
+  const { namespace, model, backend, recipe, manifest, input, adapters, ...rest } = job;
   return {
     ...rest,
+    input: input ? publicInput(input) : undefined,
+    adapters: (adapters ?? []).map((a: any) => ({
+      adapter_id: a.adapter.adapter_id,
+      digest: a.adapter.digest,
+      scale: a.scale,
+    })),
     model: {
       model_id: model.model_id,
       bundle_digest: model.bundle.bundle_digest,

@@ -24,3 +24,40 @@
   RAIL++-M terms are separate. Operators supply and license their own weights.
 - Implemented and tested control-plane behavior is distinct from real GPU inference validation;
   this workspace has neither CUDA hardware nor model weights. Later roadmap stages remain future work.
+
+# Implementation decisions — 0.2.0
+
+- Protocol minor negotiation: the worker's `supported_protocols` list is authoritative; Runtime
+  speaks the highest minor it also implements and records it per job. A 1.0 worker still serves
+  text-to-image; image-to-image requires 1.1 and is refused with `unsupported` otherwise.
+- Inputs: PNG only, verified by signature/IHDR/IEND and size limits (`max_input_bytes`, default
+  32 MiB), stored durably under the state directory with namespace ownership. The worker receives
+  bytes under a session-scoped handle at dispatch, never a path. Inputs follow
+  `output_retention_days` and are never removed while a job references them.
+- Image-to-image never resizes: the resolved width/height default to the image's dimensions and
+  differing overrides are errors. `strength` resolves request → recipe → worker task default
+  (0.75 in Engine, 0.6 in the default `variation` recipe); `floor(steps × strength)` is recorded
+  as `effective_steps` and drives progress totals.
+- Backends: `diffusers-sdxl` (reference) and `owned-sdxl` (owned pipeline) are both accepted.
+  The launched worker decides; `worker.backend_id` in the config pins expectations and a request's
+  `backend_id` must match. Backend options are keyed by the running backend only.
+- Dashboard: consumes `/v1/runtime` and `/v1/jobs?order=newest` once per second and offers only
+  existing API operations (cancel). Images open externally via `outputs export`.
+- Diagnostics: `doctor` exits 3 when the worker is unavailable, a device is not ready, a registered
+  model is missing files, storage is unwritable or no model is registered. Memory estimates come
+  from Engine's safetensors-header count and always carry their basis and exclusions.
+- Installation workflow: operators download bundles out of band, map them in `artifact_catalog`,
+  run `models inspect` (no hashing, no registration, no paths in the output), then `models register`.
+  Registration and `models show --verify` hash every byte through the worker.
+
+# Implementation decisions — 0.3.0
+
+- LoRA adapters are registry objects like models: an opaque catalog handle to a directory with one
+  safetensors file, hashed per file, validated by the worker (PEFT layout only). Requests name
+  `adapters: [{adapter_id, scale}]`; a recipe may carry a default list that a request replaces
+  wholesale. Scales are 0–2; at most four distinct adapters.
+- Adapters are part of the worker load identity, not the execution: the runtime reloads when the
+  adapter set or any scale differs, exactly as for precision. This keeps the owned pipeline free to
+  merge deltas in place and keeps per-execution cost equal to the base model.
+- Kohya-format files are refused by the worker rather than silently converted; operators convert
+  to the PEFT layout first. The runtime surfaces the worker's `unsupported` error unchanged.

@@ -1,5 +1,13 @@
 import { randomUUID, createHash } from "node:crypto";
-import { mkdir, open, rename, statfs, access, unlink } from "node:fs/promises";
+import {
+  mkdir,
+  open,
+  rename,
+  statfs,
+  access,
+  unlink,
+  readFile,
+} from "node:fs/promises";
 import { constants } from "node:fs";
 import { join } from "node:path";
 import {
@@ -9,9 +17,13 @@ import {
   submission,
   parameters,
   loadOptions,
-  PROTOCOL,
   VERSION,
+  PROTOCOLS,
   terminal,
+  effectiveSteps,
+  newInputId,
+  pngDimensions,
+  type InputRecord,
   type Job,
 } from "./contracts.js";
 import { Store } from "./store.js";
@@ -29,6 +41,10 @@ export class Runtime {
   }
   async start() {
     await this.worker.start();
+    await mkdir(join(this.config.directory, "inputs"), {
+      recursive: true,
+      mode: 0o700,
+    });
     this.timer = setInterval(
       () => void this.tick(),
       this.config.poll_interval_ms,
@@ -46,6 +62,58 @@ export class Runtime {
     const job = this.store.get(job_id, namespace);
     if (!job) throw new ApiError(404, "not_found", "Job not found");
     return job;
+  }
+  inputPath(input_id: string) {
+    return join(this.config.directory, "inputs", input_id + ".png");
+  }
+  expiry() {
+    return this.config.output_retention_days
+      ? new Date(
+          Date.now() + this.config.output_retention_days * 86400000,
+        ).toISOString()
+      : null;
+  }
+  /** Durable, namespace-owned PNG input. The worker only ever receives bytes the runtime verified. */
+  async storeInput(bytes: Buffer, namespace: string): Promise<InputRecord> {
+    if (bytes.length > this.config.max_input_bytes)
+      throw new ApiError(413, "input_too_large", "Input exceeds max_input_bytes");
+    const { width, height } = pngDimensions(bytes);
+    const record: InputRecord = {
+      input_id: newInputId(),
+      namespace,
+      mime_type: "image/png",
+      size: bytes.length,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      width,
+      height,
+      created_at: new Date().toISOString(),
+      expires_at: this.expiry(),
+    };
+    await this.atomicFile(this.inputPath(record.input_id), bytes);
+    this.store.insertInput(record);
+    return record;
+  }
+  ownedInput(input_id: string, namespace: string) {
+    const record = this.store.input(input_id, namespace);
+    if (!record) throw new ApiError(404, "not_found", "Input not found");
+    return record;
+  }
+  async deleteInput(input_id: string, namespace: string) {
+    this.ownedInput(input_id, namespace);
+    if (
+      this.store
+        .all()
+        .some((j) => !terminal(j.state) && j.input?.input_id === input_id)
+    )
+      throw new ApiError(
+        409,
+        "input_in_use",
+        "An active job references this input",
+      );
+    await unlink(this.inputPath(input_id)).catch((e: any) => {
+      if (e.code !== "ENOENT") throw e;
+    });
+    this.store.deleteInput(input_id);
   }
   async resolve(body: unknown, namespace: string) {
     const request = submission.parse(body);
@@ -66,7 +134,8 @@ export class Runtime {
         "recipe_id",
       );
     if (request.retry_of) this.owned(request.retry_of, namespace);
-    const { info, caps } = await this.worker.probe();
+    const task: string = recipe.pipeline;
+    const { info, caps, protocol } = await this.worker.probe();
     if (!caps.ready || !info.service_ready)
       throw new ApiError(
         503,
@@ -80,16 +149,114 @@ export class Runtime {
         "Selected backend is not available",
         "backend_id",
       );
+    const tasks: string[] = Array.isArray(caps.tasks)
+      ? caps.tasks
+      : ["text-to-image"];
+    if (
+      !tasks.includes(task) ||
+      (task !== "text-to-image" && protocol === PROTOCOLS[0])
+    )
+      throw new ApiError(
+        400,
+        "unsupported",
+        `The connected worker does not advertise ${task}`,
+        "recipe_id",
+      );
+    let input: InputRecord | undefined;
+    const imageDefaults: Record<string, number> = {};
+    if (task === "image-to-image") {
+      if (!request.inputs.image)
+        throw new ApiError(
+          400,
+          "invalid_request",
+          "This recipe requires an uploaded image input",
+          "inputs.image",
+        );
+      input = this.ownedInput(request.inputs.image, namespace);
+      if (input.expires_at && Date.parse(input.expires_at) <= Date.now())
+        throw new ApiError(
+          410,
+          "input_expired",
+          "Input is no longer on local storage",
+          "inputs.image",
+        );
+      imageDefaults.width = input.width;
+      imageDefaults.height = input.height;
+    } else if (request.inputs.image || request.parameters.strength !== undefined)
+      throw new ApiError(
+        400,
+        "invalid_request",
+        "Image and strength apply to image-to-image recipes only",
+        request.inputs.image ? "inputs.image" : "parameters.strength",
+      );
     const effective = parameters.parse({
       ...caps.defaults,
+      ...(task === "image-to-image" ? caps.task_defaults?.[task] : {}),
       ...recipe.defaults,
+      ...imageDefaults,
       ...request.parameters,
       seed: request.parameters.seed ?? recipe.defaults.seed ?? seed(),
     });
+    if (input) {
+      if (effective.width !== input.width || effective.height !== input.height)
+        throw new ApiError(
+          400,
+          "invalid_request",
+          "Width and height must equal the uploaded image size; nothing is resized",
+          effective.width !== input.width ? "parameters.width" : "parameters.height",
+        );
+      if (effective.strength === undefined)
+        throw new ApiError(
+          400,
+          "invalid_request",
+          "Strength is required for image-to-image",
+          "parameters.strength",
+        );
+      if (effectiveSteps(effective) < 1)
+        throw new ApiError(
+          400,
+          "invalid_request",
+          "steps × strength must denoise for at least one step",
+          "parameters.strength",
+        );
+    }
+    const uses: { adapter_id: string; scale: number }[] =
+      request.adapters ?? recipe.adapters ?? [];
+    const adapters = uses.map((use) => {
+      const adapter = this.store.registry("adapters", use.adapter_id);
+      if (!adapter)
+        throw new ApiError(
+          400,
+          "unknown_adapter",
+          `Register adapter ${use.adapter_id} before using it`,
+          "adapters",
+        );
+      return { adapter, scale: use.scale };
+    });
+    if (new Set(uses.map((u) => u.adapter_id)).size !== uses.length)
+      throw new ApiError(400, "invalid_request", "Adapters must be distinct", "adapters");
+    if (adapters.length && (!caps.adapters || protocol === PROTOCOLS[0]))
+      throw new ApiError(
+        400,
+        "unsupported",
+        "The connected worker does not advertise LoRA adapters",
+        "adapters",
+      );
+    if (adapters.length > (caps.adapters?.max_adapters ?? 0))
+      throw new ApiError(400, "unsupported", "Too many adapters for this worker", "adapters");
+    const backendId: string = caps.backend_id;
     const options = loadOptions.parse({
       ...caps.load_defaults,
-      ...request.backend_options?.["diffusers-sdxl"],
+      ...(request.backend_options as any)?.[backendId],
     });
+    for (const other of Object.keys(request.backend_options ?? {}))
+      if (other !== backendId && (request.backend_options as any)[other])
+        throw new ApiError(
+          400,
+          "unsupported_backend",
+          `Options for ${other} do not apply to the ${backendId} worker`,
+          "backend_options",
+        );
     if (!caps.precisions.includes(options.precision))
       throw new ApiError(
         400,
@@ -97,27 +264,34 @@ export class Runtime {
         "Requested precision is unavailable",
         "precision",
       );
-    await this.worker.json("/v1/validate", "POST", {
-      protocol: PROTOCOL,
+    const validation = await this.worker.json("/v1/validate", "POST", {
+      protocol,
       bundle: model.bundle,
       options,
+      ...(adapters.length ? { adapters } : {}),
     });
     return {
+      task,
       request: {
         ...request,
         parameters: effective,
-        backend_id: caps.backend_id,
-        backend_options: { "diffusers-sdxl": options },
+        adapters: uses,
+        backend_id: backendId,
+        backend_options: { [backendId]: options },
       },
+      input,
+      adapters,
       model,
       recipe,
       backend: {
-        backend_id: caps.backend_id,
+        backend_id: backendId,
+        ownership: caps.ownership ?? "reference",
         worker_version: caps.worker_version,
-        protocol: PROTOCOL,
+        protocol,
         device: caps.device,
         options,
         memory_budget_mb: caps.memory_budget_mb,
+        memory_estimate: validation?.memory_estimate ?? null,
       },
     };
   }
@@ -208,7 +382,7 @@ export class Runtime {
         this.worker.child = undefined;
         await this.worker.start();
       }
-      const { info, caps } = await this.worker.probe();
+      const { info, caps, protocol } = await this.worker.probe();
       // Release only after durable terminal commit. Retry collection acknowledgements after disconnects.
       for (const done of this.store
         .all()
@@ -216,14 +390,21 @@ export class Runtime {
           (j) =>
             terminal(j.state) &&
             !j.released &&
-            j.execution_id &&
+            (j.execution_id || j.worker_input_id) &&
             j.session_id === info.session_id,
         )) {
         try {
-          await this.worker.json(
-            `/v1/executions/${done.execution_id}`,
-            "DELETE",
-          );
+          if (done.execution_id)
+            await this.worker.json(
+              `/v1/executions/${done.execution_id}`,
+              "DELETE",
+            );
+          if (done.worker_input_id)
+            await this.worker
+              .json(`/v1/inputs/${done.worker_input_id}`, "DELETE")
+              .catch((e) => {
+                if (!(e instanceof ApiError) || e.status !== 404) throw e;
+              });
           done.released = true;
           this.store.save(done);
         } catch (e) {
@@ -304,6 +485,8 @@ export class Runtime {
             "DELETE",
           );
           job.load_operation_id = undefined;
+          if (operation.memory_estimate)
+            job.backend.memory_estimate = operation.memory_estimate;
           this.store.save(job);
           return;
         }
@@ -313,16 +496,26 @@ export class Runtime {
           this.store.finish(job, "cancelled");
           return;
         }
-        const desired = job.request.backend_options["diffusers-sdxl"];
+        const desired = job.request.backend_options[job.backend.backend_id];
+        const identity = (job.adapters ?? []).map((a) => ({
+          adapter_id: a.adapter.adapter_id,
+          digest: a.adapter.digest,
+          scale: a.scale,
+        }));
+        const loadedIdentity = (info.loaded_bundle?.adapters ?? []).map(
+          (a: any) => ({ adapter_id: a.adapter_id, digest: a.digest, scale: a.scale }),
+        );
         if (
           info.loaded_bundle?.bundle_digest !==
             job.model.bundle.bundle_digest ||
-          hash(info.loaded_bundle.options) !== hash(desired)
+          hash(info.loaded_bundle.options) !== hash(desired) ||
+          hash(loadedIdentity) !== hash(identity)
         ) {
           const op = await this.worker.json("/v1/model/load", "POST", {
-            protocol: PROTOCOL,
+            protocol,
             bundle: job.model.bundle,
             options: desired,
+            ...(identity.length ? { adapters: job.adapters } : {}),
           });
           refresh();
           job.load_operation_id = op.operation_id;
@@ -351,12 +544,44 @@ export class Runtime {
             this.store.finish(job, "cancelled");
             return;
           }
+          const inputs: Record<string, string> = { ...job.request.inputs };
+          if (job.task === "image-to-image") {
+            if (!job.worker_input_id) {
+              // Hand the worker the verified bytes under a session-scoped handle, never a path.
+              const bytes = await readFile(this.inputPath(job.input!.input_id));
+              if (
+                createHash("sha256").update(bytes).digest("hex") !==
+                job.input!.sha256
+              )
+                throw new ApiError(
+                  410,
+                  "input_unavailable",
+                  "Input bytes changed or disappeared before dispatch",
+                );
+              const uploaded = await this.worker.json(
+                "/v1/inputs",
+                "POST",
+                bytes,
+                "image/png",
+              );
+              if (uploaded.sha256 !== job.input!.sha256)
+                throw new ApiError(
+                  503,
+                  "protocol_mismatch",
+                  "Worker input digest mismatch",
+                );
+              refresh();
+              job.worker_input_id = uploaded.input_id;
+              this.store.save(job);
+            }
+            inputs.image = job.worker_input_id!;
+          }
           snapshot = await this.worker.json("/v1/executions", "POST", {
-            protocol: PROTOCOL,
+            protocol,
             attempt_id: job.attempt_id,
             bundle_digest: job.model.bundle.bundle_digest,
-            task: "text-to-image",
-            inputs: job.request.inputs,
+            task: job.task,
+            inputs,
             parameters: job.request.parameters,
           });
         }
@@ -484,25 +709,36 @@ export class Runtime {
       )
         throw new Error("output dimensions changed");
       await this.atomicFile(join(directory, "image.png"), bytes);
-      job.outputs = [
-        {
-          ...output,
-          expires_at: this.config.output_retention_days
-            ? new Date(
-                Date.now() + this.config.output_retention_days * 86400000,
-              ).toISOString()
-            : null,
-        },
-      ];
+      job.outputs = [{ ...output, expires_at: this.expiry() }];
       const manifest = {
-        schema_version: 1,
+        schema_version: 2,
         runtime_version: VERSION,
         job_id: job.job_id,
+        task: job.task,
         recipe: job.recipe,
         model: job.model.bundle,
         request: job.request,
+        inputs: job.input
+          ? [
+              {
+                input_id: job.input.input_id,
+                mime_type: job.input.mime_type,
+                size: job.input.size,
+                sha256: job.input.sha256,
+                width: job.input.width,
+                height: job.input.height,
+              },
+            ]
+          : [],
+        adapters: (job.adapters ?? []).map((a) => ({
+          adapter_id: a.adapter.adapter_id,
+          digest: a.adapter.digest,
+          scale: a.scale,
+          source: a.adapter.source,
+        })),
         backend: job.backend,
         worker: snapshot.implementation,
+        effective_settings: snapshot.effective_settings,
         measurements: snapshot.measurements,
         attempt_id: job.attempt_id,
         session_id: job.session_id,
@@ -550,10 +786,33 @@ export class Runtime {
   async doctor() {
     let worker: any;
     try {
-      worker = await this.worker.probe();
+      const { info, caps, protocol } = await this.worker.probe();
+      worker = {
+        protocol,
+        supported_protocols: info.supported_protocols ?? [info.protocol],
+        worker_version: info.worker_version,
+        backend_id: caps.backend_id,
+        ownership: caps.ownership ?? "reference",
+        owned_process: !!this.config.worker.command,
+        session_id: info.session_id,
+        state: info.state,
+        service_ready: info.service_ready,
+        device: caps.device,
+        device_ready: caps.ready,
+        missing_dependencies: caps.missing_dependencies ?? [],
+        dependencies: caps.dependencies ?? {},
+        tasks: caps.tasks ?? ["text-to-image"],
+        adapters: caps.adapters ?? null,
+        precisions: caps.precisions,
+        load_defaults: caps.load_defaults,
+        memory_budget_mb: caps.memory_budget_mb ?? null,
+        memory_estimate: caps.memory_estimate ?? null,
+        loaded_bundle_digest: info.loaded_bundle?.bundle_digest ?? null,
+      };
     } catch (e) {
       worker = {
         error: e instanceof ApiError ? e.code : "backend_unavailable",
+        message: e instanceof ApiError ? e.message : "Worker is unavailable",
       };
     }
     const disk = await statfs(this.config.directory);
@@ -577,19 +836,48 @@ export class Runtime {
         }
         return {
           model_id: model.model_id,
+          artifact_handle: model.artifact_handle,
+          bundle_digest: model.bundle.bundle_digest,
           available: missing_roles.size === 0,
           missing_roles: [...missing_roles],
+          loaded: worker.loaded_bundle_digest === model.bundle.bundle_digest,
         };
       }),
     );
+    const adapters = await Promise.all(
+      this.store.registry("adapters").map(async (adapter: any) => {
+        const root = this.config.artifact_catalog[adapter.artifact_handle];
+        let available = true;
+        for (const relative of Object.keys(adapter.files)) {
+          try {
+            if (!root) throw new Error();
+            await access(join(root, relative));
+          } catch {
+            available = false;
+          }
+        }
+        return { adapter_id: adapter.adapter_id, digest: adapter.digest, available };
+      }),
+    );
+    const jobs = this.store.all();
     return {
       runtime_version: VERSION,
-      protocol: PROTOCOL,
+      protocols: [...PROTOCOLS],
       worker,
       models,
+      adapters,
+      recipes: this.store
+        .registry("recipes")
+        .map((r: any) => ({ recipe_id: r.recipe_id, pipeline: r.pipeline })),
       storage: {
         writable,
         available_bytes: Number(disk.bavail) * Number(disk.bsize),
+        output_retention_days: this.config.output_retention_days,
+      },
+      queue: {
+        capacity: this.config.queue_capacity,
+        queued: jobs.filter((j) => j.state === "queued").length,
+        running: jobs.filter((j) => j.state === "running").length,
       },
       queue_capacity: this.config.queue_capacity,
     };
@@ -609,5 +897,16 @@ export class Runtime {
             if (e.code !== "ENOENT") throw e;
           });
       }
+    for (const input of this.store.inputs())
+      if (
+        input.expires_at &&
+        Date.parse(input.expires_at) <= Date.now() &&
+        !this.store
+          .all()
+          .some((j) => !terminal(j.state) && j.input?.input_id === input.input_id)
+      )
+        await unlink(this.inputPath(input.input_id)).catch((e: any) => {
+          if (e.code !== "ENOENT") throw e;
+        });
   }
 }

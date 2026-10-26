@@ -7,10 +7,29 @@
   "poll_interval_ms": 250,
   "max_output_bytes": 33554432,
   "output_retention_days": null,
-  "artifact_catalog": {"sdxl-base": "/absolute/path/to/local/sdxl-base"},
+  "artifact_catalog": {
+    "sdxl-base": "/absolute/path/to/local/sdxl-base",
+    "studio-style-lora": "/absolute/path/to/local/studio-style-lora"
+  },
   "credentials": [
-    {"token_env": "MEDIA_RUNTIME_TOKEN", "namespace": "owner", "operator": true},
-    {"token_env": "MEDIA_STUDIO_TOKEN", "namespace": "studio", "operator": false, "allowed_namespaces": ["studio:*"]}
+    {
+      "token_env": "MEDIA_RUNTIME_TOKEN",
+      "namespace": "owner",
+      "operator": true
+    },
+    {
+      "token_env": "MEDIA_STUDIO_TOKEN",
+      "namespace": "studio",
+      "operator": false,
+      "allowed_namespaces": [
+        "studio:*"
+      ]
+    }
   ],
-  "worker": {"url": "http://127.0.0.1:7811", "token_env": "MEDIA_ENGINE_TOKEN"}
+  "worker": {
+    "url": "http://127.0.0.1:7811",
+    "token_env": "MEDIA_ENGINE_TOKEN",
+    "backend_id": "diffusers-sdxl"
+  },
+  "max_input_bytes": 33554432
 }

@@ -1,7 +1,13 @@
 import { DatabaseSync } from "node:sqlite";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { defaultRecipe, hash, type Job, terminal } from "./contracts.js";
+import {
+  defaultRecipes,
+  hash,
+  type InputRecord,
+  type Job,
+  terminal,
+} from "./contracts.js";
 export class Store {
   db: DatabaseSync;
   constructor(directory: string) {
@@ -17,13 +23,42 @@ export class Store {
       CREATE TABLE IF NOT EXISTS events (job_id TEXT NOT NULL REFERENCES jobs(job_id), sequence INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(job_id,sequence));
       CREATE TABLE IF NOT EXISTS idempotency (namespace TEXT NOT NULL, key TEXT NOT NULL, digest TEXT NOT NULL, job_id TEXT NOT NULL REFERENCES jobs(job_id), PRIMARY KEY(namespace,key));
       CREATE TABLE IF NOT EXISTS models (id TEXT PRIMARY KEY, data TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS recipes (id TEXT PRIMARY KEY, data TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS recipes (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS adapters (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS inputs (input_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS inputs_namespace ON inputs(namespace, input_id);`);
+    for (const recipe of defaultRecipes)
+      this.db
+        .prepare("INSERT OR IGNORE INTO recipes VALUES (?,?)")
+        .run(
+          recipe.recipe_id,
+          JSON.stringify({ ...recipe, digest: hash(recipe) }),
+        );
+  }
+  insertInput(record: InputRecord) {
     this.db
-      .prepare("INSERT OR IGNORE INTO recipes VALUES (?,?)")
-      .run(
-        defaultRecipe.recipe_id,
-        JSON.stringify({ ...defaultRecipe, digest: hash(defaultRecipe) }),
-      );
+      .prepare("INSERT INTO inputs(input_id,namespace,data) VALUES (?,?,?)")
+      .run(record.input_id, record.namespace, JSON.stringify(record));
+  }
+  input(input_id: string, namespace?: string): InputRecord | undefined {
+    const row = namespace
+      ? this.db
+          .prepare("SELECT data FROM inputs WHERE input_id=? AND namespace=?")
+          .get(input_id, namespace)
+      : this.db.prepare("SELECT data FROM inputs WHERE input_id=?").get(input_id);
+    return row ? JSON.parse(row.data as string) : undefined;
+  }
+  inputs(namespace?: string): InputRecord[] {
+    return (
+      namespace
+        ? this.db
+            .prepare("SELECT data FROM inputs WHERE namespace=? ORDER BY rowid")
+            .all(namespace)
+        : this.db.prepare("SELECT data FROM inputs ORDER BY rowid").all()
+    ).map((r: any) => JSON.parse(r.data));
+  }
+  deleteInput(input_id: string) {
+    this.db.prepare("DELETE FROM inputs WHERE input_id=?").run(input_id);
   }
   transaction<T>(fn: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
@@ -106,7 +141,7 @@ export class Store {
       this.event(job, "job_state", { state });
     });
   }
-  registry(kind: "models" | "recipes", id?: string): any {
+  registry(kind: "models" | "recipes" | "adapters", id?: string): any {
     if (id) {
       const row = this.db
         .prepare(`SELECT data FROM ${kind} WHERE id=?`)
@@ -118,7 +153,7 @@ export class Store {
       .all()
       .map((r: any) => JSON.parse(r.data));
   }
-  register(kind: "models" | "recipes", id: string, data: any) {
+  register(kind: "models" | "recipes" | "adapters", id: string, data: any) {
     this.db
       .prepare(
         `INSERT INTO ${kind} VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`,

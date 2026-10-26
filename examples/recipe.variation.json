@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "recipe_id": "variation",
+  "revision": 1,
+  "pipeline": "image-to-image",
+  "model_family": "sdxl-base",
+  "inputs": {
+    "prompt": {
+      "type": "string",
+      "required": true
+    },
+    "image": {
+      "type": "image",
+      "required": true
+    }
+  },
+  "defaults": {
+    "steps": 30,
+    "guidance": 6,
+    "strength": 0.6
+  }
+}
