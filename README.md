@@ -8,7 +8,8 @@ service through its gateway.
 This release implements the **first complete path**, the **operator experience** stage and
 image-to-image from the **additional media operations** stage in [runtime-spec.md](runtime-spec.md),
 and accepts Engine's **owned pipeline** backend behind the unchanged worker protocol. LoRA,
-upscaling, video, multi-GPU and native inference are later stages.
+upscaling, video, multi-GPU and native inference are later stages, specified in the same document and
+sequenced in [docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Install and run
 

@@ -1,8 +1,9 @@
 ---
 document_type: product_specification
 status: draft_proposal
-spec_revision: 0.1.0
+spec_revision: 0.2.0
 created_at: 2026-10-26
+updated_at: 2026-10-26
 working_name: Media Runtime
 ---
 
@@ -12,21 +13,44 @@ Media Runtime is a standalone local media service operated through a CLI, an opt
 
 This specification describes proposed behavior. `MUST` defines a required behavior within its stated delivery stage; later stages are not requirements for the first increment. The companion [Media Engine Specification](engine-spec.md) owns the worker protocol.
 
+## Delivery status
+
+Revision 0.1.0 described the first complete path and listed image-to-image, LoRA, upscaling, multiple GPUs, distributed workers, video, audio and a terminal dashboard as later capabilities. Runtime 0.3.0 delivers the first complete path, the operator-experience stage (dashboard, diagnostics, installation workflow) and image-to-image and LoRA from the additional-operations stage. Revision 0.2.0 specifies every remaining deferred capability with its stage, worker-protocol dependency and acceptance rules. The [implementation plan](docs/implementation-plan.md) orders the work.
+
+| Capability                                        | Stage                       | Needs protocol | Status in Runtime 0.3.0 |
+| ------------------------------------------------- | --------------------------- | -------------- | ----------------------- |
+| CLI/API, durable FIFO jobs, Diffusers worker      | First complete path         | 1.0            | Delivered               |
+| Terminal dashboard, doctor, installation workflow | Operator experience         | 1.1            | Delivered               |
+| Image-to-image, LoRA adapters, owned backend      | Additional media operations | 1.1            | Delivered               |
+| Multiple outputs per job                          | Additional media operations | 1.2            | Specified below         |
+| Upscaling                                         | Additional media operations | 1.2            | Specified below         |
+| Single-file checkpoint conversion workflow        | Operator experience         | 1.2            | Specified below         |
+| Automatic settings and authorized fallbacks       | Additional media operations | 1.2            | Specified below         |
+| Linear typed recipes                              | Additional media operations | 1.2            | Specified below         |
+| Multiple GPUs through a worker pool               | Broader execution           | 1.2            | Specified below         |
+| Distributed workers and network modes             | Broader execution           | 1.2            | Specified below         |
+| Video                                             | Broader execution           | 1.3            | Specified below         |
+| Audio                                             | Broader execution           | 1.3            | Specified below         |
+| Owned native engine as a selectable backend       | Owned inference engine      | 1.x            | Specified below         |
+
+Arbitrary ComfyUI graph import, executable recipe code and a plugin marketplace remain outside the design. Existing Studio ComfyUI support remains a separate option.
+
 ## Product sheet
 
-| Property                 | Proposed specification                                                            |
-| ------------------------ | --------------------------------------------------------------------------------- |
-| Primary users            | Local AI server owners, SSH operators, application developers                     |
-| Initial task             | Text-to-image, one explicitly supported SDXL base pipeline                        |
-| Interfaces               | CLI and HTTP API first; terminal dashboard next                                   |
-| Runtime implementation   | Small TypeScript service on a supported Node.js LTS release                       |
-| First inference backend  | Isolated Python worker using pinned Diffusers and PyTorch                         |
-| Future inference backend | Project-owned Media Engine implementing the same worker protocol                  |
-| Persistence              | Local SQLite job metadata; local files for assets and run manifests               |
-| Initial scheduling       | One active generation on one configured GPU; bounded FIFO queue                   |
-| Default connectivity     | Loopback, authenticated local clients; no telemetry                               |
-| Integration              | Optional Studio engine; standalone use requires no Studio account or project      |
-| Packaging                | Separate runtime and backend dependency bundles with explicit compatible versions |
+| Property                 | Proposed specification                                                                       |
+| ------------------------ | -------------------------------------------------------------------------------------------- |
+| Primary users            | Local AI server owners, SSH operators, application developers                                |
+| Delivered tasks          | Text-to-image and image-to-image on one explicitly supported SDXL base pipeline, with LoRA   |
+| Planned tasks            | Upscaling, image-to-video, text-to-audio and linear recipes that chain them                  |
+| Interfaces               | CLI, HTTP API and terminal dashboard                                                         |
+| Runtime implementation   | Small TypeScript service on a supported Node.js LTS release                                  |
+| First inference backend  | Isolated Python worker using pinned Diffusers and PyTorch                                    |
+| Future inference backend | Project-owned Media Engine implementing the same worker protocol                             |
+| Persistence              | Local SQLite job metadata; local files for assets and run manifests                          |
+| Scheduling               | One active generation per configured worker; bounded FIFO queue; one worker per device       |
+| Default connectivity     | Loopback, authenticated local clients; no telemetry; explicit TLS network mode               |
+| Integration              | Optional Studio engine; standalone use requires no Studio account or project                 |
+| Packaging                | Separate runtime and backend dependency bundles with explicit compatible versions            |
 
 ## Responsibilities and boundaries
 
@@ -37,7 +61,7 @@ This specification describes proposed behavior. `MUST` defines a required behavi
 | Models           | Registry, component identity, configured paths, compatibility metadata   | Engine loads components and executes them                                          |
 | Jobs             | Durable runtime job ID, queue, state, event history, cancellation intent | Engine supplies a session-specific execution ID                                    |
 | Assets           | Durable outputs, hashes, run manifests, retention configuration          | Studio imports copies into its scoped file library                                 |
-| GPU use          | Admission, worker ownership, configured memory budget                    | Engine implements allocation and reports estimates and measurements                |
+| GPU use          | Admission, worker ownership, configured memory budget, worker pool       | Engine implements allocation and reports estimates and measurements                |
 | Access           | Runtime credentials and namespaces                                       | Studio enforces user/project permissions and approvals at its gateway              |
 
 The runtime MUST NOT own conversations, RAG, agent loops, task-based model routing, or Studio project membership. It MUST NOT expose Diffusers or PyTorch objects in its public API. It MUST NOT silently change a selected model, backend, precision, image size or recipe to make a job fit.
@@ -46,7 +70,7 @@ The runtime MUST NOT own conversations, RAG, agent loops, task-based model routi
 
 The first increment includes an explicit local model registration, one text-to-image recipe, one output image per job, queue and job commands, genuine execution events, output retrieval, cancellation, process recovery and Studio Create integration. Closing the CLI or browser MUST leave accepted jobs running in the service.
 
-Image-to-image, LoRA, upscaling, multiple GPUs, distributed workers, video, audio and a terminal dashboard are later capabilities. Arbitrary ComfyUI graph import, executable recipe code and a plugin marketplace are outside the initial design. Existing Studio ComfyUI support remains a separate option.
+Image-to-image, LoRA and the terminal dashboard are delivered. Upscaling, multiple outputs, linear recipes, multiple GPUs, distributed workers, video and audio are specified in [Deferred capabilities](#deferred-capabilities). Arbitrary ComfyUI graph import, executable recipe code and a plugin marketplace are outside the design.
 
 ## CLI and terminal experience
 
@@ -72,6 +96,8 @@ media-runtime tui
 - `doctor` explains worker compatibility, selected device, missing model components, writable storage and available space. Memory estimates carry their source and uncertainty.
 - The dashboard presents queue, stage, model, backend, seed, output location and errors. It consumes the public API and adds no execution behavior. Images open in an external viewer initially.
 - Downloads and installation are explicit operator actions. Registering a manifest or running a recipe MUST NOT fetch model weights or execute remote model code.
+
+Later stages add `run --count`, `run --worker`, `run --model-for OP=MODEL`, `workers list`, `outputs export` of every output of a job by its ID and MIME-derived extension, and dashboard columns per worker. Every addition reuses the public API; the CLI gains no private path.
 
 ## Recipes and model bundles
 
@@ -128,14 +154,19 @@ These are proposed runtime endpoints, independent of the engine endpoints. All e
 | ------------------------------------------- | ------------------------------------------------------------------------------- |
 | `GET /health`                               | Coarse service liveness, no model or filesystem details                         |
 | `GET /v1/runtime`                           | Runtime/API versions, backend readiness, limits and supported protocol versions |
+| `GET /v1/workers`                           | Configured workers, device identity, readiness and loaded identity              |
+| `GET /v1/catalog`                           | Operator-only inspection of approved artifact handles                           |
 | `GET /v1/models`                            | Registered model bundles and current availability                               |
 | `POST /v1/models`                           | Operator-only registration of an existing local bundle                          |
+| `GET /v1/adapters`, `POST /v1/adapters`     | Registered LoRA adapters; operator-only registration                            |
 | `GET /v1/recipes`                           | Recipe identities, inputs and supported tasks                                   |
+| `GET /v1/recipes/{recipe_id}`               | One recipe with its typed input declarations and operations                     |
 | `POST /v1/recipes`                          | Operator-only registration of declarative recipes                               |
+| `POST /v1/inputs`, `GET/DELETE /v1/inputs/…`| Durable, namespace-owned uploaded inputs                                        |
 | `POST /v1/jobs/validate`                    | Resolve and validate a submission without enqueuing or loading a model          |
 | `POST /v1/jobs`                             | Durable acceptance, `202` with `job_id` and current state                       |
 | `GET /v1/jobs`                              | Paginated jobs visible to the caller namespace                                  |
-| `GET /v1/jobs/{job_id}`                     | Durable state, stage, effective settings and outputs                            |
+| `GET /v1/jobs/{job_id}`                     | Durable state, stage, operations, effective settings and outputs                |
 | `GET /v1/jobs/{job_id}/events`              | SSE events with persistent sequence IDs and `Last-Event-ID` resume              |
 | `POST /v1/jobs/{job_id}/cancel`             | Record cancellation intent or return the existing terminal state                |
 | `GET /v1/jobs/{job_id}/outputs/{output_id}` | Stream an owned output by opaque ID                                             |
@@ -155,6 +186,99 @@ The runtime binds loopback by default, requires credentials, rejects browser ori
 
 Each backend runs in its own pinned environment or package. The runtime supervises owned child processes, probes protocol/capability compatibility, tracks process identity, bounds logs and handles clean shutdown. Externally managed services are never killed or reconfigured as though the runtime owned them. Python dependencies do not enter Studio's application environment.
 
+## Deferred capabilities
+
+Each capability below is a separately advertised feature with its own stage. A capability is available to a caller only when the configured worker advertises it on the negotiated protocol minor; otherwise the submission fails with `unsupported` naming the field, exactly as image-to-image and adapters do today. None of them relaxes a rule above.
+
+### Multiple outputs per job
+
+Protocol 1.2 lets an execution finalize several outputs. The runtime commits every output the worker advertises for the task, verifying each by size, digest and format signature before success, and publishes them under opaque output IDs (`image`, `image_2`, …, `video`, `poster`, `audio`). A job succeeds only when every advertised output is committed; a partial set is `output_unavailable`.
+
+- `parameters.count` (text-to-image, 1 to the worker's advertised limit) requests a batch in one execution. The job records every output's seed (`seed + k − 1`) so one image can be reproduced alone with `count: 1`.
+- `max_output_bytes` becomes a per-MIME map with explicit defaults; a worker output larger than its limit fails the job rather than being truncated.
+- `outputs export` writes every output with an extension derived from its MIME type; the manifest lists every output with its digest.
+- Studio import receives every output as a separate Studio-owned file with provenance; the gateway decides what Create shows.
+
+### Upscaling
+
+`upscale` is a recipe pipeline that enlarges an uploaded PNG by the registered model's fixed factor using a bundle of the `esrgan` family. The registration carries `family: esrgan` and its `scale`; the runtime validates it through the worker's advertised loaders and refuses a model whose family does not serve the recipe's pipeline.
+
+- The default recipe `enlarge` takes `image` and accepts `tile`/`tile_overlap` overrides. Width and height resolve to the input's dimensions and MUST NOT be overridden; the output is exactly input × scale, bounded by the worker's `output_side` limit, checked at validation.
+- No seed is resolved or recorded; the manifest records the model digest and precision instead.
+- `doctor` and `models show` report the factor and the per-tile memory estimate basis.
+- The single-file conversion workflow below covers converting upscaler releases to safetensors; the runtime never converts weights.
+
+### Single-file checkpoint conversion workflow
+
+Conversion is performed by Engine's offline `convert` subcommand; the runtime adds the operator workflow around it. `models inspect` recognizes a bundle directory containing `conversion.json`, reports the source checkpoint digest, reference bundle digest and converter versions, and prints the registration document. `models register` records that provenance in the model's `source`, and manifests carry it for every job that used the bundle. The runtime MUST NOT invoke Python or perform conversion itself, and registration of an unconverted single-file checkpoint fails with `unsupported` naming the format.
+
+### Automatic settings and authorized fallbacks
+
+Where the worker advertises `auto_options`, a submission's `backend_options` may set an option to `auto`. The runtime passes it through, persists the worker's `resolved_options` and `resolutions` in the job before dispatch, and the manifest records them; a retry re-resolves rather than copying resolved values.
+
+A submission may carry `authorized_fallbacks` drawn from the worker's advertised `fallbacks` (`cpu`, `lower_precision`). The runtime forwards them on the load body only when the credential's configuration allows fallbacks (`allow_fallbacks`, default false), records `applied_fallbacks` from the load operation in the job, emits a `stage` event naming the fallback, and shows it in `jobs watch`, the dashboard and the manifest. A fallback never changes the model, recipe or generation parameters, and an unauthorized failure still settles the job as `failed` with the worker's code.
+
+### Linear typed recipes
+
+Recipe schema version 2 declares an ordered list of typed operations. Each operation names its task, model family, inputs bound from the submission or from an earlier operation's output, defaults and optional adapters. The runtime resolves every operation before admission and runs them in order, each as its own worker execution.
+
+```json
+{
+  "schema_version": 2,
+  "recipe_id": "portrait-4k",
+  "revision": 1,
+  "inputs": { "prompt": { "type": "string", "required": true } },
+  "operations": [
+    { "op_id": "generate", "task": "text-to-image", "model_family": "sdxl-base",
+      "inputs": { "prompt": { "from": "input:prompt" } },
+      "defaults": { "width": 1024, "height": 1024, "steps": 30, "guidance": 6 } },
+    { "op_id": "enlarge", "task": "upscale", "model_family": "esrgan",
+      "inputs": { "image": { "from": "op:generate/image" } } }
+  ],
+  "publish": ["enlarge/image"]
+}
+```
+
+- Submission `model_id` selects the model for the first operation; `models: {op_id: model_id}` selects the others. Every operation MUST resolve to a registered model of its declared family and to a task the worker advertises; otherwise admission fails with the operation named in `error.field`.
+- The job records `operations[]` with per-operation state, attempt, session, execution, effective settings and outputs. `stage` events carry `op_id`; `progress` carries `operation_index` and `operation_count` beside the worker's stage progress, and the runtime MUST NOT compute a single percentage across operations.
+- An operation's outputs are committed durably before the next operation starts. An image output feeding the next operation is uploaded to the worker as an input under the job's ownership; the worker never sees a runtime path. The worker is reloaded when the next operation's bundle, adapters or options differ, using the existing load-identity rules.
+- `publish` lists the outputs exposed by the job's output endpoints and export; unlisted intermediate outputs are retained with the job and follow the same retention. The manifest lists every operation and output.
+- Cancellation between operations is honored before dispatching the next; a failed operation fails the job with `error.operation`. Retry creates a new job that runs every operation again; partial resume is not offered.
+- Schema version 1 recipes remain valid and are treated as a single operation; `recipes inspect` and `GET /v1/recipes/{id}` return the typed declarations Studio's native-workflow path needs for input mapping.
+
+### Multiple GPUs through a worker pool
+
+The configuration lists workers instead of one worker. Each entry has a `worker_id`, a loopback URL or an owned command, its credential, expected `backend_id`, `device` and an optional per-worker memory budget. Every worker is one Engine process on one device; a device is listed once, and the runtime refuses a configuration or a probe result where two workers report the same device identity.
+
+- The scheduler keeps one active execution per worker. The FIFO head is dispatched to an idle, ready worker whose loaded identity (bundle, adapters, options) matches when one exists, else to any idle worker, so that FIFO order is preserved per worker without reordering by model.
+- A submission may pin `worker_id`; an unknown or unsuitable worker fails admission. Without pinning, a job may run on any worker that advertises its task, family and protocol minor.
+- Jobs, events, manifests, `jobs list`, the dashboard and `doctor` record and display the worker ID and device identity. Restart reconciliation runs per worker session; a lost worker interrupts only its own job.
+- Queue capacity stays global; `GET /v1/runtime` reports per-worker readiness and `GET /v1/workers` lists the pool. A single `worker` entry remains valid and is treated as a pool of one.
+
+### Distributed workers and network modes
+
+A worker entry may name a remote `https://` URL when it also names a client certificate, private key and CA file; the runtime then speaks mutual TLS and pins the worker's certificate fingerprint reported in `/v1/info`. A remote entry MUST NOT carry a `command`: a remote worker is never owned, so the cancellation deadline records interruption only after the worker itself reports a terminal state or the session changes, never through termination.
+
+- The remote worker's catalog is its own; a registration's artifact handle must resolve there and digests prove the bundle is the same. Inputs and outputs already cross the connection as verified bytes; nothing else changes in the job model.
+- Remote entries have separate `remote_timeout_ms` and reconnection settings; a lost connection resumes from the worker snapshot and event sequence like a local one.
+- The runtime's own API gains a network mode: `bind` other than loopback requires server TLS material and keeps browser origins refused unless `allowed_origins` lists them explicitly. Credentials, namespaces and operator separation are unchanged; a plain-HTTP non-loopback bind MUST be refused at startup.
+
+### Video
+
+`image-to-video` is a recipe pipeline on the `svd` family (protocol 1.3). The default recipe `animate` takes an uploaded PNG whose dimensions MUST match the input and fall within the model's advertised sizes, and resolves `frames`, `fps`, `motion`, `noise_augmentation`, `steps`, `seed` and `decode_chunk` from request, recipe and worker defaults.
+
+- Outputs are `video` (`video/mp4`) and `poster` (`image/png`); both are verified by size and digest, and the MP4 by its container signature, before success. The job and manifest record frame count, frame rate and duration from the worker's output record.
+- The per-MIME output limit for video defaults to 256 MiB; export writes `.mp4` and `.png`. The dashboard shows frames and duration; images and videos open in an external viewer.
+- Studio imports the video as a Studio-owned file with provenance and the poster as its preview.
+
+### Audio
+
+`text-to-audio` is a recipe pipeline on the `stable-audio-open` family (protocol 1.3). The default recipe `soundscape` takes `prompt` and optional `negative_prompt` and resolves `duration_seconds`, `steps`, `guidance` and `seed`. The output is `audio` (`audio/wav`); the job and manifest record sample rate, channels and actual duration. The runtime verifies the RIFF/WAVE header and size before success and exports `.wav`. The dashboard shows duration; playback happens in an external player.
+
+### Owned native engine as a selectable backend
+
+When Engine ships its native backend, the runtime accepts `backend_id: native-sdxl` beside `diffusers-sdxl` and `owned-sdxl`, records `ownership: engine` from the worker's `/v1/info`, and otherwise treats it identically: the caller chooses the backend explicitly, a request for a backend other than the running one is rejected, and no recipe, scheduler or parameter is reinterpreted. The runtime's integration suite runs unchanged against the native worker and is part of its acceptance.
+
 ## AI Server Studio integration
 
 Add one Studio `MediaRuntime` adapter for this service. It maps health, model discovery, request validation, generation, status, progress, cancellation, output retrieval and provenance through the existing interface. The new runtime kind and registry entry require corresponding backend/frontend capability handling; configuration alone is not integration.
@@ -165,18 +289,20 @@ Personal and project use MUST have equivalent generation, status, cancellation a
 
 The first Studio increment must be runnable from Create with honest setup, loading, failure, Stop and output states. The standalone runtime is independently useful; its CLI milestone alone does not complete a Studio implementation phase.
 
+Later stages extend the adapter rather than the gateway contract: multiple outputs and new media types import as additional Studio file objects; linear recipes expose their typed input declarations through `GET /v1/recipes/{id}` for the native-workflow path; worker pools and remote workers are invisible to Studio beyond the worker ID in provenance. Studio work is tracked in its own repository and is not a deliverable of this runtime's plan.
+
 ## Development sequence
 
-| Stage                       | Delivered behavior                                                                                                                        |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| First complete path         | CLI/API, one registered bundle and recipe, Diffusers worker, durable queue, cancellation, saved image/manifest, Studio Create integration |
-| Operator experience         | Terminal dashboard, improved diagnostics, explicit package/model installation workflows                                                   |
-| Additional media operations | Image-to-image, LoRA or upscaling as separately advertised capabilities; linear typed recipes where needed                                |
-| Owned inference engine      | Additional backend behind the unchanged worker protocol; caller explicitly chooses it                                                     |
-| Broader execution           | More model families, devices or media types according to actual use                                                                       |
+| Stage                       | Delivered behavior                                                                                                                                      |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| First complete path         | CLI/API, one registered bundle and recipe, Diffusers worker, durable queue, cancellation, saved image/manifest, Studio Create integration (delivered)    |
+| Operator experience         | Terminal dashboard, improved diagnostics, explicit package/model installation workflows (delivered); conversion provenance workflow                      |
+| Additional media operations | Image-to-image and LoRA (delivered); multiple outputs, upscaling, automatic settings with authorized fallbacks, linear typed recipes                    |
+| Owned inference engine      | Owned pipeline backend (delivered); native backend behind the unchanged worker protocol; caller explicitly chooses it                                    |
+| Broader execution           | Worker pool for multiple GPUs, remote workers over mutual TLS with API network mode, video, audio                                                        |
 
 ## Decisions before implementation
 
 Record final product/repository names, the exact reference model and hardware, dependency pins, supported Node/Python versions and distribution licenses. Use the proposed TypeScript control plane and isolated Python worker unless implementation evidence supports a smaller arrangement. Select concrete queue, storage and cancellation defaults and publish them as configuration rather than unexplained hard limits.
 
-The next implementation step is the worker contract and the first complete path above. Future engine development follows [the engine migration sequence](engine-spec.md#progressive-inference-ownership).
+For the deferred stages, record before each starts: the per-MIME output limits, the pool scheduling tie-break when several idle workers match, the TLS material format and rotation expectations for remote workers and API network mode, the video and audio reference bundles and their licenses, and the retention rule for intermediate operation outputs. The next implementation step is protocol 1.2 support (multiple outputs, upscaling, conversion provenance, automatic settings and fallbacks) followed by linear typed recipes; the [implementation plan](docs/implementation-plan.md) sequences the rest.
