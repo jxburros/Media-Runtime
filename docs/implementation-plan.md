@@ -1,7 +1,8 @@
 # Media Runtime implementation plan — deferred capabilities
 
 This plan turns [runtime-spec.md](../runtime-spec.md) revision 0.2.0 into ordered, releasable
-increments of the TypeScript service. It covers every capability the specification marks
+increments of the service. The first increment rewrites the 0.3.0 TypeScript service in Go at
+exact feature parity; every later increment is written in Go. It covers every capability the specification marks
 "Specified below": multiple outputs, upscaling, the conversion provenance workflow, automatic
 settings and authorized fallbacks, linear typed recipes, the worker pool for multiple GPUs,
 distributed workers and network modes, video, audio and the native backend. Out-of-scope items
@@ -39,19 +40,108 @@ public API.
 
 | Runtime | Needs Engine | Protocol | Phase                                                                     |
 | ------- | ------------ | -------- | ------------------------------------------------------------------------- |
-| 0.4.0   | 0.4.0        | 1.2      | R1 Multiple outputs, upscaling, conversion provenance, auto/fallbacks     |
-| 0.5.0   | 0.4.0        | 1.2      | R2 Linear typed recipes                                                   |
-| 0.6.0   | 0.4.0        | 1.2      | R3 Worker pool for multiple GPUs                                          |
-| 0.7.0   | 0.5.0        | 1.2      | R4 Distributed workers and API network mode                               |
-| 0.8.0   | 0.6.0        | 1.3      | R5 Video                                                                  |
-| 0.9.0   | 0.7.0        | 1.3      | R6 Audio                                                                  |
+| 0.4.0   | 0.3.0        | 1.1      | R0 Go rewrite at 0.3.0 parity                                             |
+| 0.5.0   | 0.4.0        | 1.2      | R1 Multiple outputs, upscaling, conversion provenance, auto/fallbacks     |
+| 0.6.0   | 0.4.0        | 1.2      | R2 Linear typed recipes                                                   |
+| 0.7.0   | 0.4.0        | 1.2      | R3 Worker pool for multiple GPUs                                          |
+| 0.8.0   | 0.5.0        | 1.2      | R4 Distributed workers and API network mode                               |
+| 0.9.0   | 0.6.0        | 1.3      | R5 Video                                                                  |
+| 0.10.0  | 0.7.0        | 1.3      | R6 Audio                                                                  |
 | 1.0.0   | 1.0.0        | 1.3      | R7 Native backend acceptance and compatibility record                     |
+
+Engine 0.4.0 does not depend on the runtime, so R0 and Engine phase E1 proceed in parallel.
+The TypeScript service is frozen at 0.3.0 the day R0 starts; no feature is implemented twice.
 
 Every release keeps negotiating 1.0 and 1.1 so an older Engine still serves text-to-image, and
 every feature that needs a newer minor is refused with `unsupported` naming the field, as
 image-to-image and adapters are today.
 
-## Phase R1 — Runtime 0.4.0, protocol 1.2
+## Phase R0 — Runtime 0.4.0, Go rewrite at 0.3.0 parity
+
+The service is rewritten in Go before any deferred capability is built, while the parity target is
+smallest: about 4,000 lines of TypeScript, one dependency and a fully specified API, config,
+state directory, manifest and CLI surface. Phases R3 and R4 are the ones Go simplifies most (a
+goroutine per worker, mutual TLS from the standard library), so the rewrite lands before them.
+
+### R0.1 Stack and layout
+
+- Go 1.23 or later; a single static binary `media-runtime` with no cgo. Module layout:
+  `cmd/media-runtime` (CLI entry), `internal/contracts` (request/recipe/registration shapes and
+  strict validation), `internal/config`, `internal/store` (SQLite), `internal/worker` (Engine
+  client and child supervision), `internal/runtime` (resolve, submit, scheduler, commit, doctor,
+  cleanup), `internal/api` (HTTP and SSE), `internal/tui`, `internal/catalog` (inspection).
+- SQLite through `modernc.org/sqlite` (pure Go) with the same schema, WAL mode and FULL
+  synchronous setting as `src/store.ts`, so an existing 0.3.0 state directory opens unchanged.
+- `net/http` for the API and SSE; `encoding/json` with `DisallowUnknownFields` and hand-written
+  range checks replacing zod's `.strict()` schemas; `crypto/tls` reserved for R4; `bubbletea` for
+  the dashboard; stdlib `flag` with subcommands for the CLI, keeping every command, flag, exit
+  code and `--json` shape from `src/cli.ts`.
+- Dependencies are pinned in `go.mod`/`go.sum`; the release records the Go toolchain version in
+  `docs/decisions.md` as the TypeScript release recorded Node.
+
+### R0.2 Parity contract
+
+Everything below is identical to 0.3.0, byte for byte where a format is involved:
+
+- The HTTP API in [runtime-spec.md](../runtime-spec.md), including error codes, `request_id`,
+  `429` with `Retry-After`, `410` for expired outputs, SSE sequence IDs and `Last-Event-ID`
+  resume, namespace rules and operator separation.
+- `runtime.config.json` fields and environment variables (`MEDIA_RUNTIME_TOKEN`,
+  `MEDIA_RUNTIME_URL`, `MEDIA_RUNTIME_NAMESPACE`, `MEDIA_RUNTIME_CONFIG`).
+- The state directory: SQLite schema, `inputs/`, `outputs/<job>/`, manifest schema 2, file modes
+  0700/0600, atomic write and fsync order (bytes, manifest, then database), the exclusive process
+  lock.
+- Worker supervision: startup record parsing, per-launch token, session and attempt
+  reconciliation, cancellation grace and forced termination semantics, stdout drain, no stderr
+  retention.
+- CLI commands, flags, output text used by `test/tui.test.mjs`, exit codes 0/2/3/4.
+- Recipes, registrations, adapters, idempotency, retention and cleanup behavior.
+
+### R0.3 Proving parity
+
+- Keep `test/integration.test.mjs` and `test/tui.test.mjs` as the oracle: add a
+  `MEDIA_RUNTIME_BIN` switch so they launch the Go binary instead of `node dist/cli.js`, and run
+  them against Engine 0.3.0's fixture. The rewrite is done when both suites pass unmodified apart
+  from that switch.
+- Port the suites to Go tests (`internal/.../_test.go` driving the real binary and Engine's
+  `tests/serve_fixture.py`) in the same release, then delete the Node test harness; `npm test` is
+  replaced by `go test ./...` in the README and compatibility record.
+- Open a 0.3.0 state directory with the Go binary and run `jobs list`, `outputs export` and a
+  new job to prove migration-free continuity.
+
+### R0.4 TypeScript retirement
+
+- `src/client.ts` moves to a small package of its own (`gateway-client/`) and stays TypeScript:
+  it is Studio's typed entry point and gains the new output, recipe and worker types in each later
+  phase exactly as the plan already states.
+- The rest of `src/` is deleted in 0.4.0; the 0.3.0 tag and a `typescript-0.3` maintenance branch
+  remain for one feature release and are archived after 0.5.0 ships.
+- README, CHANGELOG, `docs/decisions.md` (0.4.0 entry: Go toolchain, SQLite driver, the reasons
+  for the rewrite and for keeping the gateway client in TypeScript) and `docs/compatibility.md`.
+
+Acceptance: both 0.3.0 test suites pass against the Go binary with Engine 0.3.0, a 0.3.0 state
+directory is served unchanged, and no feature beyond 0.3.0 is present.
+
+### File references in later phases
+
+Phases R1 through R7 were written against the TypeScript modules. After R0, read them through
+this mapping; responsibilities move, names do not:
+
+| TypeScript module   | Go package                                   |
+| ------------------- | -------------------------------------------- |
+| `src/contracts.ts`  | `internal/contracts`                         |
+| `src/config.ts`     | `internal/config`                            |
+| `src/store.ts`      | `internal/store`                             |
+| `src/worker.ts`     | `internal/worker` (plus `internal/pool` in R3) |
+| `src/runtime.ts`    | `internal/runtime`                           |
+| `src/server.ts`     | `internal/api`                               |
+| `src/cli.ts`        | `cmd/media-runtime`                          |
+| `src/tui.ts`        | `internal/tui`                               |
+| `src/models.ts`     | `internal/catalog`                           |
+| `src/client.ts`     | `gateway-client/` (TypeScript, unchanged role) |
+| `test/*.test.mjs`   | Go tests driving the binary and Engine's fixture |
+
+## Phase R1 — Runtime 0.5.0, protocol 1.2
 
 ### R1.1 Negotiate 1.2 and record worker identity
 
@@ -140,19 +230,19 @@ image-to-image and adapters are today.
 
 ### R1.6 Release
 
-- `src/contracts.ts` `VERSION` 0.4.0; `package.json`; `CHANGELOG.md`; README sections;
-  `docs/decisions.md` 0.4.0 entry (per-MIME limits, count limit, fallback policy); examples:
+- Version 0.5.0 in `internal/contracts` and the release tag; `CHANGELOG.md`; README sections;
+  `docs/decisions.md` 0.5.0 entry (per-MIME limits, count limit, fallback policy); examples:
   `examples/recipe.enlarge.json`, `examples/model.upscaler.json`, config with the output limit
   map.
 - Add `docs/compatibility.md`: Runtime version, negotiated minors, Engine versions tested,
   fixture version.
-- `npm test` with Engine 0.4.0 beside the checkout; also run against Engine 0.3.0's fixture to
+- `go test ./...` with Engine 0.4.0 beside the checkout; also run against Engine 0.3.0's fixture to
   prove the 1.1 path is unchanged.
 
 Acceptance: every R1 capability is refused cleanly against a 1.1 worker and works against the
 1.2 fixture; existing jobs, manifests (schema 2) and configs remain readable.
 
-## Phase R2 — Runtime 0.5.0, linear typed recipes
+## Phase R2 — Runtime 0.6.0, linear typed recipes
 
 - `src/contracts.ts`: `recipeSchemaV2` with `inputs` (typed declarations: `string`, `image`,
   `number` with optional range), `operations[]` (`op_id`, `task`, `model_family`, `inputs` bound
@@ -191,20 +281,21 @@ Acceptance: every R1 capability is refused cleanly against a 1.1 worker and work
   intermediate committed before the second dispatch, the second operation receives an uploaded
   input, worker reload observed, publish filtering, cancel between operations, failure in the
   second operation names it, restart during operation two reconciles only that attempt, v1
-  recipes still run, `GET /v1/recipes/{id}` shape. `docs/decisions.md` 0.5.0 entry records the
+  recipes still run, `GET /v1/recipes/{id}` shape. `docs/decisions.md` 0.6.0 entry records the
   intermediate retention rule.
 
 Acceptance: a linear recipe runs each operation as its own worker execution with durable
 intermediates, honest per-operation progress and no partial-resume claims; schema-1 recipes and
-0.4.0 jobs are unaffected.
+0.5.0 jobs are unaffected.
 
-## Phase R3 — Runtime 0.6.0, worker pool for multiple GPUs
+## Phase R3 — Runtime 0.7.0, worker pool for multiple GPUs
 
 - `src/config.ts`: `workers: [{ worker_id, url, token_env, command?, backend_id?, device?,
   memory_budget_mb? }]` (min 1); the legacy single `worker` object is accepted and converted to a
   one-entry pool with `worker_id: "default"`. Reject duplicate IDs; `device` is informational
   until the probe confirms it.
-- `src/worker.ts`: `WorkerClient` gains `worker_id` and is instantiated per entry; a new
+- `src/worker.ts`: `WorkerClient` gains `worker_id` and is instantiated per entry; in Go each
+  worker runs its own goroutine loop instead of sharing one polling tick; a new
   `src/pool.ts` holds the clients, probes each, keeps per-worker `info`/`caps`/`protocol`, and
   refuses to start (or marks both unavailable, configurable `strict_devices`, default true) when
   two probes report the same `device_identity`.
@@ -227,21 +318,20 @@ intermediates, honest per-operation progress and no partial-resume claims; schem
   queued jobs run concurrently; a pinned job waits for its worker; affinity keeps a matching
   loaded identity on the same worker; killing one owned worker interrupts only its job; a
   duplicate device identity is refused; a legacy single-`worker` config still works.
-- `docs/decisions.md` 0.6.0 entry: scheduling tie-break and the reordering default.
+- `docs/decisions.md` 0.7.0 entry: scheduling tie-break and the reordering default.
 
 Acceptance: N configured workers give N concurrent executions with FIFO honored, per-worker
 reconciliation and complete attribution in jobs, manifests, dashboard and doctor.
 
-## Phase R4 — Runtime 0.7.0, distributed workers and API network mode (needs Engine 0.5.0)
+## Phase R4 — Runtime 0.8.0, distributed workers and API network mode (needs Engine 0.5.0)
 
 - `src/config.ts`: a worker entry may use an `https://` URL with `tls: { ca_file, cert_file,
   key_file, pinned_sha256? }` and `remote_timeout_ms`; `command` is rejected together with a
   remote URL. Runtime API: `bind` (default `127.0.0.1`), `tls: { cert_file, key_file }` required
   when `bind` is not loopback, `allowed_origins` (default empty, meaning browser origins stay
   refused).
-- `src/worker.ts`: replace `fetch` for remote entries with `node:https` requests (or an undici
-  `Agent` with `connect` options) carrying the client certificate, the CA and a
-  `checkServerIdentity` that compares the fingerprint to `pinned_sha256` when set, and to the
+- `src/worker.ts`: in Go this is one `http.Transport` per remote entry with a `tls.Config`
+  carrying the client certificate, the CA and a `VerifyPeerCertificate` that compares the fingerprint to `pinned_sha256` when set, and to the
   fingerprint `/v1/info` reported on first contact otherwise (recorded in the store and
   compared on every reconnect). SSE streaming works over the same agent. `stop()` never
   terminates a remote worker; the cancellation-deadline branch in `tick()` records
@@ -256,12 +346,12 @@ reconciliation and complete attribution in jobs, manifests, dashboard and doctor
   fails config validation; the runtime API over TLS with a client that presents the token; a
   non-loopback plain-HTTP bind is refused at startup.
 - README: a "Remote workers" section with the trust model (per-worker catalog, digests prove
-  identity, no ownership) and the certificate expectations; `docs/decisions.md` 0.7.0 entry.
+  identity, no ownership) and the certificate expectations; `docs/decisions.md` 0.8.0 entry.
 
 Acceptance: a job runs on a remote worker with identical job semantics, nothing ever terminates
 a remote process, and no plain-HTTP non-loopback listener can be configured.
 
-## Phase R5 — Runtime 0.8.0, video (needs Engine 0.6.0, protocol 1.3)
+## Phase R5 — Runtime 0.9.0, video (needs Engine 0.6.0, protocol 1.3)
 
 - `src/contracts.ts`: `PROTOCOLS` adds 1.3; `TASKS` adds `image-to-video`; family `svd`;
   parameters `frames`, `fps`, `motion`, `noise_augmentation`, `decode_chunk`; default recipe
@@ -276,10 +366,10 @@ a remote process, and no plain-HTTP non-loopback listener can be configured.
 - `src/client.ts`: video output types for Studio's adapter; Studio imports the video and poster
   (tracked in Studio's repository).
 - Tests: the fixture's two-frame MP4 runs end-to-end, container signature verified, size limit
-  enforced from the per-MIME map, a 1.2 fixture refuses the task; `docs/decisions.md` 0.8.0
+  enforced from the per-MIME map, a 1.2 fixture refuses the task; `docs/decisions.md` 0.9.0
   records the reference bundle and the video output limit.
 
-## Phase R6 — Runtime 0.9.0, audio (needs Engine 0.7.0)
+## Phase R6 — Runtime 0.10.0, audio (needs Engine 0.7.0)
 
 - `src/contracts.ts`: `TASKS` adds `text-to-audio`; family `stable-audio-open`; parameters
   `duration_seconds`; default recipe `soundscape`; `signatures` gains a RIFF/WAVE check.
@@ -311,15 +401,16 @@ lists each tested combination.
   applied by `migrateJob()` in `src/store.ts`. Manifest schemas are versioned (3 in R1, 4 in R2,
   5 in R5) and older manifests are never rewritten. Config accepts the previous release's shape
   for one release before removal is even considered.
-- **Gateway client.** `src/client.ts` is Studio's typed entry point; every new output type,
+- **Gateway client.** `src/client.ts` (after R0, `gateway-client/`) is Studio's typed entry point; every new output type,
   recipe shape and worker field is added there in the same change, and the Studio adapter work
   is listed in that phase's CHANGELOG entry as a companion task.
 - **Documentation.** README sections per feature, `CHANGELOG.md`, `docs/decisions.md` per
   release, `docs/compatibility.md` per release, and examples for every new recipe, model and
   config field.
-- **Release checklist.** `VERSION` and `package.json` bump, `npm run build`, `npm test` against
-  the required Engine and the previous Engine, CHANGELOG, README, decisions, compatibility,
-  examples, `package-lock.json` unchanged unless a dependency changed.
+- **Release checklist.** Version bump and tag, `go build` and `go test ./...` against the
+  required Engine and the previous Engine, CHANGELOG, README, decisions, compatibility,
+  examples, `go.sum` unchanged unless a dependency changed, gateway client package published
+  when its types changed.
 
 ## Risks and open decisions
 
@@ -327,7 +418,7 @@ lists each tested combination.
 | ---------------------------------- | -------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
 | FIFO versus utilization in a pool  | Literal FIFO can idle a worker when the head is pinned or unsuitable                   | `allow_reordering` off by default; document the trade-off              |
 | Intermediate output storage        | Linear recipes multiply bytes on disk                                                   | Same retention as outputs; `publish` controls exposure, not retention |
-| Node TLS client pinning            | `fetch` cannot pin certificates; `node:https` is needed for remote workers              | Isolate transport in `src/worker.ts`; keep loopback on `fetch`         |
+| Rewrite while Engine moves         | R0 and Engine E1 overlap; a parity target that drifts doubles the work                  | Freeze TypeScript at 0.3.0; R0 targets Engine 0.3.0's fixture only     |
 | Video and audio limits             | Default per-MIME limits are guesses until measured                                      | Record in decisions; configurable                                      |
 | Studio adapter lag                 | Runtime features ship before Studio shows them                                           | Gateway client typed first; Studio tasks listed per phase              |
 | Hardware validation                | No GPU or weights in this workspace                                                     | Each release states hardware-validated versus implemented              |

@@ -6,7 +6,8 @@ Specification revision 0.2.0 builds out every capability revision 0.1.0 deferred
 outputs per job, upscaling, the conversion provenance workflow, automatic settings with authorized
 fallbacks, linear typed recipes (schema 2), a worker pool for multiple GPUs, distributed workers
 with API network mode, video, audio and the native backend. `docs/implementation-plan.md` orders
-them into releases 0.4.0 through 1.0.0 against the matching Engine releases. No code changed.
+them into releases 0.5.0 through 1.0.0 against the matching Engine releases, after a Go rewrite
+of the service at 0.3.0 parity as 0.4.0. No code changed.
 
 ## 0.3.0 — 2026-10-26
 

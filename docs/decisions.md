@@ -61,3 +61,19 @@
   merge deltas in place and keeps per-execution cost equal to the base model.
 - Kohya-format files are refused by the worker rather than silently converted; operators convert
   to the PEFT layout first. The runtime surfaces the worker's `unsupported` error unchanged.
+
+# Implementation decisions — 0.4.0 (planned)
+
+- The service is rewritten in Go at exact 0.3.0 parity before any deferred capability is built.
+  Reasons: the parity target is smallest now (about 4,000 lines, one dependency); the worker pool
+  and mutual-TLS stages are simpler on goroutines and `crypto/tls` than ported afterwards; a
+  static binary removes the Node installation from operator hosts; the maintainer's language
+  preference. The "same language as Studio" argument from 0.1.0 is retained only where it matters:
+  the typed gateway client stays TypeScript.
+- Parity oracle: the 0.3.0 `test/integration.test.mjs` and `test/tui.test.mjs` suites run against
+  the Go binary with Engine 0.3.0's fixture before being ported to Go tests.
+- Pure-Go SQLite (`modernc.org/sqlite`), same schema and pragmas, so state directories migrate
+  without conversion. No cgo anywhere in the binary.
+- The TypeScript service is frozen at 0.3.0 when the rewrite starts and archived after 0.5.0.
+- Language split across the project: Go for the runtime, Python for the reference and owned
+  Engine backends, Rust recommended for Engine's native backend (decided in Engine phase E6).

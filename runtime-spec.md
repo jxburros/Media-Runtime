@@ -32,8 +32,11 @@ Revision 0.1.0 described the first complete path and listed image-to-image, LoRA
 | Video                                             | Broader execution           | 1.3            | Specified below         |
 | Audio                                             | Broader execution           | 1.3            | Specified below         |
 | Owned native engine as a selectable backend       | Owned inference engine      | 1.x            | Specified below         |
+| Go rewrite of the service at 0.3.0 parity         | Operator experience         | 1.1            | Specified below         |
 
 Arbitrary ComfyUI graph import, executable recipe code and a plugin marketplace remain outside the design. Existing Studio ComfyUI support remains a separate option.
+
+The service implementation language changes before the deferred capabilities are built: Runtime 0.4.0 rewrites the 0.3.0 TypeScript service in Go at exact parity, and every later stage is implemented in Go. The public API, configuration, state directory, manifests and CLI are unchanged by the rewrite; see [Implementation language](#implementation-language).
 
 ## Product sheet
 
@@ -43,7 +46,7 @@ Arbitrary ComfyUI graph import, executable recipe code and a plugin marketplace 
 | Delivered tasks          | Text-to-image and image-to-image on one explicitly supported SDXL base pipeline, with LoRA   |
 | Planned tasks            | Upscaling, image-to-video, text-to-audio and linear recipes that chain them                  |
 | Interfaces               | CLI, HTTP API and terminal dashboard                                                         |
-| Runtime implementation   | Small TypeScript service on a supported Node.js LTS release                                  |
+| Runtime implementation   | Small Go service shipped as one static binary; the 0.3.0 TypeScript service is its parity oracle |
 | First inference backend  | Isolated Python worker using pinned Diffusers and PyTorch                                    |
 | Future inference backend | Project-owned Media Engine implementing the same worker protocol                             |
 | Persistence              | Local SQLite job metadata; local files for assets and run manifests                          |
@@ -275,6 +278,16 @@ A worker entry may name a remote `https://` URL when it also names a client cert
 
 `text-to-audio` is a recipe pipeline on the `stable-audio-open` family (protocol 1.3). The default recipe `soundscape` takes `prompt` and optional `negative_prompt` and resolves `duration_seconds`, `steps`, `guidance` and `seed`. The output is `audio` (`audio/wav`); the job and manifest record sample rate, channels and actual duration. The runtime verifies the RIFF/WAVE header and size before success and exports `.wav`. The dashboard shows duration; playback happens in an external player.
 
+### Implementation language
+
+Runtime 0.4.0 is a Go rewrite of the 0.3.0 service, delivered before any other deferred capability so that the parity target is as small as it will ever be and so that the worker pool and network-mode stages are built on Go's concurrency and TLS primitives rather than ported later.
+
+- The rewrite MUST preserve the HTTP API, error codes, SSE semantics, configuration file, environment variables, SQLite schema and state directory layout, manifest schema, CLI commands, flags, output and exit codes of 0.3.0. A 0.3.0 state directory MUST be served by 0.4.0 without migration.
+- Parity is proven by running the 0.3.0 integration and dashboard test suites against the Go binary with Engine 0.3.0 before those suites are ported to Go.
+- The service ships as one static binary with no cgo and a pure-Go SQLite driver; dependencies are pinned in the module files and the toolchain version is recorded with the release.
+- The typed gateway client used by Studio remains a TypeScript package maintained in this repository; it is the only TypeScript retained, and it gains every later output, recipe and worker type.
+- 0.4.0 MUST NOT include any capability beyond 0.3.0. The TypeScript service is frozen when the rewrite starts and retired after the first Go feature release.
+
 ### Owned native engine as a selectable backend
 
 When Engine ships its native backend, the runtime accepts `backend_id: native-sdxl` beside `diffusers-sdxl` and `owned-sdxl`, records `ownership: engine` from the worker's `/v1/info`, and otherwise treats it identically: the caller chooses the backend explicitly, a request for a backend other than the running one is rejected, and no recipe, scheduler or parameter is reinterpreted. The runtime's integration suite runs unchanged against the native worker and is part of its acceptance.
@@ -296,13 +309,13 @@ Later stages extend the adapter rather than the gateway contract: multiple outpu
 | Stage                       | Delivered behavior                                                                                                                                      |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | First complete path         | CLI/API, one registered bundle and recipe, Diffusers worker, durable queue, cancellation, saved image/manifest, Studio Create integration (delivered)    |
-| Operator experience         | Terminal dashboard, improved diagnostics, explicit package/model installation workflows (delivered); conversion provenance workflow                      |
+| Operator experience         | Terminal dashboard, improved diagnostics, explicit package/model installation workflows (delivered); Go rewrite at parity; conversion provenance workflow |
 | Additional media operations | Image-to-image and LoRA (delivered); multiple outputs, upscaling, automatic settings with authorized fallbacks, linear typed recipes                    |
 | Owned inference engine      | Owned pipeline backend (delivered); native backend behind the unchanged worker protocol; caller explicitly chooses it                                    |
 | Broader execution           | Worker pool for multiple GPUs, remote workers over mutual TLS with API network mode, video, audio                                                        |
 
 ## Decisions before implementation
 
-Record final product/repository names, the exact reference model and hardware, dependency pins, supported Node/Python versions and distribution licenses. Use the proposed TypeScript control plane and isolated Python worker unless implementation evidence supports a smaller arrangement. Select concrete queue, storage and cancellation defaults and publish them as configuration rather than unexplained hard limits.
+Record final product/repository names, the exact reference model and hardware, dependency pins, supported Go/Python versions and distribution licenses. The control plane is Go from 0.4.0 (the 0.1.0 proposal of a TypeScript control plane was implemented through 0.3.0 and is superseded); the isolated Python worker remains until Engine's native backend exists. Select concrete queue, storage and cancellation defaults and publish them as configuration rather than unexplained hard limits.
 
-For the deferred stages, record before each starts: the per-MIME output limits, the pool scheduling tie-break when several idle workers match, the TLS material format and rotation expectations for remote workers and API network mode, the video and audio reference bundles and their licenses, and the retention rule for intermediate operation outputs. The next implementation step is protocol 1.2 support (multiple outputs, upscaling, conversion provenance, automatic settings and fallbacks) followed by linear typed recipes; the [implementation plan](docs/implementation-plan.md) sequences the rest.
+For the deferred stages, record before each starts: the per-MIME output limits, the pool scheduling tie-break when several idle workers match, the TLS material format and rotation expectations for remote workers and API network mode, the video and audio reference bundles and their licenses, and the retention rule for intermediate operation outputs. The next implementation step is the Go rewrite at 0.3.0 parity, then protocol 1.2 support (multiple outputs, upscaling, conversion provenance, automatic settings and fallbacks) followed by linear typed recipes; the [implementation plan](docs/implementation-plan.md) sequences the rest.
