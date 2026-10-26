@@ -1,0 +1,5 @@
+{
+  "model_id": "studio-sdxl",
+  "artifact_handle": "sdxl-base",
+  "source": {"repository": "stabilityai/stable-diffusion-xl-base-1.0", "license": "CreativeML Open RAIL++-M"}
+}

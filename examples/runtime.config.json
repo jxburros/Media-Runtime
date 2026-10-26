@@ -1,0 +1,16 @@
+{
+  "directory": ".runtime",
+  "port": 7810,
+  "queue_capacity": 32,
+  "cancellation_grace_ms": 10000,
+  "worker_timeout_ms": 30000,
+  "poll_interval_ms": 250,
+  "max_output_bytes": 33554432,
+  "output_retention_days": null,
+  "artifact_catalog": {"sdxl-base": "/absolute/path/to/local/sdxl-base"},
+  "credentials": [
+    {"token_env": "MEDIA_RUNTIME_TOKEN", "namespace": "owner", "operator": true},
+    {"token_env": "MEDIA_STUDIO_TOKEN", "namespace": "studio", "operator": false, "allowed_namespaces": ["studio:*"]}
+  ],
+  "worker": {"url": "http://127.0.0.1:7811", "token_env": "MEDIA_ENGINE_TOKEN"}
+}
