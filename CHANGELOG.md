@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 — 2026-10-26
+
+LoRA adapters as a separately advertised capability. Operators register an approved adapter
+directory (`POST /v1/adapters`, `adapters register`); submissions and recipes name up to four
+registered adapters with scales (`run --adapter ID[:SCALE]`). The runtime validates them through
+the worker, treats the adapter set as part of the worker load identity, records them in the job
+and manifest, and refuses them for workers that do not advertise adapters or speak only 1.0.
+
 ## 0.2.0 — 2026-10-26
 
 Operator-experience and additional-operation stages. Negotiates `media-worker/1.0` or `1.1` per

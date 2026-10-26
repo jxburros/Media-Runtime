@@ -90,7 +90,11 @@ test(
       max_output_bytes: 32 * 1024 * 1024,
       output_retention_days: null,
       max_input_bytes: 32 * 1024 * 1024,
-      artifact_catalog: { fixture: join(root, "model"), absent: join(root, "nope") },
+      artifact_catalog: {
+        fixture: join(root, "model"),
+        "fixture-lora": join(root, "lora"),
+        absent: join(root, "nope"),
+      },
       worker: {
         url: `http://127.0.0.1:${discovery.port}`,
         token_env: "MEDIA_TEST_WORKER_TOKEN",
@@ -441,6 +445,61 @@ test(
         },
       );
       await t.test(
+        "LoRA adapters are registered, validated and part of the load identity",
+        async () => {
+          await assert.rejects(
+            () => client.submit({ ...submit, adapters: [{ adapter_id: "fixture-lora" }] }),
+            (e) => e.status === 400 && e.code === "unknown_adapter",
+          );
+          const registered = await client.json("/v1/adapters", "POST", {
+            adapter_id: "fixture-lora",
+            artifact_handle: "fixture-lora",
+            source: { license: "test-only" },
+          });
+          assert.equal(registered.layout.format, "peft-lora");
+          assert.deepEqual(registered.layout.targets, ["text_encoder", "unet"]);
+          assert.equal((await client.adapters())[0].adapter_id, "fixture-lora");
+          await assert.rejects(
+            () =>
+              client.submit({
+                ...submit,
+                adapters: [{ adapter_id: "fixture-lora" }, { adapter_id: "fixture-lora" }],
+              }),
+            (e) => e.status === 400,
+          );
+          await assert.rejects(
+            () => client.submit({ ...submit, adapters: [{ adapter_id: "fixture-lora", scale: 5 }] }),
+            (e) => e.status === 400,
+          );
+          const before = (await client.health()).worker.loaded_bundle_digest;
+          const accepted = await client.submit({
+            ...submit,
+            adapters: [{ adapter_id: "fixture-lora", scale: 0.7 }],
+          });
+          const done = await wait(accepted.job_id);
+          assert.equal(done.state, "succeeded", JSON.stringify(done.error));
+          assert.deepEqual(done.adapters, [
+            { adapter_id: "fixture-lora", digest: registered.digest, scale: 0.7 },
+          ]);
+          const manifest = await client.manifest(done.job_id);
+          assert.equal(manifest.adapters[0].scale, 0.7);
+          assert.equal(manifest.backend.memory_estimate.adapters.length, 1);
+          const info = await runtime.worker.json("/v1/info");
+          assert.equal(info.loaded_bundle.adapters[0].scale, 0.7);
+          assert.equal(info.loaded_bundle.bundle_digest, before);
+          // A job without adapters needs a fresh load; the identity includes the adapter set.
+          const plain = await wait((await client.submit(submit)).job_id);
+          assert.equal(plain.state, "succeeded");
+          assert.deepEqual(plain.adapters, []);
+          assert.equal((await runtime.worker.json("/v1/info")).loaded_bundle.adapters.length, 0);
+          const reader = new MediaRuntimeClient(client.url, config.tokens[1].token);
+          await assert.rejects(
+            () => reader.json("/v1/adapters", "POST", { adapter_id: "x", artifact_handle: "fixture-lora" }),
+            (e) => e.status === 403,
+          );
+        },
+      );
+      await t.test(
         "protocol negotiation serves a 1.0 worker without image-to-image",
         async () => {
           assert.equal((await client.health()).worker.protocol, "media-worker/1.1");
@@ -464,6 +523,10 @@ test(
                   model_id: "fixture",
                   inputs: { prompt: "test", image: record.input_id },
                 }),
+              (e) => e.status === 400 && e.code === "unsupported",
+            );
+            await assert.rejects(
+              () => client.submit({ ...submit, adapters: [{ adapter_id: "fixture-lora" }] }),
               (e) => e.status === 400 && e.code === "unsupported",
             );
             const legacy = await client.submit(submit);

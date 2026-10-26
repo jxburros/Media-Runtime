@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { readdir, lstat, readFile, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { ApiError, hash, registration } from "./contracts.js";
+import { ApiError, adapterRegistration, hash, registration } from "./contracts.js";
 export async function buildBundle(
   raw: unknown,
   catalog: Record<string, string>,
@@ -260,4 +260,58 @@ export async function inspectCatalog(
       };
   }
   return entries;
+}
+
+/** Register an approved LoRA adapter directory: one safetensors file, hashed, no paths exposed. */
+export async function buildAdapter(
+  raw: unknown,
+  catalog: Record<string, string>,
+) {
+  const data = adapterRegistration.parse(raw);
+  const configured = catalog[data.artifact_handle];
+  if (!configured)
+    throw new ApiError(
+      400,
+      "missing_component",
+      "Artifact handle is not in the operator catalog",
+      "artifact_handle",
+    );
+  let root: string;
+  try {
+    root = await realpath(configured);
+  } catch {
+    throw new ApiError(400, "missing_component", "Approved adapter directory is unavailable");
+  }
+  const files: Record<string, string> = {};
+  try {
+    for (const name of (await readdir(root)).sort()) {
+      const info = await lstat(join(root, name));
+      if (info.isSymbolicLink())
+        throw new ApiError(400, "unsupported", "Adapter symlinks are not supported");
+      if (info.isDirectory())
+        throw new ApiError(400, "unsupported", "An adapter directory holds flat files only");
+      if (/\.(py|pkl|pickle|bin|pt|pth)$/.test(name))
+        throw new ApiError(400, "unsupported", "Use a safetensors LoRA file");
+      const digest = createHash("sha256");
+      for await (const chunk of createReadStream(join(root, name))) digest.update(chunk);
+      files[name] = digest.digest("hex");
+    }
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    throw new ApiError(400, "missing_component", "Cannot read the approved adapter");
+  }
+  if (Object.keys(files).filter((f) => f.endsWith(".safetensors")).length !== 1)
+    throw new ApiError(
+      400,
+      "unsupported",
+      "An adapter directory contains exactly one .safetensors file",
+    );
+  const record = {
+    schema_version: 1,
+    adapter_id: data.adapter_id,
+    artifact_handle: data.artifact_handle,
+    files,
+    source: data.source,
+  };
+  return { ...record, digest: hash(record) };
 }

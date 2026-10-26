@@ -220,6 +220,30 @@ export class Runtime {
           "parameters.strength",
         );
     }
+    const uses: { adapter_id: string; scale: number }[] =
+      request.adapters ?? recipe.adapters ?? [];
+    const adapters = uses.map((use) => {
+      const adapter = this.store.registry("adapters", use.adapter_id);
+      if (!adapter)
+        throw new ApiError(
+          400,
+          "unknown_adapter",
+          `Register adapter ${use.adapter_id} before using it`,
+          "adapters",
+        );
+      return { adapter, scale: use.scale };
+    });
+    if (new Set(uses.map((u) => u.adapter_id)).size !== uses.length)
+      throw new ApiError(400, "invalid_request", "Adapters must be distinct", "adapters");
+    if (adapters.length && (!caps.adapters || protocol === PROTOCOLS[0]))
+      throw new ApiError(
+        400,
+        "unsupported",
+        "The connected worker does not advertise LoRA adapters",
+        "adapters",
+      );
+    if (adapters.length > (caps.adapters?.max_adapters ?? 0))
+      throw new ApiError(400, "unsupported", "Too many adapters for this worker", "adapters");
     const backendId: string = caps.backend_id;
     const options = loadOptions.parse({
       ...caps.load_defaults,
@@ -244,16 +268,19 @@ export class Runtime {
       protocol,
       bundle: model.bundle,
       options,
+      ...(adapters.length ? { adapters } : {}),
     });
     return {
       task,
       request: {
         ...request,
         parameters: effective,
+        adapters: uses,
         backend_id: backendId,
         backend_options: { [backendId]: options },
       },
       input,
+      adapters,
       model,
       recipe,
       backend: {
@@ -470,15 +497,25 @@ export class Runtime {
           return;
         }
         const desired = job.request.backend_options[job.backend.backend_id];
+        const identity = (job.adapters ?? []).map((a) => ({
+          adapter_id: a.adapter.adapter_id,
+          digest: a.adapter.digest,
+          scale: a.scale,
+        }));
+        const loadedIdentity = (info.loaded_bundle?.adapters ?? []).map(
+          (a: any) => ({ adapter_id: a.adapter_id, digest: a.digest, scale: a.scale }),
+        );
         if (
           info.loaded_bundle?.bundle_digest !==
             job.model.bundle.bundle_digest ||
-          hash(info.loaded_bundle.options) !== hash(desired)
+          hash(info.loaded_bundle.options) !== hash(desired) ||
+          hash(loadedIdentity) !== hash(identity)
         ) {
           const op = await this.worker.json("/v1/model/load", "POST", {
             protocol,
             bundle: job.model.bundle,
             options: desired,
+            ...(identity.length ? { adapters: job.adapters } : {}),
           });
           refresh();
           job.load_operation_id = op.operation_id;
@@ -693,6 +730,12 @@ export class Runtime {
               },
             ]
           : [],
+        adapters: (job.adapters ?? []).map((a) => ({
+          adapter_id: a.adapter.adapter_id,
+          digest: a.adapter.digest,
+          scale: a.scale,
+          source: a.adapter.source,
+        })),
         backend: job.backend,
         worker: snapshot.implementation,
         effective_settings: snapshot.effective_settings,
@@ -759,6 +802,7 @@ export class Runtime {
         missing_dependencies: caps.missing_dependencies ?? [],
         dependencies: caps.dependencies ?? {},
         tasks: caps.tasks ?? ["text-to-image"],
+        adapters: caps.adapters ?? null,
         precisions: caps.precisions,
         load_defaults: caps.load_defaults,
         memory_budget_mb: caps.memory_budget_mb ?? null,
@@ -800,12 +844,28 @@ export class Runtime {
         };
       }),
     );
+    const adapters = await Promise.all(
+      this.store.registry("adapters").map(async (adapter: any) => {
+        const root = this.config.artifact_catalog[adapter.artifact_handle];
+        let available = true;
+        for (const relative of Object.keys(adapter.files)) {
+          try {
+            if (!root) throw new Error();
+            await access(join(root, relative));
+          } catch {
+            available = false;
+          }
+        }
+        return { adapter_id: adapter.adapter_id, digest: adapter.digest, available };
+      }),
+    );
     const jobs = this.store.all();
     return {
       runtime_version: VERSION,
       protocols: [...PROTOCOLS],
       worker,
       models,
+      adapters,
       recipes: this.store
         .registry("recipes")
         .map((r: any) => ({ recipe_id: r.recipe_id, pipeline: r.pipeline })),

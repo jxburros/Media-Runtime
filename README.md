@@ -43,6 +43,8 @@ node dist/cli.js models register examples/model.json
 node dist/cli.js models show studio-sdxl --verify   # re-hash through the worker; memory estimate
 node dist/cli.js run portrait --model studio-sdxl --prompt "Soft window light" --seed 42 --wait
 node dist/cli.js run variation --model studio-sdxl --prompt "Softer light" --image ./source.png --strength 0.5 --wait
+node dist/cli.js adapters register examples/adapter.json
+node dist/cli.js run portrait --model studio-sdxl --prompt "Soft window light" --adapter studio-style:0.8 --wait
 node dist/cli.js jobs list
 node dist/cli.js outputs export JOB_ID --directory ./exports
 node dist/cli.js tui
@@ -72,6 +74,16 @@ forbidden Python/pickle files and symlinks without hashing or registering, and p
 registration document for a complete bundle. `models register` hashes every file through the
 worker and records the bundle identity; `models show MODEL --verify` repeats that check later and
 returns the worker's memory estimate for its load defaults.
+
+## LoRA adapters
+
+An adapter is an approved directory in `artifact_catalog` holding one PEFT-layout safetensors
+file. `adapters register` hashes it and validates the layout through the worker; `adapters list`
+shows registrations. `run --adapter ID[:SCALE]` (repeatable, up to four) or a recipe's `adapters`
+list selects them. The adapter set is part of the worker's load identity: changing adapters or
+scales reloads the model, and the job and manifest record each adapter's digest and scale. Workers
+that do not advertise adapters, or that speak only `media-worker/1.0`, reject such requests.
+Kohya-format files are refused until converted to the PEFT layout.
 
 ## Image-to-image
 
@@ -106,8 +118,8 @@ leak prompts or grow without bound. Only this child can be terminated after the 
 period; forced termination settles the job as `execution_interrupted`, not confirmed cancellation.
 
 The worker contract is [media-worker/1.1](https://github.com/jxburros/Media-Engine/blob/main/docs/protocol.md).
-Runtime 0.2.0 negotiates the highest minor the worker lists: Engine 0.2.0 gives `media-worker/1.1`
-with image-to-image; Engine 0.1.0 gives `media-worker/1.0` with text-to-image only. There is one
+Runtime 0.3.0 negotiates the highest minor the worker lists: Engine 0.2.0 and later give
+`media-worker/1.1` with image-to-image and (Engine 0.3.0) LoRA adapters; Engine 0.1.0 gives `media-worker/1.0` with text-to-image only. There is one
 active execution and at most 32 queued jobs by default; all operational limits are in the config.
 Requested model, backend, seed, dimensions, precision and scheduler are never silently changed.
 
@@ -143,6 +155,6 @@ runtime and imports verified output copies with provenance. Personal and project
 Keep Media-Engine beside this checkout (or set `MEDIA_ENGINE_REPO`) and run `npm test`.
 The integration suite drives the real worker HTTP server using an explicitly identified test backend
 located only in Engine's tests, covering text-to-image, image-to-image, 1.0 negotiation, catalog
-inspection and verification; `test/tui.test.mjs` renders the dashboard and doctor output. The
+inspection, verification and LoRA adapters; `test/tui.test.mjs` renders the dashboard and doctor output. The
 fixture is not an inference fallback. GPU image quality and hardware
 compatibility require the selected real bundle; see [implementation decisions](docs/decisions.md).

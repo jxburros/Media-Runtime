@@ -2,7 +2,7 @@ import { z } from "zod";
 import { createHash, randomBytes } from "node:crypto";
 export const PROTOCOLS = ["media-worker/1.0", "media-worker/1.1"] as const;
 export const PROTOCOL = PROTOCOLS[PROTOCOLS.length - 1];
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 export const BACKENDS = ["diffusers-sdxl", "owned-sdxl"] as const;
 export const TASKS = ["text-to-image", "image-to-image"] as const;
 export const id = z.string().regex(/^[a-zA-Z0-9_-]{1,80}$/);
@@ -37,12 +37,17 @@ export const loadOptions = z
     offload: z.literal("none"),
   })
   .strict();
+export const MAX_ADAPTERS = 4;
+export const adapterUse = z
+  .object({ adapter_id: id, scale: z.number().min(0).max(2).default(1) })
+  .strict();
 export const submission = z
   .object({
     recipe_id: id,
     model_id: id,
     inputs,
     parameters: parameters.partial().default({}),
+    adapters: z.array(adapterUse).max(MAX_ADAPTERS).optional(),
     backend_id: z.enum(BACKENDS).optional(),
     backend_options: z
       .object({
@@ -73,6 +78,7 @@ export const recipeSchema = z
       })
       .strict(),
     defaults: parameters.partial(),
+    adapters: z.array(adapterUse).max(MAX_ADAPTERS).optional(),
   })
   .strict()
   .refine(
@@ -89,6 +95,20 @@ export const recipeSchema = z
 export const registration = z
   .object({
     model_id: id,
+    artifact_handle: id,
+    source: z
+      .object({
+        repository: z.string().max(300).optional(),
+        revision: z.string().max(100).optional(),
+        license: z.string().max(300).optional(),
+      })
+      .strict()
+      .default({}),
+  })
+  .strict();
+export const adapterRegistration = z
+  .object({
+    adapter_id: id,
     artifact_handle: id,
     source: z
       .object({
@@ -229,6 +249,7 @@ export type Job = {
   model: any;
   backend: any;
   input?: InputRecord;
+  adapters: { adapter: any; scale: number }[];
   attempt_id?: string;
   session_id?: string;
   execution_id?: string;

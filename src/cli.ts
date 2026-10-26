@@ -15,8 +15,9 @@ media-runtime serve --config runtime.config.json
 media-runtime doctor [--json]
 media-runtime models inspect [HANDLE] | models register model.json | models list | models show MODEL [--verify]
 media-runtime recipes register recipe.json | recipes list | recipes inspect portrait
+media-runtime adapters register adapter.json | adapters list
 media-runtime inputs upload image.png | inputs list | inputs delete INPUT
-media-runtime run RECIPE --model MODEL --prompt TEXT [--image FILE|INPUT] [--strength S] [--seed N] [--wait] [--json]
+media-runtime run RECIPE --model MODEL --prompt TEXT [--image FILE|INPUT] [--strength S] [--adapter ID[:SCALE]]... [--seed N] [--wait] [--json]
 media-runtime jobs list | jobs watch JOB | jobs cancel JOB | jobs retry JOB
 media-runtime outputs export JOB --directory DIR
 media-runtime tui
@@ -69,6 +70,11 @@ export function explainDoctor(report: any): { lines: string[]; healthy: boolean 
       `Model ${m.model_id} (${m.artifact_handle}): ${m.available ? "all registered files present" : `MISSING ${m.missing_roles.join(", ")}`}${m.loaded ? "; loaded in the worker" : ""}`,
     );
   }
+  for (const a of report.adapters ?? []) {
+    if (!a.available) healthy = false;
+    lines.push(`Adapter ${a.adapter_id}: ${a.available ? "files present" : "MISSING files"}`);
+  }
+  if (w.adapters === null) lines.push("  LoRA adapters: not advertised by this worker");
   lines.push(`Recipes: ${(report.recipes ?? []).map((r: any) => `${r.recipe_id} (${r.pipeline})`).join(", ")}`);
   const s = report.storage ?? {};
   if (!s.writable) healthy = false;
@@ -105,6 +111,7 @@ async function main() {
       "negative-prompt": { type: "string" },
       image: { type: "string" },
       strength: { type: "string" },
+      adapter: { type: "string", multiple: true },
       seed: { type: "string" },
       width: { type: "string" },
       height: { type: "string" },
@@ -246,7 +253,7 @@ async function main() {
     print(await client.model(args[2], !!values.verify));
     return;
   }
-  if (["models", "recipes"].includes(args[0])) {
+  if (["models", "recipes", "adapters"].includes(args[0])) {
     if (args[1] === "register" && args[2]) {
       print(
         await client.json(
@@ -314,6 +321,16 @@ async function main() {
           ...(image ? { image } : {}),
         },
         parameters,
+        ...(values.adapter?.length
+          ? {
+              adapters: values.adapter.map((entry) => {
+                const [adapter_id, scale] = entry.split(":");
+                return scale === undefined
+                  ? { adapter_id }
+                  : { adapter_id, scale: Number(scale) };
+              }),
+            }
+          : {}),
         ...(values.backend ? { backend_id: values.backend } : {}),
         ...(values.precision
           ? {

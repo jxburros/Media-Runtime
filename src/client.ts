@@ -52,6 +52,9 @@ export class MediaRuntimeClient {
       "/v1/catalog" + (handle ? `?handle=${encodeURIComponent(handle)}` : ""),
     );
   }
+  adapters() {
+    return this.json("/v1/adapters");
+  }
   recipes() {
     return this.json("/v1/recipes");
   }

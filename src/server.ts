@@ -16,7 +16,7 @@ import {
   terminal,
 } from "./contracts.js";
 import { Runtime } from "./runtime.js";
-import { buildBundle, inspectCatalog } from "./models.js";
+import { buildAdapter, buildBundle, inspectCatalog } from "./models.js";
 export function createRuntimeServer(runtime: Runtime) {
   const streams = new Set<ServerResponse>();
   const server = createServer(async (req, res) => {
@@ -236,6 +236,38 @@ export function createRuntimeServer(runtime: Runtime) {
           memory_estimate: validation?.memory_estimate ?? null,
         });
       }
+      if (path === "/v1/adapters" && method === "GET")
+        return send(
+          200,
+          runtime.store.registry("adapters").map((a: any) => ({
+            adapter_id: a.adapter_id,
+            artifact_handle: a.artifact_handle,
+            digest: a.digest,
+            source: a.source,
+            files: Object.keys(a.files).length,
+          })),
+        );
+      if (path === "/v1/adapters" && method === "POST") {
+        operator();
+        const adapter = await buildAdapter(await body(), runtime.config.artifact_catalog);
+        const { caps, protocol } = await runtime.worker.probe();
+        if (!caps.adapters || protocol === PROTOCOLS[0])
+          throw new ApiError(
+            503,
+            "unsupported",
+            "The connected worker does not advertise LoRA adapters",
+          );
+        const validation = await runtime.worker.json("/v1/validate", "POST", {
+          protocol,
+          adapters: [{ adapter, scale: 1 }],
+        });
+        runtime.store.register("adapters", adapter.adapter_id, adapter);
+        return send(201, {
+          adapter_id: adapter.adapter_id,
+          digest: adapter.digest,
+          layout: validation?.adapters?.[0]?.layout ?? null,
+        });
+      }
       if (path === "/v1/recipes" && method === "GET")
         return send(200, runtime.store.registry("recipes"));
       if (path === "/v1/recipes" && method === "POST") {
@@ -440,10 +472,15 @@ export function publicInput(record: any) {
   return rest;
 }
 export function publicJob(job: any) {
-  const { namespace, model, backend, recipe, manifest, input, ...rest } = job;
+  const { namespace, model, backend, recipe, manifest, input, adapters, ...rest } = job;
   return {
     ...rest,
     input: input ? publicInput(input) : undefined,
+    adapters: (adapters ?? []).map((a: any) => ({
+      adapter_id: a.adapter.adapter_id,
+      digest: a.adapter.digest,
+      scale: a.scale,
+    })),
     model: {
       model_id: model.model_id,
       bundle_digest: model.bundle.bundle_digest,

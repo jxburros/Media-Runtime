@@ -49,3 +49,15 @@
 - Installation workflow: operators download bundles out of band, map them in `artifact_catalog`,
   run `models inspect` (no hashing, no registration, no paths in the output), then `models register`.
   Registration and `models show --verify` hash every byte through the worker.
+
+# Implementation decisions — 0.3.0
+
+- LoRA adapters are registry objects like models: an opaque catalog handle to a directory with one
+  safetensors file, hashed per file, validated by the worker (PEFT layout only). Requests name
+  `adapters: [{adapter_id, scale}]`; a recipe may carry a default list that a request replaces
+  wholesale. Scales are 0–2; at most four distinct adapters.
+- Adapters are part of the worker load identity, not the execution: the runtime reloads when the
+  adapter set or any scale differs, exactly as for precision. This keeps the owned pipeline free to
+  merge deltas in place and keeps per-execution cost equal to the base model.
+- Kohya-format files are refused by the worker rather than silently converted; operators convert
+  to the PEFT layout first. The runtime surfaces the worker's `unsupported` error unchanged.

@@ -24,6 +24,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS idempotency (namespace TEXT NOT NULL, key TEXT NOT NULL, digest TEXT NOT NULL, job_id TEXT NOT NULL REFERENCES jobs(job_id), PRIMARY KEY(namespace,key));
       CREATE TABLE IF NOT EXISTS models (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS recipes (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS adapters (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS inputs (input_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS inputs_namespace ON inputs(namespace, input_id);`);
     for (const recipe of defaultRecipes)
@@ -140,7 +141,7 @@ export class Store {
       this.event(job, "job_state", { state });
     });
   }
-  registry(kind: "models" | "recipes", id?: string): any {
+  registry(kind: "models" | "recipes" | "adapters", id?: string): any {
     if (id) {
       const row = this.db
         .prepare(`SELECT data FROM ${kind} WHERE id=?`)
@@ -152,7 +153,7 @@ export class Store {
       .all()
       .map((r: any) => JSON.parse(r.data));
   }
-  register(kind: "models" | "recipes", id: string, data: any) {
+  register(kind: "models" | "recipes" | "adapters", id: string, data: any) {
     this.db
       .prepare(
         `INSERT INTO ${kind} VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
