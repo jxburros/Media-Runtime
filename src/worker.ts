@@ -1,12 +1,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { ApiError, PROTOCOL } from "./contracts.js";
+import { ApiError, BACKENDS, PROTOCOLS, negotiate } from "./contracts.js";
 import type { Config } from "./config.js";
 export class WorkerClient {
   child?: ChildProcess;
   url: string;
   token: string;
   discoveredSession?: string;
+  /** Protocol minor negotiated with the current worker session; set by probe(). */
+  protocol: (typeof PROTOCOLS)[number] = PROTOCOLS[0];
   constructor(public config: Config) {
     this.url = config.worker.url.replace(/\/$/, "");
     this.token = process.env[config.worker.token_env] || "";
@@ -60,7 +62,7 @@ export class WorkerClient {
     });
     child.stdout?.resume();
     if (
-      record.protocol !== PROTOCOL ||
+      !PROTOCOLS.includes(record.protocol) ||
       record.pid !== child.pid ||
       !Number.isInteger(record.port) ||
       record.port < 1 ||
@@ -77,16 +79,25 @@ export class WorkerClient {
     path: string,
     method = "GET",
     body?: unknown,
+    contentType?: string,
   ): Promise<Response> {
     let response: Response;
+    const binary = body instanceof Uint8Array;
     try {
       response = await fetch(this.url + path, {
         method,
         headers: {
           Authorization: `Bearer ${this.token}`,
-          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          ...(body === undefined
+            ? {}
+            : { "Content-Type": contentType || "application/json" }),
         },
-        body: body === undefined ? undefined : JSON.stringify(body),
+        body:
+          body === undefined
+            ? undefined
+            : binary
+              ? (body as Uint8Array)
+              : JSON.stringify(body),
         signal: AbortSignal.timeout(this.config.worker_timeout_ms),
         redirect: "error",
       });
@@ -115,8 +126,13 @@ export class WorkerClient {
     }
     return response;
   }
-  async json(path: string, method = "GET", body?: unknown): Promise<any> {
-    const r = await this.response(path, method, body);
+  async json(
+    path: string,
+    method = "GET",
+    body?: unknown,
+    contentType?: string,
+  ): Promise<any> {
+    const r = await this.response(path, method, body, contentType);
     return r.json();
   }
   async probe() {
@@ -125,23 +141,36 @@ export class WorkerClient {
       this.json("/v1/capabilities"),
     ]);
     if (
-      info.protocol !== PROTOCOL ||
-      caps.protocol !== PROTOCOL ||
       info.session_id !== caps.session_id ||
       (this.discoveredSession && this.discoveredSession !== info.session_id)
     )
       throw new ApiError(
         503,
         "protocol_mismatch",
-        "Requires media-worker/1.0 in the discovered worker session",
+        "Worker identity changed between discovery and readiness",
       );
-    if (caps.backend_id !== "diffusers-sdxl")
+    // Negotiate the highest minor both sides implement; the worker's list is authoritative.
+    const protocol = negotiate(info.supported_protocols, info.protocol);
+    if (negotiate(caps.supported_protocols, caps.protocol) !== protocol)
+      throw new ApiError(
+        503,
+        "protocol_mismatch",
+        "Worker info and capabilities disagree about the protocol",
+      );
+    this.protocol = protocol;
+    const expected = this.config.worker.backend_id;
+    if (
+      !BACKENDS.includes(caps.backend_id) ||
+      (expected && caps.backend_id !== expected)
+    )
       throw new ApiError(
         503,
         "unsupported_backend",
-        "This release supports the explicit diffusers-sdxl backend",
+        expected
+          ? `Configured backend ${expected} is not the running worker's backend`
+          : `Supported backends are ${BACKENDS.join(", ")}`,
       );
-    return { info, caps };
+    return { info, caps, protocol };
   }
   async stop() {
     const child = this.child;

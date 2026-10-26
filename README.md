@@ -1,11 +1,14 @@
 # Media Runtime
 
-A standalone, authenticated local media service with a TypeScript CLI/API, SQLite FIFO jobs,
-resumable job events, cancellation, immutable PNG outputs and provenance. Media Engine is its
-separately installed SDXL inference worker. Studio connects to this service through its gateway.
+A standalone, authenticated local media service with a TypeScript CLI/API, terminal dashboard,
+SQLite FIFO jobs, resumable job events, cancellation, durable PNG inputs, immutable PNG outputs and
+provenance. Media Engine is its separately installed SDXL inference worker. Studio connects to this
+service through its gateway.
 
-This release implements the **first increment** in [runtime-spec.md](runtime-spec.md).
-The terminal dashboard, img2img, LoRA, video, multi-GPU and owned native inference are later stages.
+This release implements the **first complete path**, the **operator experience** stage and
+image-to-image from the **additional media operations** stage in [runtime-spec.md](runtime-spec.md),
+and accepts Engine's **owned pipeline** backend behind the unchanged worker protocol. LoRA,
+upscaling, video, multi-GPU and native inference are later stages.
 
 ## Install and run
 
@@ -35,17 +38,51 @@ npm run build
 node dist/cli.js serve --config runtime.config.json
 # In another terminal, with MEDIA_RUNTIME_TOKEN configured:
 node dist/cli.js doctor
+node dist/cli.js models inspect            # what each catalog handle is missing, before registering
 node dist/cli.js models register examples/model.json
+node dist/cli.js models show studio-sdxl --verify   # re-hash through the worker; memory estimate
 node dist/cli.js run portrait --model studio-sdxl --prompt "Soft window light" --seed 42 --wait
+node dist/cli.js run variation --model studio-sdxl --prompt "Softer light" --image ./source.png --strength 0.5 --wait
 node dist/cli.js jobs list
 node dist/cli.js outputs export JOB_ID --directory ./exports
+node dist/cli.js tui
 ```
 
 Use `npm link` if you want the `media-runtime` executable on PATH. `run` without `--wait` returns
-immediately; closing a CLI or browser never cancels an accepted job. `jobs watch`, `jobs cancel`,
-`jobs retry`, `recipes list`, `recipes inspect`, and `recipes register` use the same public API.
-`--json` produces machine-readable records. Exit codes: 0 success, 2 invalid input, 3 unavailable
-service, 4 a failed/cancelled job when waiting. Explicit retry creates a new linked job.
+immediately; closing a CLI, dashboard or browser never cancels an accepted job. `jobs watch`,
+`jobs cancel`, `jobs retry`, `recipes list`, `recipes inspect`, `recipes register`, `inputs upload`,
+`inputs list` and `inputs delete` use the same public API. `--json` produces machine-readable
+records. Exit codes: 0 success, 2 invalid input (and an incomplete `models inspect`), 3 unavailable
+service (and a `doctor` that found problems), 4 a failed/cancelled job when waiting. Explicit retry
+creates a new linked job.
+
+`doctor` explains the negotiated protocol, backend and ownership stage, device readiness, missing
+worker dependencies, load defaults, the memory estimate with its basis, registered models and their
+missing components, recipes, writable storage and free space, and the queue. `tui` is a terminal
+dashboard over the public API: queue, stage and step progress, model, backend, seed, output
+location and errors, with `j`/`k` to select, `c` to cancel and `q` to quit. It adds no execution
+behavior; images open in an external viewer after `outputs export`.
+
+## Model installation workflow
+
+Nothing here downloads weights. Download the complete SDXL base Diffusers bundle out of band,
+place it in a directory the service may read, add the directory to `artifact_catalog` under an
+opaque handle, then run `models inspect`. It lists each handle's completeness, missing roles,
+forbidden Python/pickle files and symlinks without hashing or registering, and prints the
+registration document for a complete bundle. `models register` hashes every file through the
+worker and records the bundle identity; `models show MODEL --verify` repeats that check later and
+returns the worker's memory estimate for its load defaults.
+
+## Image-to-image
+
+The `variation` recipe (pipeline `image-to-image`) takes an uploaded PNG input. `run --image FILE`
+uploads the file first (`inputs upload` does the same) and submits the returned `input_id`; the
+service never accepts a client path. Inputs are durable, namespace-owned and listed by
+`inputs list`. The resolved width and height are the image's own dimensions, and overriding them to
+other values is an error: nothing is resized. `strength` (request, then recipe, then worker default)
+controls how many of `steps` are actually sampled; the job records `effective_steps`, progress
+reports the real total and the manifest lists the input's digest. Inputs follow
+`output_retention_days` and cannot be deleted while a job references them.
 
 `MEDIA_RUNTIME_URL` defaults to `http://127.0.0.1:7810`. `MEDIA_RUNTIME_NAMESPACE` supplies a namespace
 only for a credential with a matching `allowed_namespaces` grant. Never put an integration token
@@ -62,14 +99,17 @@ private worker instead, set `worker.command` to an argument array, for example:
 ```
 
 Runtime generates a per-launch worker token, reads the startup record, checks session/protocol
-identity and probes readiness. Stdout is drained and stderr is not retained, so worker logs cannot
+identity and probes readiness. Engine's `--backend owned-sdxl` runs the project-owned pipeline;
+set `worker.backend_id` to pin which backend Runtime expects, and pass `--backend` on `run` to
+state the choice explicitly. A request for a backend other than the running one is rejected. Stdout is drained and stderr is not retained, so worker logs cannot
 leak prompts or grow without bound. Only this child can be terminated after the cancellation grace
 period; forced termination settles the job as `execution_interrupted`, not confirmed cancellation.
 
-The worker contract is [media-worker/1.0](https://github.com/jxburros/Media-Engine/blob/main/docs/protocol.md).
-Versions 0.1.0 of both apps are compatible. There is one active execution and at most 32 queued
-jobs by default; all operational limits are in the config. Requested model, seed, dimensions,
-precision and scheduler are never silently changed.
+The worker contract is [media-worker/1.1](https://github.com/jxburros/Media-Engine/blob/main/docs/protocol.md).
+Runtime 0.2.0 negotiates the highest minor the worker lists: Engine 0.2.0 gives `media-worker/1.1`
+with image-to-image; Engine 0.1.0 gives `media-worker/1.0` with text-to-image only. There is one
+active execution and at most 32 queued jobs by default; all operational limits are in the config.
+Requested model, backend, seed, dimensions, precision and scheduler are never silently changed.
 
 ## Persistence and recovery
 
@@ -85,9 +125,9 @@ size, SHA-256 and PNG dimensions, then fsynced with the manifest before the data
 The worker's copy is discarded only after that commit. This is not an exactly-once guarantee across
 process crashes. Keep one Runtime per state directory; the CLI uses an exclusive process lock.
 
-Outputs/events have no automatic expiry by default. Set `output_retention_days` explicitly to expire
-outputs; manifests and authorized metadata remain, and retrieval returns 410. Active jobs and
-uncollected Engine outputs are preserved. Exports create copies and refuse to overwrite files.
+Outputs, inputs and events have no automatic expiry by default. Set `output_retention_days`
+explicitly to expire outputs and inputs; manifests and authorized metadata remain, and retrieval
+returns 410. Active jobs, referenced inputs and uncollected Engine outputs are preserved. Exports create copies and refuse to overwrite files.
 Prompts remain private job data. Local state uses directory mode 0700 and file mode 0600.
 
 ## Studio
@@ -102,5 +142,7 @@ runtime and imports verified output copies with provenance. Personal and project
 
 Keep Media-Engine beside this checkout (or set `MEDIA_ENGINE_REPO`) and run `npm test`.
 The integration suite drives the real worker HTTP server using an explicitly identified test backend
-located only in Engine's tests. It is not an inference fallback. GPU image quality and hardware
+located only in Engine's tests, covering text-to-image, image-to-image, 1.0 negotiation, catalog
+inspection and verification; `test/tui.test.mjs` renders the dashboard and doctor output. The
+fixture is not an inference fallback. GPU image quality and hardware
 compatibility require the selected real bundle; see [implementation decisions](docs/decisions.md).

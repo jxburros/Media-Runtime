@@ -10,6 +10,40 @@ import { MediaRuntimeClient } from "../dist/client.js";
 const engine = resolve(process.env.MEDIA_ENGINE_REPO || "../Media-Engine");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const token = "runtime-test-token-not-a-secret-000000000000";
+import { deflateSync } from "node:zlib";
+function makePng(width, height) {
+  const crcTable = [];
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    crcTable.push(c >>> 0);
+  }
+  const crc = (buf) => {
+    let c = 0xffffffff;
+    for (const b of buf) c = crcTable[(c ^ b) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
+    const sum = Buffer.alloc(4);
+    sum.writeUInt32BE(crc(body));
+    return Buffer.concat([length, body, sum]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  const row = Buffer.concat([Buffer.from([0]), Buffer.alloc(width * 3, 0x40)]);
+  return Buffer.concat([
+    Buffer.from("89504e470d0a1a0a", "hex"),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", deflateSync(Buffer.concat(Array(height).fill(row)))),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
 const workerToken = "worker-test-token-not-a-secret-000000000000";
 const submit = {
   recipe_id: "portrait",
@@ -55,7 +89,8 @@ test(
       worker_timeout_ms: 1000,
       max_output_bytes: 32 * 1024 * 1024,
       output_retention_days: null,
-      artifact_catalog: { fixture: join(root, "model") },
+      max_input_bytes: 32 * 1024 * 1024,
+      artifact_catalog: { fixture: join(root, "model"), absent: join(root, "nope") },
       worker: {
         url: `http://127.0.0.1:${discovery.port}`,
         token_env: "MEDIA_TEST_WORKER_TOKEN",
@@ -339,6 +374,137 @@ test(
             }
           },
         );
+      await t.test(
+        "image-to-image flows through durable, namespace-owned inputs",
+        async () => {
+          const record = await client.uploadInput(makePng(64, 64));
+          assert.equal(record.width, 64);
+          assert.equal(record.namespace, undefined);
+          const reader = new MediaRuntimeClient(client.url, config.tokens[1].token);
+          await assert.rejects(
+            () => reader.input(record.input_id),
+            (e) => e.status === 404,
+          );
+          await assert.rejects(
+            () =>
+              client.submit({
+                ...submit,
+                inputs: { prompt: "test", image: record.input_id },
+              }),
+            (e) => e.status === 400 && e.field === "inputs.image",
+          );
+          await assert.rejects(
+            () =>
+              client.submit({
+                recipe_id: "variation",
+                model_id: "fixture",
+                inputs: { prompt: "test", image: record.input_id },
+                parameters: { width: 128, steps: 4 },
+              }),
+            (e) => e.status === 400 && e.field === "parameters.width",
+          );
+          await assert.rejects(
+            () =>
+              client.submit({
+                recipe_id: "variation",
+                model_id: "fixture",
+                inputs: { prompt: "test" },
+                parameters: { steps: 4 },
+              }),
+            (e) => e.status === 400 && e.field === "inputs.image",
+          );
+          const accepted = await client.submit({
+            recipe_id: "variation",
+            model_id: "fixture",
+            inputs: { prompt: "test", image: record.input_id },
+            parameters: { steps: 4 },
+          });
+          await wait(accepted.job_id, (j) => !!j.execution_id);
+          await assert.rejects(
+            () => client.deleteInput(record.input_id),
+            (e) => e.status === 409,
+          );
+          const done = await wait(accepted.job_id);
+          assert.equal(done.state, "succeeded", JSON.stringify(done.error));
+          assert.equal(done.task, "image-to-image");
+          assert.equal(done.request.parameters.width, 64);
+          assert.equal(done.request.parameters.strength, 0.6);
+          assert.equal(done.input.sha256, record.sha256);
+          const manifest = await client.manifest(done.job_id);
+          assert.equal(manifest.task, "image-to-image");
+          assert.equal(manifest.inputs[0].sha256, record.sha256);
+          assert.equal(manifest.effective_settings.effective_steps, 2);
+          assert.equal(manifest.backend.protocol, "media-worker/1.1");
+          await wait(done.job_id, (j) => j.released === true);
+          assert.equal((await client.deleteInput(record.input_id)).deleted, true);
+          assert.equal((await client.inputs()).length, 0);
+        },
+      );
+      await t.test(
+        "protocol negotiation serves a 1.0 worker without image-to-image",
+        async () => {
+          assert.equal((await client.health()).worker.protocol, "media-worker/1.1");
+          const original = runtime.worker.probe.bind(runtime.worker);
+          const originalJson = runtime.worker.json.bind(runtime.worker);
+          runtime.worker.json = async (path, method, body, type) => {
+            const result = await originalJson(path, method, body, type);
+            if (path === "/v1/info" || path === "/v1/capabilities") {
+              delete result.supported_protocols;
+              result.protocol = "media-worker/1.0";
+            }
+            return result;
+          };
+          try {
+            assert.equal((await client.health()).worker.protocol, "media-worker/1.0");
+            const record = await client.uploadInput(makePng(64, 64));
+            await assert.rejects(
+              () =>
+                client.submit({
+                  recipe_id: "variation",
+                  model_id: "fixture",
+                  inputs: { prompt: "test", image: record.input_id },
+                }),
+              (e) => e.status === 400 && e.code === "unsupported",
+            );
+            const legacy = await client.submit(submit);
+            assert.equal((await wait(legacy.job_id)).state, "succeeded");
+            assert.equal(
+              (await client.manifest(legacy.job_id)).backend.protocol,
+              "media-worker/1.0",
+            );
+            await client.deleteInput(record.input_id);
+          } finally {
+            runtime.worker.json = originalJson;
+            runtime.worker.probe = original;
+          }
+        },
+      );
+      await t.test(
+        "catalog inspection and model verification guide installation",
+        async () => {
+          const entries = await client.catalog();
+          const fixture = entries.find((e) => e.artifact_handle === "fixture");
+          assert.equal(fixture.complete, true);
+          assert.deepEqual(fixture.registration, {
+            model_id: "fixture",
+            artifact_handle: "fixture",
+          });
+          const absent = entries.find((e) => e.artifact_handle === "absent");
+          assert.equal(absent.present, false);
+          assert.equal(absent.complete, false);
+          assert.ok(!JSON.stringify(entries).includes(root));
+          const reader = new MediaRuntimeClient(client.url, config.tokens[1].token);
+          await assert.rejects(() => reader.catalog(), (e) => e.status === 403);
+          const detail = await client.model("fixture", true);
+          assert.equal(detail.verification.valid, true);
+          assert.equal(detail.verification.memory_estimate.source, "safetensors_headers");
+          assert.equal(detail.components.length, 7);
+          const newest = await client.jobs({ limit: 2, newest: true });
+          assert.equal(newest.jobs.length, 2);
+          assert.equal(newest.next_cursor, null);
+          assert.ok(newest.jobs[0].created_at >= newest.jobs[1].created_at);
+        },
+      );
       await t.test(
         "failure is private and lost session never regenerates",
         async () => {

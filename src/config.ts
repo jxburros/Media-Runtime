@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { readFileSync } from "node:fs";
 import { resolve, isAbsolute } from "node:path";
-import { id } from "./contracts.js";
+import { BACKENDS, id } from "./contracts.js";
 const positive = z.number().int().positive();
 const schema = z
   .object({
@@ -12,6 +12,7 @@ const schema = z
     poll_interval_ms: positive.default(250),
     worker_timeout_ms: positive.default(30000),
     max_output_bytes: positive.default(32 * 1024 * 1024),
+    max_input_bytes: positive.default(32 * 1024 * 1024),
     output_retention_days: z.number().positive().nullable().default(null),
     credentials: z
       .array(
@@ -31,6 +32,7 @@ const schema = z
         url: z.string().url().default("http://127.0.0.1:7811"),
         token_env: z.string().default("MEDIA_ENGINE_TOKEN"),
         command: z.array(z.string()).min(1).optional(),
+        backend_id: z.enum(BACKENDS).optional(),
       })
       .strict(),
   })
