@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -198,9 +199,20 @@ func truthy(v any) bool {
 	return true
 }
 
+// Caller is the authenticated identity a request runs under.
+type Caller struct {
+	Namespace      string
+	AllowFallbacks bool
+}
+
+func forbidden(field, message string) error {
+	return c.Err(400, "invalid_request", message, field)
+}
+
 // Resolve validates a submission against the registries and the live worker. The result is
 // the job's task, request, input, adapters, model, recipe and backend, in that order.
-func (r *Runtime) Resolve(body any, namespace string) (*jsonv.Object, error) {
+func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
+	namespace := caller.Namespace
 	request, err := c.Validate(c.Submission, body)
 	if err != nil {
 		return nil, err
@@ -224,7 +236,8 @@ func (r *Runtime) Resolve(body any, namespace string) (*jsonv.Object, error) {
 		return nil, err
 	}
 	info, caps, protocol := p.Info, p.Caps, p.Protocol
-	if !truthy(caps.Get("ready")) || !truthy(info.Get("service_ready")) {
+	minor := c.Minor(protocol)
+	if !truthy(info.Get("service_ready")) || !(truthy(caps.Get("ready")) || cpuFallbackReady(caps, protocol, request)) {
 		return nil, c.Err(503, "backend_unavailable", "Worker dependencies or selected device are not ready")
 	}
 	if b := request.Str("backend_id"); b != "" && b != caps.Str("backend_id") {
@@ -234,14 +247,67 @@ func (r *Runtime) Resolve(body any, namespace string) (*jsonv.Object, error) {
 	if _, ok := caps.Get("tasks").([]any); ok {
 		tasks = strList(caps.Get("tasks"))
 	}
-	if !c.Contains(tasks, task) || (task != "text-to-image" && protocol == c.PROTOCOLS[0]) {
+	if !c.Contains(tasks, task) || minor < c.TaskMinor(task) {
 		return nil, c.Err(400, "unsupported", "The connected worker does not advertise "+task, "recipe_id")
+	}
+	// The model's family must serve the recipe, and from 1.2 the worker must load that family.
+	bundle := model.Obj("bundle")
+	family := bundle.Str("family")
+	if family != recipe.Str("model_family") {
+		return nil, c.Err(400, "unsupported", "Model "+model.Str("model_id")+" is a "+family+" bundle; recipe "+recipe.Str("recipe_id")+" needs "+recipe.Str("model_family"), "model_id")
+	}
+	if minor >= 2 && !loads(caps, family) {
+		return nil, c.Err(400, "unsupported", "The connected worker does not load the "+family+" family", "model_id")
+	}
+	var taskParameters *jsonv.Object
+	if minor >= 2 {
+		taskParameters = caps.Obj("task_parameters").Obj(task)
 	}
 	inputs := request.Obj("inputs")
 	params := request.Obj("parameters")
+	usesImage := task == "image-to-image" || task == "upscale"
+	if task == "upscale" {
+		if inputs.Has("prompt") || inputs.Has("negative_prompt") {
+			field := "inputs.prompt"
+			if !inputs.Has("prompt") {
+				field = "inputs.negative_prompt"
+			}
+			return nil, forbidden(field, "An upscale takes an image and no prompt")
+		}
+		for _, k := range []string{"seed", "steps", "guidance", "sampler", "scheduler", "strength", "count"} {
+			if params.Has(k) {
+				return nil, forbidden("parameters."+k, "An upscale has no "+k+"; it enlarges by the model's fixed factor")
+			}
+		}
+		if request.Has("adapters") {
+			return nil, forbidden("adapters", "Adapters do not apply to an upscale")
+		}
+	} else if !inputs.Has("prompt") {
+		return nil, c.Invalid([]string{"inputs", "prompt"})
+	} else if params.Has("tile") || params.Has("tile_overlap") {
+		field := "parameters.tile"
+		if !params.Has("tile") {
+			field = "parameters.tile_overlap"
+		}
+		return nil, forbidden(field, "Tiling applies to upscale recipes only")
+	}
+	if params.Has("count") {
+		if task != "text-to-image" {
+			return nil, forbidden("parameters.count", "count applies to text-to-image recipes only")
+		}
+		if taskParameters == nil || !c.Contains(strList(taskParameters.Get("parameters")), "count") {
+			return nil, c.Err(400, "unsupported", "The connected worker does not advertise multiple outputs", "parameters.count")
+		}
+		count, _ := params.Num("count")
+		if limit := asArray(caps.Obj("limits").Get("count")); len(limit) == 2 {
+			if high, _ := limit[1].(float64); count > high {
+				return nil, c.Err(400, "unsupported", "count exceeds the worker's limit", "parameters.count")
+			}
+		}
+	}
 	var input *jsonv.Object
 	imageDefaults := jsonv.NewObject()
-	if task == "image-to-image" {
+	if usesImage {
 		if !inputs.Has("image") {
 			return nil, c.Err(400, "invalid_request", "This recipe requires an uploaded image input", "inputs.image")
 		}
@@ -259,16 +325,30 @@ func (r *Runtime) Resolve(body any, namespace string) (*jsonv.Object, error) {
 		}
 		return nil, c.Err(400, "invalid_request", "Image and strength apply to image-to-image recipes only", field)
 	}
-	merged := jsonv.NewObject().Assign(caps.Obj("defaults"))
-	if task == "image-to-image" {
-		merged.Assign(caps.Obj("task_defaults").Obj(task))
-	}
 	defaults := recipe.Obj("defaults")
-	merged.Assign(defaults).Assign(imageDefaults).Assign(params)
-	merged.Set("seed", nullish(params.Get("seed"), defaults.Get("seed"), c.Seed()))
-	effective, err := c.Validate(c.Parameters, merged)
-	if err != nil {
-		return nil, err
+	var effective *jsonv.Object
+	if task == "upscale" {
+		merged := jsonv.NewObject().Assign(caps.Obj("task_defaults").Obj(task)).Assign(taskParameters.Obj("defaults"))
+		merged.Assign(defaults).Assign(imageDefaults).Assign(params)
+		if effective, err = c.Validate(c.UpscaleParameters, merged); err != nil {
+			return nil, err
+		}
+		if sizes := asArray(caps.Obj("limits").Get("tile_sizes")); len(sizes) > 0 {
+			tile, _ := effective.Num("tile")
+			if tile != 0 && !containsNumber(sizes, tile) {
+				return nil, c.Err(400, "unsupported", "tile must be 0 or an advertised tile size", "parameters.tile")
+			}
+		}
+	} else {
+		merged := jsonv.NewObject().Assign(caps.Obj("defaults"))
+		if task == "image-to-image" {
+			merged.Assign(caps.Obj("task_defaults").Obj(task))
+		}
+		merged.Assign(defaults).Assign(imageDefaults).Assign(params)
+		merged.Set("seed", nullish(params.Get("seed"), defaults.Get("seed"), c.Seed()))
+		if effective, err = c.Validate(c.Parameters, merged); err != nil {
+			return nil, err
+		}
 	}
 	if input != nil {
 		if !jsonEqual(effective.Get("width"), input.Get("width")) || !jsonEqual(effective.Get("height"), input.Get("height")) {
@@ -278,11 +358,25 @@ func (r *Runtime) Resolve(body any, namespace string) (*jsonv.Object, error) {
 			}
 			return nil, c.Err(400, "invalid_request", "Width and height must equal the uploaded image size; nothing is resized", field)
 		}
+	}
+	if task == "image-to-image" {
 		if !effective.Has("strength") {
 			return nil, c.Err(400, "invalid_request", "Strength is required for image-to-image", "parameters.strength")
 		}
 		if c.EffectiveSteps(effective) < 1 {
 			return nil, c.Err(400, "invalid_request", "steps × strength must denoise for at least one step", "parameters.strength")
+		}
+	}
+	if task == "upscale" {
+		scale, _ := model.Num("scale")
+		side, ok := caps.Obj("limits").Num("output_side")
+		width, _ := effective.Num("width")
+		height, _ := effective.Num("height")
+		if scale < 1 {
+			return nil, c.Err(400, "unsupported", "Re-register this upscaler so its scale is known", "model_id")
+		}
+		if ok && math.Max(width, height)*scale > side {
+			return nil, c.Err(400, "invalid_request", "The upscaled image would exceed the worker's output_side limit", "output_side")
 		}
 	}
 	uses := asArray(nullish(request.Get("adapters"), recipe.Get("adapters"), []any{}))
@@ -319,12 +413,35 @@ func (r *Runtime) Resolve(body any, namespace string) (*jsonv.Object, error) {
 			return nil, c.Err(400, "unsupported_backend", "Options for "+other+" do not apply to the "+backendID+" worker", "backend_options")
 		}
 	}
-	if !c.Contains(strList(caps.Get("precisions")), options.Str("precision")) {
+	if options.Str("precision") == "auto" {
+		if minor < 2 || !c.Contains(strList(caps.Get("auto_options")), "precision") {
+			return nil, c.Err(400, "unsupported", "The connected worker does not resolve automatic precision", "precision")
+		}
+	} else if !c.Contains(strList(caps.Get("precisions")), options.Str("precision")) {
 		return nil, c.Err(400, "unsupported", "Requested precision is unavailable", "precision")
 	}
-	validateBody := jsonv.O("protocol", protocol, "bundle", model.Get("bundle"), "options", options)
+	fallbacks := strList(request.Get("authorized_fallbacks"))
+	if len(fallbacks) > 0 {
+		if !caller.AllowFallbacks {
+			return nil, c.Err(403, "fallbacks_not_allowed", "This credential may not authorize fallbacks", "authorized_fallbacks")
+		}
+		distinct := map[string]bool{}
+		for _, f := range fallbacks {
+			if minor < 2 || !c.Contains(strList(caps.Get("fallbacks")), f) {
+				return nil, c.Err(400, "unsupported", "The connected worker does not advertise the "+f+" fallback", "authorized_fallbacks")
+			}
+			distinct[f] = true
+		}
+		if len(distinct) != len(fallbacks) {
+			return nil, c.Err(400, "invalid_request", "Fallbacks must be distinct", "authorized_fallbacks")
+		}
+	}
+	validateBody := jsonv.O("protocol", protocol, "bundle", bundle, "options", options)
 	if len(adapters) > 0 {
 		validateBody.Set("adapters", adapters)
+	}
+	if len(fallbacks) > 0 {
+		validateBody.Set("authorized_fallbacks", request.Get("authorized_fallbacks"))
 	}
 	validation, err := r.Worker.Obj("/v1/validate", "POST", validateBody)
 	if err != nil {
@@ -346,6 +463,16 @@ func (r *Runtime) Resolve(body any, namespace string) (*jsonv.Object, error) {
 		"memory_budget_mb", jsonv.Maybe(caps.Get("memory_budget_mb")),
 		"memory_estimate", nullish(validation.Get("memory_estimate")),
 	)
+	if minor >= 2 {
+		// The worker identity and the capability facts this job was admitted against.
+		backend.Set("device_identity", jsonv.Maybe(info.Get("device_identity")))
+		backend.Set("loader", jsonv.Maybe(loader(caps, family)))
+		backend.Set("auto_options", nullish(caps.Get("auto_options"), []any{}))
+		backend.Set("fallbacks", nullish(caps.Get("fallbacks"), []any{}))
+		backend.Set("task_parameters", jsonv.Maybe(taskParameters))
+		backend.Set("resolved_options", jsonv.Maybe(validation.Get("resolved_options")))
+		backend.Set("resolutions", nullish(validation.Get("resolutions"), []any{}))
+	}
 	return jsonv.O(
 		"task", task,
 		"request", resolvedRequest,
@@ -357,10 +484,40 @@ func (r *Runtime) Resolve(body any, namespace string) (*jsonv.Object, error) {
 	), nil
 }
 
+// cpuFallbackReady is a worker whose selected device is unavailable but which can run the request
+// on its host CPU because the request authorizes that fallback. Nothing else relaxes readiness.
+func cpuFallbackReady(caps *jsonv.Object, protocol string, request *jsonv.Object) bool {
+	return c.Minor(protocol) >= 2 && caps.Get("device_available") == false && len(caps.Arr("missing_dependencies")) == 0 &&
+		c.Contains(strList(caps.Get("fallbacks")), "cpu") && c.Contains(strList(request.Get("authorized_fallbacks")), "cpu")
+}
+
+// loader is the worker's loader entry for a family, or nil.
+func loader(caps *jsonv.Object, family string) *jsonv.Object {
+	for _, raw := range caps.Arr("loaders") {
+		if l, ok := raw.(*jsonv.Object); ok && c.Contains(strList(l.Get("families")), family) {
+			return l
+		}
+	}
+	return nil
+}
+
+// loads reports whether a 1.2 worker advertises a loader for the family.
+func loads(caps *jsonv.Object, family string) bool { return loader(caps, family) != nil }
+
+func containsNumber(list []any, n float64) bool {
+	for _, v := range list {
+		if f, ok := v.(float64); ok && f == n {
+			return true
+		}
+	}
+	return false
+}
+
 func jsonEqual(a, b any) bool { return string(jsonv.MustMarshal(a)) == string(jsonv.MustMarshal(b)) }
 
 // Submit admits a job durably; a repeated idempotency key returns the original job.
-func (r *Runtime) Submit(body any, namespace string, key *string) (*jsonv.Object, error) {
+func (r *Runtime) Submit(body any, caller Caller, key *string) (*jsonv.Object, error) {
+	namespace := caller.Namespace
 	parsed, err := c.Validate(c.Submission, body)
 	if err != nil {
 		return nil, err
@@ -385,7 +542,7 @@ func (r *Runtime) Submit(body any, namespace string, key *string) (*jsonv.Object
 	if retry, err := existing(r.Store); err != nil || retry != nil {
 		return retry, err
 	}
-	resolved, err := r.Resolve(parsed, namespace)
+	resolved, err := r.Resolve(parsed, caller)
 	if err != nil {
 		return nil, err
 	}
@@ -585,12 +742,12 @@ func (r *Runtime) tick() (err error) {
 	}
 	job := r.firstRunning()
 	if job == nil {
-		if info.Str("state") != "ready" || !truthy(caps.Get("ready")) {
+		if info.Str("state") != "ready" {
 			return nil
 		}
 		r.mu.Lock()
 		queued := r.Store.All("queued")
-		if len(queued) == 0 {
+		if len(queued) == 0 || !(truthy(caps.Get("ready")) || cpuFallbackReady(caps, protocol, queued[0].Obj("request"))) {
 			r.mu.Unlock()
 			return nil
 		}
@@ -652,6 +809,11 @@ func (r *Runtime) tick() (err error) {
 			if estimate := operation.Get("memory_estimate"); truthy(estimate) {
 				job.Obj("backend").Set("memory_estimate", estimate)
 			}
+			for _, k := range []string{"resolved_options", "resolutions"} {
+				if v := operation.Get(k); v != nil {
+					job.Obj("backend").Set(k, v)
+				}
+			}
 			return r.save(job, nil)
 		}
 		if s := info.Str("state"); s == "loading" || s == "unloading" {
@@ -681,6 +843,9 @@ func (r *Runtime) tick() (err error) {
 			if len(identity) > 0 {
 				body.Set("adapters", job.Get("adapters"))
 			}
+			if fallbacks := job.Obj("request").Arr("authorized_fallbacks"); len(fallbacks) > 0 {
+				body.Set("authorized_fallbacks", fallbacks)
+			}
 			op, err := r.Worker.Obj("/v1/model/load", "POST", body)
 			if err != nil {
 				return err
@@ -693,7 +858,19 @@ func (r *Runtime) tick() (err error) {
 			})
 		}
 		job.Set("dispatch_phase", "executing")
-		if err := r.save(job, nil); err != nil {
+		// Record any fallback the loaded bundle runs on; it was authorized by this or an earlier job.
+		var applied []any
+		if c.Minor(protocol) >= 2 {
+			applied = asArray(nullish(loaded.Get("applied_fallbacks"), []any{}))
+			job.Set("applied_fallbacks", applied)
+			job.Obj("backend").Set("applied_fallbacks", applied)
+		}
+		if err := r.save(job, func(tx *store.Store) error {
+			if len(applied) > 0 {
+				tx.Event(job, "stage", jsonv.O("stage", "loading", "fallback", applied))
+			}
+			return nil
+		}); err != nil {
 			return err
 		}
 	}
@@ -712,7 +889,7 @@ func (r *Runtime) tick() (err error) {
 				return nil
 			}
 			inputs := job.Obj("request").Obj("inputs").Clone()
-			if job.Str("task") == "image-to-image" {
+			if task := job.Str("task"); task == "image-to-image" || task == "upscale" {
 				if job.Str("worker_input_id") == "" {
 					// Hand the worker the verified bytes under a session-scoped handle, never a path.
 					record := job.Obj("input")
@@ -840,51 +1017,103 @@ func isInt(v any) bool {
 	return ok && f == float64(int64(f))
 }
 
-// commitOutputs verifies the output bytes, then writes them, the manifest and the database in
-// that order; success is recorded only after everything is durable.
+// OutputFile is the stored path of one committed output.
+func (r *Runtime) OutputFile(jobID string, output *jsonv.Object) string {
+	ext := c.Extensions[output.Str("mime_type")]
+	if ext == "" {
+		ext = "png"
+	}
+	return filepath.Join(r.OutputDirectory(jobID), output.Str("output_id")+"."+ext)
+}
+
+// commitOutputs verifies every output the worker advertised for the task, then writes their
+// bytes, the manifest and the database in that order; success is recorded only after
+// everything is durable, and a partial set is output_unavailable.
 func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
 	directory := r.OutputDirectory(job.Str("job_id"))
 	err := func() error {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			return err
 		}
-		outputs := snapshot.Arr("outputs")
-		if len(outputs) != 1 {
-			return errors.New("invalid outputs")
-		}
-		output, _ := outputs[0].(*jsonv.Object)
-		size, _ := output.Num("size")
-		if output.Get("output_id") != "image" || output.Get("mime_type") != "image/png" || !isInt(output.Get("size")) ||
-			size < 1 || size > float64(r.Config.MaxOutputBytes) {
-			return errors.New("invalid output")
-		}
-		res, err := r.Worker.Response("/v1/executions/"+job.Str("execution_id")+"/outputs/image", "GET", nil, "")
-		if err != nil {
-			return err
-		}
-		defer res.Body.Close()
-		bytes, err := io.ReadAll(io.LimitReader(res.Body, int64(r.Config.MaxOutputBytes)+1))
-		if err != nil {
-			return err
-		}
-		if len(bytes) > r.Config.MaxOutputBytes {
-			return errors.New("output too large")
-		}
-		width, _ := output.Num("width")
-		height, _ := output.Num("height")
-		if float64(len(bytes)) != size || c.SHA256Hex(bytes) != output.Str("sha256") || len(bytes) < 24 ||
-			string(bytes[:8]) != "\x89PNG\r\n\x1a\n" ||
-			float64(be32(bytes[16:20])) != width || float64(be32(bytes[20:24])) != height {
-			return errors.New("output integrity failure")
-		}
+		backend := job.Obj("backend")
 		params := job.Obj("request").Obj("parameters")
-		if !jsonEqual(output.Get("width"), params.Get("width")) || !jsonEqual(output.Get("height"), params.Get("height")) {
-			return errors.New("output dimensions changed")
+		task := job.Str("task")
+		count, ok := params.Num("count")
+		if !ok {
+			count = 1
 		}
-		if err := atomicFile(filepath.Join(directory, "image.png"), bytes); err != nil {
-			return err
+		taskParameters := backend.Obj("task_parameters")
+		expected := c.OutputIDs(taskParameters, int(count))
+		formats := taskParameters.Obj("output_formats")
+		records := map[string]*jsonv.Object{}
+		for _, raw := range snapshot.Arr("outputs") {
+			record, _ := raw.(*jsonv.Object)
+			if record == nil || records[record.Str("output_id")] != nil {
+				return errors.New("invalid outputs")
+			}
+			records[record.Str("output_id")] = record
 		}
-		job.Set("outputs", []any{output.Clone().Set("expires_at", r.expiry())})
+		if len(records) != len(expected) {
+			return errors.New("output set differs from the advertised outputs")
+		}
+		width, _ := params.Num("width")
+		height, _ := params.Num("height")
+		var scale float64
+		if task == "upscale" {
+			scale, _ = job.Obj("model").Num("scale")
+			width, height = width*scale, height*scale
+		}
+		seed, seeded := params.Num("seed")
+		committed := []any{}
+		for k, id := range expected {
+			output := records[id]
+			if output == nil {
+				return errors.New("missing advertised output " + id)
+			}
+			mime := output.Str("mime_type")
+			if want := formats.Str(id); (want != "" && mime != want) || (formats == nil && mime != "image/png") {
+				return errors.New("output type differs from the advertised type")
+			}
+			limit := r.Config.OutputLimit(mime)
+			check := c.Signatures[mime]
+			size, _ := output.Num("size")
+			if check == nil || limit == 0 || !isInt(output.Get("size")) || size < 1 || size > float64(limit) {
+				return errors.New("invalid output")
+			}
+			res, err := r.Worker.Response("/v1/executions/"+job.Str("execution_id")+"/outputs/"+id, "GET", nil, "")
+			if err != nil {
+				return err
+			}
+			bytes, err := io.ReadAll(io.LimitReader(res.Body, int64(limit)+1))
+			res.Body.Close()
+			if err != nil {
+				return err
+			}
+			if len(bytes) > limit {
+				return errors.New("output too large")
+			}
+			if float64(len(bytes)) != size || c.SHA256Hex(bytes) != output.Str("sha256") || !check(bytes, output) {
+				return errors.New("output integrity failure")
+			}
+			if mime == "image/png" {
+				if w, _ := output.Num("width"); w != width {
+					return errors.New("output dimensions changed")
+				}
+				if h, _ := output.Num("height"); h != height {
+					return errors.New("output dimensions changed")
+				}
+			}
+			if err := atomicFile(r.OutputFile(job.Str("job_id"), output), bytes); err != nil {
+				return err
+			}
+			record := output.Clone()
+			if seeded && task == "text-to-image" {
+				// Output k of a batch used seed + k − 1, so any one image can be reproduced alone.
+				record.Set("seed", seed+float64(k))
+			}
+			committed = append(committed, record.Set("expires_at", r.expiry()))
+		}
+		job.Set("outputs", committed)
 		input := job.Obj("input")
 		inputs := []any{}
 		if input != nil {
@@ -908,24 +1137,34 @@ func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
 				"source", jsonv.Maybe(adapter.Get("source")),
 			))
 		}
+		var scaleValue any = jsonv.Absent
+		if task == "upscale" {
+			scaleValue = scale
+		}
 		manifest := jsonv.O(
-			"schema_version", 2.0,
+			"schema_version", 3.0,
 			"runtime_version", c.VERSION,
 			"job_id", job.Get("job_id"),
 			"task", job.Get("task"),
+			"family", job.Obj("model").Obj("bundle").Get("family"),
+			"scale", scaleValue,
 			"recipe", job.Get("recipe"),
 			"model", job.Obj("model").Get("bundle"),
 			"request", job.Get("request"),
 			"inputs", inputs,
 			"adapters", adapters,
 			"backend", job.Get("backend"),
+			"device_identity", nullish(backend.Get("device_identity")),
+			"resolved_options", nullish(backend.Get("resolved_options"), backend.Get("options")),
+			"resolutions", nullish(backend.Get("resolutions"), []any{}),
+			"applied_fallbacks", nullish(job.Get("applied_fallbacks"), []any{}),
 			"worker", jsonv.Maybe(snapshot.Get("implementation")),
 			"effective_settings", jsonv.Maybe(snapshot.Get("effective_settings")),
 			"measurements", jsonv.Maybe(snapshot.Get("measurements")),
 			"attempt_id", job.Get("attempt_id"),
 			"session_id", job.Get("session_id"),
 			"execution_id", job.Get("execution_id"),
-			"outputs", job.Get("outputs"),
+			"outputs", committed,
 			"determinism", "Seed reproducibility depends on hardware, software and dependency versions; matching bytes are not guaranteed.",
 		)
 		job.Set("manifest", manifest)
@@ -940,18 +1179,19 @@ func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
 		job.Set("state", "succeeded")
 		job.Set("stage", nil)
 		return r.save(job, func(tx *store.Store) error {
-			tx.Event(job, "output", job.Arr("outputs")[0])
+			for _, output := range committed {
+				tx.Event(job, "output", output)
+			}
 			tx.Event(job, "job_state", jsonv.O("state", "succeeded"))
 			return nil
 		})
 	}()
 	if err != nil {
 		var api *c.ApiError
+		job.Set("state", "running")
 		if errors.As(err, &api) && api.Code == "backend_unavailable" {
-			job.Set("state", "running")
 			return err
 		}
-		job.Set("state", "running")
 		r.finish(job, "failed", jsonv.O("code", "output_unavailable", "message", "Output could not be verified and committed to durable storage"))
 	}
 	return nil
@@ -1002,6 +1242,13 @@ func (r *Runtime) Doctor() (*jsonv.Object, error) {
 			"memory_estimate", nullish(caps.Get("memory_estimate")),
 			"loaded_bundle_digest", nullish(info.Obj("loaded_bundle").Get("bundle_digest")),
 		)
+		if c.Minor(p.Protocol) >= 2 {
+			w.Set("device_identity", nullish(info.Get("device_identity")))
+			w.Set("loaders", nullish(caps.Get("loaders"), []any{}))
+			w.Set("auto_options", nullish(caps.Get("auto_options"), []any{}))
+			w.Set("fallbacks", nullish(caps.Get("fallbacks"), []any{}))
+			w.Set("applied_fallbacks", nullish(info.Obj("loaded_bundle").Get("applied_fallbacks"), []any{}))
+		}
 	} else {
 		code, message := "backend_unavailable", "Worker is unavailable"
 		var api *c.ApiError
@@ -1037,6 +1284,9 @@ func (r *Runtime) Doctor() (*jsonv.Object, error) {
 		models = append(models, jsonv.O(
 			"model_id", model.Get("model_id"),
 			"artifact_handle", model.Get("artifact_handle"),
+			"family", nullish(bundle.Get("family"), "sdxl-base"),
+			"scale", jsonv.Maybe(model.Get("scale")),
+			"conversion", jsonv.Maybe(bundle.Obj("source").Get("conversion")),
 			"bundle_digest", bundle.Get("bundle_digest"),
 			"available", len(missing) == 0,
 			"missing_roles", roles,
@@ -1094,7 +1344,7 @@ func (r *Runtime) Cleanup() error {
 		for _, raw := range job.Arr("outputs") {
 			output, _ := raw.(*jsonv.Object)
 			if c.Expired(output.Get("expires_at")) {
-				path := filepath.Join(r.OutputDirectory(job.Str("job_id")), output.Str("output_id")+".png")
+				path := r.OutputFile(job.Str("job_id"), output)
 				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 					return err
 				}

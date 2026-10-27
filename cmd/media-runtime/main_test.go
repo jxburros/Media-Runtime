@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	c "github.com/jxburros/media-runtime/internal/contracts"
 	"github.com/jxburros/media-runtime/internal/integration"
 	"github.com/jxburros/media-runtime/internal/jsonv"
 )
@@ -40,8 +41,8 @@ type service struct {
 func start(t *testing.T, bin, root, directory string, fixture *integration.Fixture) *service {
 	t.Helper()
 	config := filepath.Join(root, "runtime.config.json")
-	doc := fmt.Sprintf(`{"port":0,"directory":%q,"poll_interval_ms":20,"credentials":[{"token_env":"MEDIA_RUNTIME_TOKEN","namespace":"owner","operator":true}],"artifact_catalog":{"fixture":%q},"worker":{"url":%q,"token_env":"MEDIA_TEST_WORKER_TOKEN"}}`,
-		directory, filepath.Join(root, "model"), fixture.URL)
+	doc := fmt.Sprintf(`{"port":0,"directory":%q,"poll_interval_ms":20,"credentials":[{"token_env":"MEDIA_RUNTIME_TOKEN","namespace":"owner","operator":true}],"artifact_catalog":{"fixture":%q,"upscaler":%q},"worker":{"url":%q,"token_env":"MEDIA_TEST_WORKER_TOKEN"}}`,
+		directory, filepath.Join(root, "model"), filepath.Join(root, "upscaler"), fixture.URL)
 	if err := os.WriteFile(config, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +118,7 @@ func TestCommandLineAgainstTheEngineFixture(t *testing.T) {
 	directory := filepath.Join(root, "state")
 	s := start(t, bin, root, directory, fixture)
 
-	if out, _, code := s.cli(t, "--version"); code != 0 || strings.TrimSpace(out) != "0.4.0" {
+	if out, _, code := s.cli(t, "--version"); code != 0 || strings.TrimSpace(out) != c.VERSION {
 		t.Fatalf("version %q %d", out, code)
 	}
 	if _, _, code := s.cli(t, "doctor"); code != 3 {
@@ -250,5 +251,55 @@ func TestServesATypeScriptStateDirectoryUnchanged(t *testing.T) {
 	out, errText, code = s.cli(t, "run", "portrait", "--model", "fixture", "--prompt", "new", "--width", "64", "--height", "64", "--steps", "3", "--wait", "--json")
 	if code != 0 || lastJSON(t, out).Str("state") != "succeeded" {
 		t.Fatalf("new job on migrated state %d %s %s", code, out, errText)
+	}
+}
+
+func TestCommandLineMultipleOutputsAndUpscale(t *testing.T) {
+	bin := binary(t)
+	root := t.TempDir()
+	fixture := integration.StartFixture(t, root)
+	if _, err := os.Stat(filepath.Join(root, "upscaler")); err != nil {
+		t.Skip("the Engine fixture predates protocol 1.2")
+	}
+	s := start(t, bin, root, filepath.Join(root, "state"), fixture)
+	for name, doc := range map[string]string{
+		"model.json":    `{"model_id":"fixture","artifact_handle":"fixture"}`,
+		"upscaler.json": `{"model_id":"upscaler","artifact_handle":"upscaler","family":"esrgan"}`,
+	} {
+		path := filepath.Join(root, name)
+		_ = os.WriteFile(path, []byte(doc), 0o600)
+		if _, errText, code := s.cli(t, "models", "register", path); code != 0 {
+			t.Fatalf("register %s %d %s", name, code, errText)
+		}
+	}
+	if out, _, code := s.cli(t, "doctor"); code != 0 || !strings.Contains(out, "Model upscaler (upscaler, esrgan ×2)") || !strings.Contains(out, "Device identity:") {
+		t.Fatalf("doctor %d %s", code, out)
+	}
+	out, errText, code := s.cli(t, "run", "portrait", "--model", "fixture", "--prompt", "batch", "--width", "64", "--height", "64", "--steps", "3", "--count", "3", "--wait", "--json")
+	if code != 0 {
+		t.Fatalf("run --count %d %s %s", code, out, errText)
+	}
+	job := lastJSON(t, out)
+	exports := filepath.Join(root, "exports")
+	if _, errText, code := s.cli(t, "outputs", "export", job.Str("job_id"), "--directory", exports); code != 0 {
+		t.Fatalf("export %d %s", code, errText)
+	}
+	for _, id := range []string{"image", "image_2", "image_3"} {
+		if _, err := os.Stat(filepath.Join(exports, job.Str("job_id")+"-"+id+".png")); err != nil {
+			t.Fatalf("export lacks %s", id)
+		}
+	}
+	png := filepath.Join(root, "in.png")
+	_ = os.WriteFile(png, integration.MakePNG(64, 64), 0o600)
+	out, errText, code = s.cli(t, "run", "enlarge", "--model", "upscaler", "--image", png, "--tile", "0", "--wait", "--json")
+	if code != 0 {
+		t.Fatalf("run enlarge %d %s %s", code, out, errText)
+	}
+	enlarged := lastJSON(t, out)
+	if output := enlarged.Arr("outputs")[0].(*jsonv.Object); output.Get("width") != 128.0 {
+		t.Fatalf("enlarge %s", out)
+	}
+	if _, errText, code := s.cli(t, "run", "enlarge", "--model", "upscaler", "--image", png, "--seed", "3"); code != 2 || !strings.Contains(errText, "no seed") {
+		t.Fatalf("enlarge --seed must be refused: %d %s", code, errText)
 	}
 }

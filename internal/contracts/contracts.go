@@ -16,12 +16,53 @@ import (
 	"github.com/jxburros/media-runtime/internal/jsonv"
 )
 
-const VERSION = "0.4.0"
+const VERSION = "0.5.0"
 
-var PROTOCOLS = []string{"media-worker/1.0", "media-worker/1.1"}
+var PROTOCOLS = []string{"media-worker/1.0", "media-worker/1.1", "media-worker/1.2"}
 var PROTOCOL = PROTOCOLS[len(PROTOCOLS)-1]
 var BACKENDS = []string{"diffusers-sdxl", "owned-sdxl"}
-var TASKS = []string{"text-to-image", "image-to-image"}
+var TASKS = []string{"text-to-image", "image-to-image", "upscale"}
+
+// FAMILIES are the model families a registration may name, with the tasks each serves.
+var FAMILIES = map[string][]string{
+	"sdxl-base": {"text-to-image", "image-to-image"},
+	"esrgan":    {"upscale"},
+}
+
+// TaskFamily is the family whose bundles serve a task.
+func TaskFamily(task string) string {
+	if task == "upscale" {
+		return "esrgan"
+	}
+	return "sdxl-base"
+}
+
+// TaskMinor is the lowest protocol minor a task needs.
+func TaskMinor(task string) int {
+	switch task {
+	case "image-to-image":
+		return 1
+	case "upscale":
+		return 2
+	}
+	return 0
+}
+
+// Minor is the minor number of a negotiated protocol (media-worker/1.N).
+func Minor(protocol string) int {
+	for i, p := range PROTOCOLS {
+		if p == protocol {
+			return i
+		}
+	}
+	return 0
+}
+
+// FALLBACKS are the fallbacks a caller may authorize.
+var FALLBACKS = []string{"cpu", "lower_precision"}
+
+// MaxCount bounds parameters.count before the worker's advertised limit applies.
+const MaxCount = 4
 
 const MaxAdapters = 4
 
@@ -42,22 +83,34 @@ var parameterFields = []Field{
 	{Name: "sampler", Check: Literal("euler")},
 	{Name: "scheduler", Check: Literal("euler")},
 	{Name: "strength", Check: Num(NumOpts{GreaterThan: F(0), Max: F(1)}), Optional: true},
+	{Name: "count", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(MaxCount)}), Optional: true},
 }
 
-// Parameters is the complete, resolved parameter set.
+var tileFields = []Field{
+	{Name: "tile", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(8192)})},
+	{Name: "tile_overlap", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(64)})},
+}
+
+// Parameters is the complete, resolved parameter set of a diffusion task.
 var Parameters = StrictObject(parameterFields...)
 
-// PartialParameters is a request's or recipe's parameter overrides.
-var PartialParameters = StrictObject(Partial(parameterFields)...)
+// UpscaleParameters is the resolved parameter set of an upscale: the input's size and tiling.
+var UpscaleParameters = StrictObject(append(append([]Field{}, parameterFields[:2]...), tileFields...)...)
+
+// PartialParameters is a request's or recipe's parameter overrides for any task.
+var PartialParameters = StrictObject(Partial(append(append([]Field{}, parameterFields...), tileFields...))...)
+
+// Prompt is a non-blank prompt; diffusion tasks require one and upscale forbids it.
+var Prompt = Str(StrOpts{Min: 1, Max: 10000, Refine: func(s string) bool { return strings.TrimFunc(s, isJSSpace) != "" }})
 
 var Inputs = StrictObject(
-	Field{Name: "prompt", Check: Str(StrOpts{Min: 1, Max: 10000, Refine: func(s string) bool { return strings.TrimFunc(s, isJSSpace) != "" }})},
+	Field{Name: "prompt", Check: Prompt, Optional: true},
 	Field{Name: "negative_prompt", Check: Str(StrOpts{Max: 10000}), Optional: true},
 	Field{Name: "image", Check: InputID, Optional: true},
 )
 
 var loadOptionFields = []Field{
-	{Name: "precision", Check: Enum("float16", "float32")},
+	{Name: "precision", Check: Enum("float16", "float32", "auto")},
 	{Name: "attention", Check: Literal("sdpa")},
 	{Name: "offload", Check: Literal("none")},
 }
@@ -84,6 +137,7 @@ var Submission = StrictObject(
 		Field{Name: "owned-sdxl", Check: partialLoadOptions, Optional: true},
 	), Optional: true},
 	Field{Name: "retry_of", Check: ID, Optional: true},
+	Field{Name: "authorized_fallbacks", Check: Array(Enum(FALLBACKS...), ArrOpts{Max: len(FALLBACKS)}), Optional: true},
 )
 
 var RecipeSchema = Refine(StrictObject(
@@ -91,12 +145,12 @@ var RecipeSchema = Refine(StrictObject(
 	Field{Name: "recipe_id", Check: ID},
 	Field{Name: "revision", Check: Num(NumOpts{Int: true, GreaterThan: F(0)})},
 	Field{Name: "pipeline", Check: Enum(TASKS...)},
-	Field{Name: "model_family", Check: Literal("sdxl-base")},
+	Field{Name: "model_family", Check: Enum("sdxl-base", "esrgan")},
 	Field{Name: "inputs", Check: StrictObject(
 		Field{Name: "prompt", Check: StrictObject(
 			Field{Name: "type", Check: Literal("string")},
 			Field{Name: "required", Check: Literal(true)},
-		)},
+		), Optional: true},
 		Field{Name: "image", Check: StrictObject(
 			Field{Name: "type", Check: Literal("image")},
 			Field{Name: "required", Check: Literal(true)},
@@ -106,22 +160,52 @@ var RecipeSchema = Refine(StrictObject(
 	Field{Name: "adapters", Check: adapterList, Optional: true},
 ), func(v any) bool {
 	r := v.(*jsonv.Object)
-	if r.Str("pipeline") == "image-to-image" {
-		return r.Obj("inputs").Has("image")
+	inputs, defaults := r.Obj("inputs"), r.Obj("defaults")
+	pipeline := r.Str("pipeline")
+	if r.Str("model_family") != TaskFamily(pipeline) {
+		return false
 	}
-	return !r.Obj("inputs").Has("image") && !r.Obj("defaults").Has("strength")
+	switch pipeline {
+	case "image-to-image":
+		return inputs.Has("prompt") && inputs.Has("image") && !defaults.Has("count") && !hasTile(defaults)
+	case "upscale":
+		// An upscale takes one image; only tiling has defaults and nothing adapts the network.
+		for _, k := range defaults.Keys() {
+			if k != "tile" && k != "tile_overlap" {
+				return false
+			}
+		}
+		return inputs.Has("image") && !inputs.Has("prompt") && !r.Has("adapters")
+	}
+	return inputs.Has("prompt") && !inputs.Has("image") && !defaults.Has("strength") && !hasTile(defaults)
 }, "inputs")
 
-var sourceSchema = StrictObject(
-	Field{Name: "repository", Check: Str(StrOpts{Max: 300}), Optional: true},
-	Field{Name: "revision", Check: Str(StrOpts{Max: 100}), Optional: true},
-	Field{Name: "license", Check: Str(StrOpts{Max: 300}), Optional: true},
+func hasTile(defaults *jsonv.Object) bool {
+	return defaults.Has("tile") || defaults.Has("tile_overlap")
+}
+
+// Conversion is the provenance a converted bundle's conversion.json carries.
+var Conversion = StrictObject(
+	Field{Name: "source_sha256", Check: Str(StrOpts{Pattern: regexp.MustCompile(`^[a-f0-9]{64}$`)})},
+	Field{Name: "reference_bundle_digest", Check: Str(StrOpts{Pattern: regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)})},
+	Field{Name: "converter", Check: Record(Str(StrOpts{Max: 100}))},
+	Field{Name: "mapped_keys", Check: Record(Num(NumOpts{Int: true, Min: F(0)}))},
 )
+
+var sourceFields = []Field{
+	{Name: "repository", Check: Str(StrOpts{Max: 300}), Optional: true},
+	{Name: "revision", Check: Str(StrOpts{Max: 100}), Optional: true},
+	{Name: "license", Check: Str(StrOpts{Max: 300}), Optional: true},
+}
+
+var sourceSchema = StrictObject(sourceFields...)
 
 var Registration = StrictObject(
 	Field{Name: "model_id", Check: ID},
 	Field{Name: "artifact_handle", Check: ID},
-	Field{Name: "source", Check: sourceSchema, Default: func() any { return jsonv.NewObject() }},
+	Field{Name: "family", Check: Enum("sdxl-base", "esrgan"), Optional: true},
+	Field{Name: "source", Check: StrictObject(append(append([]Field{}, sourceFields...),
+		Field{Name: "conversion", Check: Conversion, Optional: true})...), Default: func() any { return jsonv.NewObject() }},
 )
 
 var AdapterRegistration = StrictObject(
@@ -134,6 +218,7 @@ var AdapterRegistration = StrictObject(
 func DefaultRecipes() []*jsonv.Object {
 	return []*jsonv.Object{
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"portrait","revision":1,"pipeline":"text-to-image","model_family":"sdxl-base","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"width":1024,"height":1024,"steps":30,"guidance":6}}`),
+		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"enlarge","revision":1,"pipeline":"upscale","model_family":"esrgan","inputs":{"image":{"type":"image","required":true}},"defaults":{"tile":0,"tile_overlap":16}}`),
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"variation","revision":1,"pipeline":"image-to-image","model_family":"sdxl-base","inputs":{"prompt":{"type":"string","required":true},"image":{"type":"image","required":true}},"defaults":{"steps":30,"guidance":6,"strength":0.6}}`),
 	}
 }
@@ -305,4 +390,43 @@ func isJSSpace(r rune) bool {
 		return true
 	}
 	return r >= '\u2000' && r <= '\u200a'
+}
+
+// OutputIDs are the outputs a worker produces for a task: the advertised IDs, with each repeated
+// output expanded to id, id_2 … id_N for parameters.count = N. Workers before 1.2 produce "image".
+func OutputIDs(taskParameters *jsonv.Object, count int) []string {
+	if taskParameters == nil {
+		return []string{"image"}
+	}
+	repeated := map[string]bool{}
+	for _, id := range taskParameters.Arr("repeated_outputs") {
+		if s, ok := id.(string); ok {
+			repeated[s] = true
+		}
+	}
+	var out []string
+	for _, raw := range taskParameters.Arr("outputs") {
+		id, _ := raw.(string)
+		out = append(out, id)
+		if repeated[id] {
+			for k := 2; k <= count; k++ {
+				out = append(out, fmt.Sprintf("%s_%d", id, k))
+			}
+		}
+	}
+	return out
+}
+
+// Extensions maps each verifiable output MIME type to its file extension.
+var Extensions = map[string]string{"image/png": "png", "application/zip": "zip", "video/mp4": "mp4", "audio/wav": "wav"}
+
+// Signatures verify an output's bytes against its MIME type and record without decoding
+// media. PNG is checked from 0.5.0; the archive, video and audio checks arrive with their tasks.
+var Signatures = map[string]func(data []byte, record *jsonv.Object) bool{
+	"image/png": func(data []byte, record *jsonv.Object) bool {
+		width, _ := record.Num("width")
+		height, _ := record.Num("height")
+		return len(data) >= 24 && string(data[:8]) == "\x89PNG\r\n\x1a\n" && string(data[12:16]) == "IHDR" &&
+			float64(binary.BigEndian.Uint32(data[16:20])) == width && float64(binary.BigEndian.Uint32(data[20:24])) == height
+	},
 }

@@ -8,6 +8,8 @@ by `tests/serve_fixture.py`; it proves protocol behavior, not GPU inference.
 | ------- | -------------------------- | -------------------------------- | ---------------- | ---------------- | ----------------------------- | ------ |
 | 0.3.0   | media-worker/1.0, 1.1      | 0.3.0 (fixture)                  | 1.1              | Node 22.22, TypeScript 5.8.3 | `npm test` (14 tests)         | pass   |
 | 0.4.0   | media-worker/1.0, 1.1      | 0.3.0 (fixture, commit 7ad6c39)  | 1.1 (1.0 by negotiation override) | Go 1.24.7 linux/amd64 | `go test ./...`, also `-race` | pass   |
+| 0.5.0   | media-worker/1.0, 1.1, 1.2 | 0.4.0 (fixture)                  | 1.2, and 1.1 pinned with `--protocol` | Go 1.24.7 linux/amd64 | `go test ./...`               | pass   |
+| 0.5.0   | media-worker/1.0, 1.1, 1.2 | 0.3.0 (fixture, commit 7ad6c39)  | 1.1              | Go 1.24.7 linux/amd64 | `go test ./...` (1.2 tests skip) | pass   |
 
 0.4.0 also serves a state directory written by Runtime 0.3.0 (`testdata/state-0.3.0`) unchanged:
 listing, export, idempotent replay of a 0.3.0 key and a new job.

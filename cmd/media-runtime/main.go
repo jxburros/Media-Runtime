@@ -33,7 +33,8 @@ media-runtime models inspect [HANDLE] | models register model.json | models list
 media-runtime recipes register recipe.json | recipes list | recipes inspect portrait
 media-runtime adapters register adapter.json | adapters list
 media-runtime inputs upload image.png | inputs list | inputs delete INPUT
-media-runtime run RECIPE --model MODEL --prompt TEXT [--image FILE|INPUT] [--strength S] [--adapter ID[:SCALE]]... [--seed N] [--wait] [--json]
+media-runtime run RECIPE --model MODEL [--prompt TEXT] [--image FILE|INPUT] [--strength S] [--adapter ID[:SCALE]]... [--seed N] [--count N]
+                   [--tile N] [--tile-overlap N] [--precision P|auto] [--fallback cpu|lower_precision]... [--wait] [--json]
 media-runtime jobs list | jobs watch JOB | jobs cancel JOB | jobs retry JOB
 media-runtime outputs export JOB --directory DIR
 media-runtime tui
@@ -53,14 +54,15 @@ func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(v string) error { *m = append(*m, v); return nil }
 
 type options struct {
-	strings  map[string]*string
-	set      map[string]bool
-	adapters multi
-	wait     bool
-	json     bool
-	verify   bool
-	help     bool
-	version  bool
+	strings   map[string]*string
+	set       map[string]bool
+	adapters  multi
+	fallbacks multi
+	wait      bool
+	json      bool
+	verify    bool
+	help      bool
+	version   bool
 }
 
 func (o *options) get(name string) (string, bool) { return *o.strings[name], o.set[name] }
@@ -70,10 +72,11 @@ func parse(args []string) (*options, []string, error) {
 	o := &options{strings: map[string]*string{}, set: map[string]bool{}}
 	fs := flag.NewFlagSet("media-runtime", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	for _, name := range []string{"config", "model", "prompt", "negative-prompt", "image", "strength", "seed", "width", "height", "steps", "guidance", "precision", "backend", "directory", "idempotency-key"} {
+	for _, name := range []string{"config", "model", "prompt", "negative-prompt", "image", "strength", "seed", "width", "height", "steps", "guidance", "precision", "backend", "directory", "idempotency-key", "count", "tile", "tile-overlap"} {
 		o.strings[name] = fs.String(name, "", "")
 	}
 	fs.Var(&o.adapters, "adapter", "")
+	fs.Var(&o.fallbacks, "fallback", "")
 	fs.BoolVar(&o.wait, "wait", false, "")
 	fs.BoolVar(&o.json, "json", false, "")
 	fs.BoolVar(&o.verify, "verify", false, "")
@@ -169,7 +172,8 @@ func run(argv []string) error {
 			if err != nil {
 				return err
 			}
-			stamp := string(jsonv.MustMarshal([]any{job.Get("state"), job.Get("stage"), job.Get("cancel_requested"), job.Obj("progress").Get("completed_steps")}))
+			progress := job.Obj("progress")
+			stamp := string(jsonv.MustMarshal([]any{job.Get("state"), job.Get("stage"), job.Get("cancel_requested"), progress.Get("completed_steps"), progress.Get("completed"), job.Get("applied_fallbacks")}))
 			if stamp != prior {
 				print(job)
 				prior = stamp
@@ -349,9 +353,9 @@ func number(text string) float64 {
 
 func runJob(cl *client.Client, values *options, recipe string, print func(any), watch func(string) error) error {
 	parameters := jsonv.NewObject()
-	for _, field := range []string{"seed", "width", "height", "steps", "guidance", "strength"} {
+	for _, field := range []string{"seed", "width", "height", "steps", "guidance", "strength", "count", "tile", "tile-overlap"} {
 		if v, ok := values.get(field); ok {
-			parameters.Set(field, number(v))
+			parameters.Set(strings.ReplaceAll(field, "-", "_"), number(v))
 		}
 	}
 	image, hasImage := values.get("image")
@@ -408,6 +412,13 @@ func runJob(cl *client.Client, values *options, recipe string, print func(any), 
 		}
 		body.Set("backend_options", jsonv.O(key, jsonv.O("precision", precision)))
 	}
+	if len(values.fallbacks) > 0 {
+		list := []any{}
+		for _, f := range values.fallbacks {
+			list = append(list, f)
+		}
+		body.Set("authorized_fallbacks", list)
+	}
 	key, _ := values.get("idempotency-key")
 	accepted, err := cl.Submit(body, key)
 	if err != nil {
@@ -454,7 +465,11 @@ func export(cl *client.Client, jobID, target string, print func(any)) error {
 		if err != nil {
 			return err
 		}
-		if err := write(fmt.Sprintf("%s-%s.png", job.Str("job_id"), output.Str("output_id")), data); err != nil {
+		ext := c.Extensions[output.Str("mime_type")]
+		if ext == "" {
+			ext = "bin"
+		}
+		if err := write(fmt.Sprintf("%s-%s.%s", job.Str("job_id"), output.Str("output_id"), ext), data); err != nil {
 			return err
 		}
 	}

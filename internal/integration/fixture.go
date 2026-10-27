@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	c "github.com/jxburros/media-runtime/internal/contracts"
 	"github.com/jxburros/media-runtime/internal/jsonv"
 )
 
@@ -109,6 +110,12 @@ func StartFixture(t testing.TB, root string, args ...string) *Fixture {
 	})
 	port, _ := discovery.Num("port")
 	return &Fixture{URL: fmt.Sprintf("http://127.0.0.1:%d", int(port)), Discovery: discovery, cmd: cmd}
+}
+
+// Highest is the highest protocol minor the fixture and this runtime share.
+func (f *Fixture) Highest() string {
+	p, _ := c.Negotiate(f.Discovery.Get("supported_protocols"), f.Discovery.Get("protocol"))
+	return p
 }
 
 type discard struct{}

@@ -73,6 +73,22 @@ func joinList(v any, sep string) string {
 	return strings.Join(parts, sep)
 }
 
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
+}
+
+// short abbreviates a digest for display.
+func short(digest string) string {
+	digest = strings.TrimPrefix(digest, "sha256:")
+	if len(digest) > 12 {
+		return digest[:12]
+	}
+	return digest
+}
+
 func objOrEmpty(o *jsonv.Object) *jsonv.Object {
 	if o == nil {
 		return jsonv.NewObject()
@@ -103,6 +119,28 @@ func ExplainDoctor(report *jsonv.Object) ([]string, bool) {
 		lines = append(lines, fmt.Sprintf("  Device %s: %s; service state %s; tasks %s", text(w, "device"), ready, text(w, "state"), joinList(w.Get("tasks"), ", ")))
 		if !truthy(w.Get("device_ready")) {
 			healthy = false
+		}
+		if id := w.Obj("device_identity"); id != nil {
+			memory := "memory unknown"
+			if id.Get("total_memory_mb") != nil {
+				memory = text(id, "total_memory_mb") + " MiB"
+			}
+			host := id.Str("host_id")
+			if len(host) > 12 {
+				host = host[:12]
+			}
+			lines = append(lines, fmt.Sprintf("  Device identity: %s (%s), %s, host %s, pid %s", or(id, "name", "unnamed"), or(id, "device", "?"), memory, host, text(id, "pid")))
+		}
+		if loaders := w.Arr("loaders"); len(loaders) > 0 {
+			parts := []string{}
+			for _, raw := range loaders {
+				l := objOrEmpty(raw.(*jsonv.Object))
+				parts = append(parts, fmt.Sprintf("%s (%s)", joinList(l.Get("families"), "/"), text(l, "format")))
+			}
+			lines = append(lines, "  Loaders: "+strings.Join(parts, ", "))
+		}
+		if w.Has("auto_options") || w.Has("fallbacks") {
+			lines = append(lines, fmt.Sprintf("  Automatic options: %s; authorizable fallbacks: %s", orNone(joinList(w.Get("auto_options"), ", ")), orNone(joinList(w.Get("fallbacks"), ", "))))
 		}
 		if missing := w.Arr("missing_dependencies"); len(missing) > 0 {
 			healthy = false
@@ -146,7 +184,17 @@ func ExplainDoctor(report *jsonv.Object) ([]string, bool) {
 		if truthy(m.Get("loaded")) {
 			loaded = "; loaded in the worker"
 		}
-		lines = append(lines, fmt.Sprintf("Model %s (%s): %s%s", text(m, "model_id"), text(m, "artifact_handle"), state, loaded))
+		kind := ""
+		if f := m.Str("family"); f != "" && f != "sdxl-base" {
+			kind = ", " + f
+			if m.Get("scale") != nil {
+				kind += " ×" + text(m, "scale")
+			}
+		}
+		lines = append(lines, fmt.Sprintf("Model %s (%s%s): %s%s", text(m, "model_id"), text(m, "artifact_handle"), kind, state, loaded))
+		if conversion := m.Obj("conversion"); conversion != nil {
+			lines = append(lines, fmt.Sprintf("  converted from source sha256 %s (reference %s)", short(conversion.Str("source_sha256")), short(conversion.Str("reference_bundle_digest"))))
+		}
 	}
 	for _, raw := range report.Arr("adapters") {
 		a := objOrEmpty(raw.(*jsonv.Object))
@@ -204,6 +252,9 @@ func ExplainCatalog(entries []any) []string {
 		state := "NOT READY"
 		if truthy(e.Get("complete")) {
 			state = "complete SDXL base bundle"
+			if e.Str("family") == "esrgan" {
+				state = "complete esrgan upscaler ×" + text(e, "scale")
+			}
 		}
 		size := ""
 		if truthy(e.Get("present")) {
@@ -213,6 +264,14 @@ func ExplainCatalog(entries []any) []string {
 		lines = append(lines, fmt.Sprintf("%s: %s%s", text(e, "artifact_handle"), state, size))
 		for _, problem := range e.Arr("problems") {
 			lines = append(lines, "  - "+jsText(problem))
+		}
+		if conversion := e.Obj("conversion"); conversion != nil {
+			converter := []string{}
+			tools := conversion.Obj("converter")
+			for _, k := range tools.Keys() {
+				converter = append(converter, k+"="+jsText(tools.Get(k)))
+			}
+			lines = append(lines, fmt.Sprintf("  converted from source sha256 %s, reference bundle %s, by %s", short(conversion.Str("source_sha256")), short(conversion.Str("reference_bundle_digest")), strings.Join(converter, " ")))
 		}
 		if truthy(e.Get("complete")) {
 			lines = append(lines, fmt.Sprintf("  register with: media-runtime models register <file containing %s>", jsonv.MustMarshal(e.Get("registration"))))

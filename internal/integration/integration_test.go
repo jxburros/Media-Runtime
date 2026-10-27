@@ -163,7 +163,7 @@ func TestRuntimeAndEngineCooperate(t *testing.T) {
 		CancellationGraceMS: 500,
 		PollIntervalMS:      20,
 		WorkerTimeoutMS:     1000,
-		MaxOutputBytes:      32 * 1024 * 1024,
+		MaxOutputBytes:      config.DefaultOutputLimits(),
 		MaxInputBytes:       32 * 1024 * 1024,
 		ArtifactCatalog: jsonv.O(
 			"fixture", filepath.Join(root, "model"),
@@ -339,7 +339,7 @@ func TestRuntimeAndEngineCooperate(t *testing.T) {
 		equal(t, manifest.Str("task"), "image-to-image")
 		equal(t, get(manifest, "inputs", "0", "sha256"), record.Get("sha256"))
 		equal(t, get(manifest, "effective_settings", "effective_steps"), 2.0)
-		equal(t, get(manifest, "backend", "protocol"), "media-worker/1.1")
+		equal(t, get(manifest, "backend", "protocol"), e.fixture.Highest())
 		e.wait(done.Str("job_id"), func(j *jsonv.Object) bool { return j.Bool("released") })
 		equal(t, okObj(e.client.DeleteInput(record.Str("input_id"))).Get("deleted"), true)
 		equal(t, len(ok(e.client.Inputs()).([]any)), 0)
@@ -385,7 +385,7 @@ func TestRuntimeAndEngineCooperate(t *testing.T) {
 	})
 
 	t.Run("protocol negotiation serves a 1.0 worker without image-to-image", func(t *testing.T) {
-		equal(t, get(okObj(e.client.Health()), "worker", "protocol"), "media-worker/1.1")
+		equal(t, get(okObj(e.client.Health()), "worker", "protocol"), e.fixture.Highest())
 		e.rt.Worker.SetHooks(func(path, method string, body, result any) (any, error) {
 			if o, ok := result.(*jsonv.Object); ok && (path == "/v1/info" || path == "/v1/capabilities") {
 				o.Delete("supported_protocols")
@@ -472,7 +472,7 @@ func TestOwnedWorkerCrashAndCancellationDeadline(t *testing.T) {
 		CancellationGraceMS: 80,
 		PollIntervalMS:      20,
 		WorkerTimeoutMS:     500,
-		MaxOutputBytes:      33554432,
+		MaxOutputBytes:      config.DefaultOutputLimits(),
 		MaxInputBytes:       33554432,
 		ArtifactCatalog:     jsonv.O("fixture", filepath.Join(root, "model")),
 		Worker: config.Worker{

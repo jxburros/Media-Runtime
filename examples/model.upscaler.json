@@ -1,0 +1,6 @@
+{
+  "model_id": "upscaler",
+  "artifact_handle": "esrgan-x2",
+  "family": "esrgan",
+  "source": {"repository": "operator-converted Real-ESRGAN x2 network", "license": "BSD-3-Clause"}
+}

@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jxburros/media-runtime/internal/catalog"
+	"github.com/jxburros/media-runtime/internal/config"
 	c "github.com/jxburros/media-runtime/internal/contracts"
 	"github.com/jxburros/media-runtime/internal/jsonv"
 	"github.com/jxburros/media-runtime/internal/runtime"
@@ -66,7 +66,7 @@ var (
 	namespacePattern = regexp.MustCompile(`^[A-Za-z0-9_:.-]{1,200}$`)
 	inputPath        = regexp.MustCompile(`^/v1/inputs/(input_[a-f0-9]{32})$`)
 	modelPath        = regexp.MustCompile(`^/v1/models/([a-zA-Z0-9_-]{1,80})$`)
-	jobPath          = regexp.MustCompile(`^/v1/jobs/(job_[a-f0-9-]+)(?:/(events|cancel|manifest|outputs)(?:/(image))?)?$`)
+	jobPath          = regexp.MustCompile(`^/v1/jobs/(job_[a-f0-9-]+)(?:/(events|cancel|manifest|outputs)(?:/([a-z][a-z0-9_]{0,31}))?)?$`)
 )
 
 type request struct {
@@ -75,6 +75,11 @@ type request struct {
 	sent      bool
 	namespace string
 	operator  bool
+	fallbacks bool
+}
+
+func (q *request) caller() runtime.Caller {
+	return runtime.Caller{Namespace: q.namespace, AllowFallbacks: q.fallbacks}
 }
 
 func (q *request) send(status int, body any) error {
@@ -173,32 +178,24 @@ func (s *Server) route(q *request) error {
 		return q.send(200, jsonv.O("status", "ok"))
 	}
 	supplied, _ := header(r, "Authorization")
-	var credential *struct {
-		namespace string
-		operator  bool
-		allowed   []string
-	}
-	for _, t := range cfg.Tokens {
+	var credential *config.Token
+	for i, t := range cfg.Tokens {
 		expected := "Bearer " + t.Token
 		if len(expected) == len(supplied) && subtle.ConstantTimeCompare([]byte(expected), []byte(supplied)) == 1 {
-			credential = &struct {
-				namespace string
-				operator  bool
-				allowed   []string
-			}{t.Namespace, t.Operator, t.AllowedNamespaces}
+			credential = &cfg.Tokens[i]
 			break
 		}
 	}
 	if credential == nil {
 		return c.Err(401, "unauthorized", "A valid bearer credential is required")
 	}
-	q.namespace, q.operator = credential.namespace, credential.operator
+	q.namespace, q.operator, q.fallbacks = credential.Namespace, credential.Operator, credential.AllowFallbacks
 	if suppliedNamespace, ok := header(r, "X-Media-Namespace"); ok {
 		if !namespacePattern.MatchString(suppliedNamespace) {
 			return c.Err(400, "invalid_namespace", "Invalid caller namespace")
 		}
 		allowed := false
-		for _, n := range credential.allowed {
+		for _, n := range credential.AllowedNamespaces {
 			if n == suppliedNamespace || (strings.HasSuffix(n, "*") && strings.HasPrefix(suppliedNamespace, n[:len(n)-1])) {
 				allowed = true
 			}
@@ -221,7 +218,7 @@ func (s *Server) route(q *request) error {
 			Set("limits", jsonv.O(
 				"queue_capacity", float64(cfg.QueueCapacity),
 				"max_input_bytes", float64(cfg.MaxInputBytes),
-				"max_output_bytes", float64(cfg.MaxOutputBytes),
+				"max_output_bytes", outputLimits(cfg),
 			)).
 			Set("protocols", protocols()))
 	case path == "/v1/catalog" && method == "GET":
@@ -270,7 +267,8 @@ func (s *Server) route(q *request) error {
 			models = append(models, jsonv.O(
 				"model_id", model.Get("model_id"),
 				"family", bundle.Get("family"),
-				"tasks", []any{"text-to-image", "image-to-image"},
+				"tasks", familyTasks(bundle.Str("family")),
+				"scale", jsonv.Maybe(model.Get("scale")),
 				"bundle_digest", bundle.Get("bundle_digest"),
 				"source", jsonv.Maybe(bundle.Get("source")),
 				"available", statErr == nil && cfg.Catalog(model.Str("artifact_handle")) != "",
@@ -298,14 +296,25 @@ func (s *Server) route(q *request) error {
 		if err != nil {
 			return err
 		}
+		family := model.Str("family")
+		if family != "sdxl-base" && (c.Minor(p.Protocol) < 2 || !workerLoads(p.Caps, family)) {
+			return c.Err(503, "unsupported", "The connected worker does not load the "+family+" family", "family")
+		}
 		validation, err := rt.Worker.Obj("/v1/validate", "POST", jsonv.O("protocol", p.Protocol, "bundle", model.Get("bundle"), "options", jsonv.Maybe(p.Caps.Get("load_defaults"))))
 		if err != nil {
 			return err
 		}
+		if scale, ok := validation.Num("scale"); ok && family == "esrgan" {
+			// The worker read the network configuration; its factor is the one recorded.
+			model.Set("scale", scale)
+		}
 		rt.Store.Register("models", model.Str("model_id"), model)
 		return q.send(201, jsonv.O(
 			"model_id", model.Get("model_id"),
+			"family", model.Get("family"),
+			"scale", jsonv.Maybe(model.Get("scale")),
 			"bundle_digest", model.Obj("bundle").Get("bundle_digest"),
+			"conversion", jsonv.Maybe(model.Obj("bundle").Obj("source").Get("conversion")),
 			"memory_estimate", nullish(validation.Get("memory_estimate")),
 		))
 	case path == "/v1/adapters" && method == "GET":
@@ -383,7 +392,7 @@ func (s *Server) route(q *request) error {
 		if err != nil {
 			return err
 		}
-		result, err := rt.Resolve(body, namespace)
+		result, err := rt.Resolve(body, q.caller())
 		if err != nil {
 			return err
 		}
@@ -402,7 +411,7 @@ func (s *Server) route(q *request) error {
 		if err != nil {
 			return err
 		}
-		job, err := rt.Submit(body, namespace, key)
+		job, err := rt.Submit(body, q.caller(), key)
 		if err != nil {
 			return err
 		}
@@ -488,6 +497,8 @@ func (s *Server) modelDetail(q *request, modelID string, verify bool) error {
 		"model_id", model.Get("model_id"),
 		"artifact_handle", model.Get("artifact_handle"),
 		"family", bundle.Get("family"),
+		"tasks", familyTasks(bundle.Str("family")),
+		"scale", jsonv.Maybe(model.Get("scale")),
 		"bundle_digest", bundle.Get("bundle_digest"),
 		"source", jsonv.Maybe(bundle.Get("source")),
 		"components", components,
@@ -531,7 +542,7 @@ func (s *Server) output(q *request, job *jsonv.Object, outputID string) error {
 	if output == nil {
 		return c.Err(404, "not_found", "Output not found")
 	}
-	file := filepath.Join(s.Runtime.OutputDirectory(job.Str("job_id")), outputID+".png")
+	file := s.Runtime.OutputFile(job.Str("job_id"), output)
 	info, err := os.Stat(file)
 	if c.Expired(output.Get("expires_at")) || err != nil {
 		return c.Err(410, "output_expired", "Output is no longer on local storage")
@@ -643,6 +654,35 @@ var (
 	decimal = regexp.MustCompile(`^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$`)
 	radix   = regexp.MustCompile(`^0([xX][0-9a-fA-F]+|[oO][0-7]+|[bB][01]+)$`)
 )
+
+func outputLimits(cfg *config.Config) *jsonv.Object {
+	limits := jsonv.NewObject()
+	for _, mime := range config.OutputMIMEs {
+		limits.Set(mime, float64(cfg.OutputLimit(mime)))
+	}
+	return limits
+}
+
+func familyTasks(family string) []any {
+	tasks := []any{}
+	for _, t := range c.FAMILIES[family] {
+		tasks = append(tasks, t)
+	}
+	return tasks
+}
+
+func workerLoads(caps *jsonv.Object, family string) bool {
+	for _, raw := range caps.Arr("loaders") {
+		if l, ok := raw.(*jsonv.Object); ok {
+			for _, f := range l.Arr("families") {
+				if f == family {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
 
 func protocols() []any {
 	out := make([]any, len(c.PROTOCOLS))

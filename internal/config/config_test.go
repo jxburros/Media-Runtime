@@ -35,7 +35,10 @@ func TestExampleConfigurationParses(t *testing.T) {
 		len(cfg.Tokens) != 2 || cfg.Tokens[1].AllowedNamespaces[0] != "studio:*" || !filepath.IsAbs(cfg.Directory) {
 		t.Fatalf("%+v", cfg)
 	}
-	if got := strings.Join(cfg.ArtifactCatalog.Keys(), ","); got != "sdxl-base,studio-style-lora" {
+	if !cfg.Tokens[0].AllowFallbacks || cfg.Tokens[1].AllowFallbacks || cfg.OutputLimit("application/zip") != 268435456 {
+		t.Fatalf("fallback grants or output limits: %+v", cfg)
+	}
+	if got := strings.Join(cfg.ArtifactCatalog.Keys(), ","); got != "sdxl-base,studio-style-lora,esrgan-x2" {
 		t.Fatal(got)
 	}
 }
@@ -57,7 +60,11 @@ func TestConfigurationIsStrict(t *testing.T) {
 	}
 	raw, _ := jsonv.Parse([]byte(`{"credentials":[{"token_env":"MEDIA_RUNTIME_TOKEN","namespace":"owner"}],"artifact_catalog":{},"worker":{"url":"http://localhost:7811/"}}`))
 	cfg, err := Parse(raw, tokens)
-	if err != nil || cfg.Port != 7810 || cfg.Worker.TokenEnv != "MEDIA_ENGINE_TOKEN" || cfg.MaxOutputBytes != 33554432 {
+	if err != nil || cfg.Port != 7810 || cfg.Worker.TokenEnv != "MEDIA_ENGINE_TOKEN" || cfg.MaxOutputBytes["image/png"] != 33554432 || cfg.MaxOutputBytes["video/mp4"] != 268435456 {
 		t.Fatalf("defaults: %v %+v", err, cfg)
+	}
+	raw, _ = jsonv.Parse([]byte(`{"max_output_bytes":1000,"credentials":[{"token_env":"MEDIA_RUNTIME_TOKEN","namespace":"owner"}],"artifact_catalog":{},"worker":{}}`))
+	if cfg, err := Parse(raw, tokens); err != nil || cfg.OutputLimit("image/png") != 1000 || cfg.OutputLimit("audio/wav") != 67108864 {
+		t.Fatalf("0.4.0 numeric output limit: %v %+v", err, cfg)
 	}
 }

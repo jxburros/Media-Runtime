@@ -100,6 +100,9 @@ func DescribeStage(job *jsonv.Object) string {
 		if progress.Str("stage") == "sampling" && truthy(progress.Get("total_steps")) {
 			return fmt.Sprintf("sampling %s/%s", js(progress, "completed_steps"), js(progress, "total_steps"))
 		}
+		if truthy(progress.Get("total")) && progress.Get("unit") != nil {
+			return fmt.Sprintf("%s %s/%s %s", js(progress, "stage"), js(progress, "completed"), js(progress, "total"), js(progress, "unit"))
+		}
 		if s := job.Str("stage"); s != "" {
 			return s
 		}
@@ -111,6 +114,20 @@ func DescribeStage(job *jsonv.Object) string {
 		return "queued"
 	}
 	return js(job, "state")
+}
+
+// FallbackNames lists applied fallbacks, which the worker records as {fallback, reason, …}.
+func FallbackNames(applied []any) string {
+	names := []string{}
+	for _, raw := range applied {
+		switch f := raw.(type) {
+		case string:
+			names = append(names, f)
+		case *jsonv.Object:
+			names = append(names, f.Str("fallback"))
+		}
+	}
+	return strings.Join(names, ", ")
 }
 
 func truthy(v any) bool {
@@ -244,6 +261,12 @@ func Render(state State, columns, rows int) []string {
 			tail = "output expired"
 		} else if location != "" {
 			tail = "output ready"
+			if n := len(job.Arr("outputs")); n > 1 {
+				tail = fmt.Sprintf("%d outputs ready", n)
+			}
+		}
+		if names := FallbackNames(job.Arr("applied_fallbacks")); names != "" {
+			tail += " (fallback " + names + ")"
 		}
 		task := "text-to-image"
 		if job.Get("task") != nil {

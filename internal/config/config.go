@@ -18,6 +18,7 @@ type Credential struct {
 	Namespace         string
 	Operator          bool
 	AllowedNamespaces []string
+	AllowFallbacks    bool
 }
 
 type Token struct {
@@ -25,6 +26,18 @@ type Token struct {
 	Namespace         string
 	Operator          bool
 	AllowedNamespaces []string
+	// AllowFallbacks lets this credential forward authorized_fallbacks to the worker.
+	AllowFallbacks bool
+}
+
+// OutputMIMEs are the output types the runtime can verify, with their default size limits.
+var OutputMIMEs = []string{"image/png", "application/zip", "video/mp4", "audio/wav"}
+
+var defaultOutputBytes = map[string]int{
+	"image/png":       32 * 1024 * 1024,
+	"application/zip": 256 * 1024 * 1024,
+	"video/mp4":       256 * 1024 * 1024,
+	"audio/wav":       64 * 1024 * 1024,
 }
 
 type Worker struct {
@@ -41,8 +54,9 @@ type Config struct {
 	CancellationGraceMS int
 	PollIntervalMS      int
 	WorkerTimeoutMS     int
-	MaxOutputBytes      int
-	MaxInputBytes       int
+	// MaxOutputBytes is the per-MIME limit for one committed output.
+	MaxOutputBytes map[string]int
+	MaxInputBytes  int
 	// OutputRetentionDays is nil for unlimited retention.
 	OutputRetentionDays *float64
 	Credentials         []Credential
@@ -51,6 +65,18 @@ type Config struct {
 	Worker          Worker
 	Tokens          []Token
 }
+
+// DefaultOutputLimits is a fresh copy of the default per-MIME output limits.
+func DefaultOutputLimits() map[string]int {
+	limits := map[string]int{}
+	for mime, limit := range defaultOutputBytes {
+		limits[mime] = limit
+	}
+	return limits
+}
+
+// OutputLimit is the size limit for one output of a MIME type (0 for an unknown type).
+func (cfg *Config) OutputLimit(mime string) int { return cfg.MaxOutputBytes[mime] }
 
 // Catalog returns the configured directory for a handle, or "".
 func (cfg *Config) Catalog(handle string) string { return cfg.ArtifactCatalog.Str(handle) }
@@ -66,7 +92,7 @@ var schema = c.StrictObject(
 	c.Field{Name: "cancellation_grace_ms", Check: positive, Default: def(10000.0)},
 	c.Field{Name: "poll_interval_ms", Check: positive, Default: def(250.0)},
 	c.Field{Name: "worker_timeout_ms", Check: positive, Default: def(30000.0)},
-	c.Field{Name: "max_output_bytes", Check: positive, Default: def(float64(32 * 1024 * 1024))},
+	c.Field{Name: "max_output_bytes", Check: outputLimits, Optional: true},
 	c.Field{Name: "max_input_bytes", Check: positive, Default: def(float64(32 * 1024 * 1024))},
 	c.Field{Name: "output_retention_days", Check: c.Nullable(c.Num(c.NumOpts{GreaterThan: c.F(0)})), Default: def(nil)},
 	c.Field{Name: "credentials", Check: c.Array(c.StrictObject(
@@ -74,6 +100,7 @@ var schema = c.StrictObject(
 		c.Field{Name: "namespace", Check: c.ID},
 		c.Field{Name: "operator", Check: c.Bool(), Default: def(false)},
 		c.Field{Name: "allowed_namespaces", Check: c.Array(c.Str(c.StrOpts{Min: 1}), c.ArrOpts{}), Default: func() any { return []any{} }},
+		c.Field{Name: "allow_fallbacks", Check: c.Bool(), Default: def(false)},
 	), c.ArrOpts{Min: 1})},
 	c.Field{Name: "artifact_catalog", Check: c.Record(c.Str(c.StrOpts{Refine: filepath.IsAbs}))},
 	c.Field{Name: "worker", Check: c.StrictObject(
@@ -83,6 +110,18 @@ var schema = c.StrictObject(
 		c.Field{Name: "backend_id", Check: c.Enum(c.BACKENDS...), Optional: true},
 	)},
 )
+
+// outputLimits accepts the 0.4.0 number (the PNG limit) or a map of the known MIME types.
+var outputLimits c.Check = func(v any, path []string) (any, error) {
+	if _, ok := v.(float64); ok {
+		return positive(v, path)
+	}
+	fields := []c.Field{}
+	for _, mime := range OutputMIMEs {
+		fields = append(fields, c.Field{Name: mime, Check: positive, Optional: true})
+	}
+	return c.StrictObject(fields...)(v, path)
+}
 
 // Read loads the file named by the argument, $MEDIA_RUNTIME_CONFIG or runtime.config.json.
 func Read(file string) (*Config, error) {
@@ -122,10 +161,18 @@ func Parse(raw any, env func(string) string) (*Config, error) {
 		CancellationGraceMS: num(parsed, "cancellation_grace_ms"),
 		PollIntervalMS:      num(parsed, "poll_interval_ms"),
 		WorkerTimeoutMS:     num(parsed, "worker_timeout_ms"),
-		MaxOutputBytes:      num(parsed, "max_output_bytes"),
+		MaxOutputBytes:      DefaultOutputLimits(),
 		MaxInputBytes:       num(parsed, "max_input_bytes"),
 		ArtifactCatalog:     parsed.Obj("artifact_catalog"),
 		Worker:              Worker{URL: w.Str("url"), TokenEnv: w.Str("token_env"), BackendID: w.Str("backend_id")},
+	}
+	switch limits := parsed.Get("max_output_bytes").(type) {
+	case float64:
+		cfg.MaxOutputBytes["image/png"] = int(limits)
+	case *jsonv.Object:
+		for _, mime := range limits.Keys() {
+			cfg.MaxOutputBytes[mime] = num(limits, mime)
+		}
 	}
 	if days, ok := parsed.Num("output_retention_days"); ok {
 		cfg.OutputRetentionDays = &days
@@ -142,7 +189,7 @@ func Parse(raw any, env func(string) string) (*Config, error) {
 	seen := map[string]bool{}
 	for _, raw := range parsed.Arr("credentials") {
 		o := raw.(*jsonv.Object)
-		cred := Credential{TokenEnv: o.Str("token_env"), Namespace: o.Str("namespace"), Operator: o.Bool("operator")}
+		cred := Credential{TokenEnv: o.Str("token_env"), Namespace: o.Str("namespace"), Operator: o.Bool("operator"), AllowFallbacks: o.Bool("allow_fallbacks")}
 		for _, n := range o.Arr("allowed_namespaces") {
 			cred.AllowedNamespaces = append(cred.AllowedNamespaces, n.(string))
 		}
@@ -155,7 +202,7 @@ func Parse(raw any, env func(string) string) (*Config, error) {
 			return nil, errors.New("Credentials must be unique")
 		}
 		seen[token] = true
-		cfg.Tokens = append(cfg.Tokens, Token{Token: token, Namespace: cred.Namespace, Operator: cred.Operator, AllowedNamespaces: cred.AllowedNamespaces})
+		cfg.Tokens = append(cfg.Tokens, Token{Token: token, Namespace: cred.Namespace, Operator: cred.Operator, AllowedNamespaces: cred.AllowedNamespaces, AllowFallbacks: cred.AllowFallbacks})
 	}
 	abs, err := filepath.Abs(cfg.Directory)
 	if err != nil {

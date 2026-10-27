@@ -122,3 +122,37 @@ framework (strict decoding with `DisallowUnknownFields` and hand-written range c
 
 The gateway client package keeps TypeScript's zero-dependency profile: it uses `fetch` and no
 third-party module.
+
+# Implementation decisions — 0.5.0
+
+- Protocol 1.2 is negotiated when the worker lists it; 1.0 and 1.1 remain. Each 1.2 field is
+  admitted only against a 1.2 worker that advertises it and is otherwise refused with
+  `unsupported` naming the field (`parameters.count`, `precision`, `authorized_fallbacks`,
+  `recipe_id` for `upscale`, `family` at registration).
+- Output limits: `max_output_bytes` is a per-MIME map with defaults `image/png` 32 MiB,
+  `application/zip` 256 MiB, `video/mp4` 256 MiB and `audio/wav` 64 MiB; the 0.4.0 number is
+  read as the PNG limit. The video and audio defaults are unmeasured guesses until those stages.
+- `count` is 1–4 in the request schema and further bounded by the worker's `limits.count`. The
+  expected output set is the worker's `task_parameters.<task>.outputs` with `repeated_outputs`
+  expanded to `id_2 … id_N`; an extra or missing output fails the job (`output_unavailable`).
+  Output `k` of a batch records seed `seed + k − 1`.
+- Upscale requests carry only `width`, `height` (the input's), `tile` and `tile_overlap`. The
+  registration's `scale` is the factor the worker reports when it validates the bundle; the
+  runtime checks `max(width, height) × scale ≤ limits.output_side` before admission and the worker
+  checks again. Model and recipe families must match before any worker call.
+- Conversion provenance comes only from the directory's `conversion.json`: a registration may
+  repeat it (it must match) but never supply it alone. A directory holding one `.safetensors` file
+  and no `model_index.json`/`config.json` is a bare checkpoint and is refused with field `format`.
+- Fallback policy: credentials default to `allow_fallbacks: false`; a request naming fallbacks with
+  such a credential is `403 fallbacks_not_allowed`, field `authorized_fallbacks`. The one
+  readiness relaxation is a 1.2 worker whose selected device is unavailable (`device_available:
+  false`, dependencies present) when the request authorizes `cpu`: it is admitted and dispatched
+  so the worker can apply that fallback. Without the authorization the 503 refusal is unchanged.
+  Applied fallbacks are recorded from the loaded bundle when the job is dispatched, so a job that
+  reuses an already loaded fallback bundle records it too.
+- `auto` stays in the request and the load identity (the worker reports the requested options as
+  the loaded options), so an identical request does not reload; resolved values are recorded,
+  never copied into a retry.
+- Manifest schema 3 adds `family`, `scale` (upscale), `device_identity`, `resolved_options`,
+  `resolutions`, `applied_fallbacks` and every output with its seed. Schema 2 manifests are never
+  rewritten.

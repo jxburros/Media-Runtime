@@ -5,17 +5,24 @@
   "cancellation_grace_ms": 10000,
   "worker_timeout_ms": 30000,
   "poll_interval_ms": 250,
-  "max_output_bytes": 33554432,
+  "max_output_bytes": {
+    "image/png": 33554432,
+    "application/zip": 268435456,
+    "video/mp4": 268435456,
+    "audio/wav": 67108864
+  },
   "output_retention_days": null,
   "artifact_catalog": {
     "sdxl-base": "/absolute/path/to/local/sdxl-base",
-    "studio-style-lora": "/absolute/path/to/local/studio-style-lora"
+    "studio-style-lora": "/absolute/path/to/local/studio-style-lora",
+    "esrgan-x2": "/absolute/path/to/local/esrgan-x2"
   },
   "credentials": [
     {
       "token_env": "MEDIA_RUNTIME_TOKEN",
       "namespace": "owner",
-      "operator": true
+      "operator": true,
+      "allow_fallbacks": true
     },
     {
       "token_env": "MEDIA_STUDIO_TOKEN",

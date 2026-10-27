@@ -127,6 +127,20 @@ func BuildBundle(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 		}
 		return nil, c.Err(400, "missing_component", "Cannot read the approved bundle")
 	}
+	family := data.Str("family")
+	if family == "" {
+		family = "sdxl-base"
+	}
+	if family == "esrgan" {
+		return buildSingleFile(data, root, files)
+	}
+	if bareCheckpoint(files) {
+		return nil, c.Err(400, "unsupported", "A single-file checkpoint is not a bundle: convert it with media-engine convert, then register the converted directory", "format")
+	}
+	source, err := withConversion(data.Obj("source"), root, files)
+	if err != nil {
+		return nil, err
+	}
 	index, err := readJSON(filepath.Join(root, "model_index.json"))
 	if err != nil {
 		return nil, c.Err(400, "missing_component", "Missing pipeline configuration")
@@ -160,13 +174,129 @@ func BuildBundle(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 		"pipeline", "text-to-image",
 		"components", components,
 		"configuration", jsonv.O("artifact_handle", handle, "files", files),
+		"source", source,
+	)
+	return jsonv.O(
+		"model_id", data.Str("model_id"),
+		"artifact_handle", handle,
+		"family", "sdxl-base",
+		"bundle", bundle.Clone().Set("bundle_digest", c.Hash(bundle)),
+	), nil
+}
+
+// bareCheckpoint is one safetensors file with no pipeline or network configuration beside it.
+func bareCheckpoint(files *jsonv.Object) bool {
+	weights := 0
+	for _, k := range files.Keys() {
+		if strings.Contains(k, "/") || k == "model_index.json" || k == "config.json" {
+			return false
+		}
+		if strings.HasSuffix(k, ".safetensors") {
+			weights++
+		}
+	}
+	return weights == 1
+}
+
+// singleFileLayout reports the weights file of a single-file-safetensors directory: exactly one
+// root .safetensors file plus config.json and nothing else.
+func singleFileLayout(files *jsonv.Object) (string, bool) {
+	weights := ""
+	for _, k := range files.Keys() {
+		switch {
+		case strings.Contains(k, "/"):
+			return "", false
+		case k == "config.json":
+		case strings.HasSuffix(k, ".safetensors") && weights == "":
+			weights = k
+		default:
+			return "", false
+		}
+	}
+	return weights, weights != "" && files.Has("config.json")
+}
+
+// networkConfig reads an upscaler's config.json; ok is false unless it names an RRDB network
+// with an integer scale.
+func networkConfig(root string) (architecture string, scale float64, ok bool) {
+	config, err := readJSON(filepath.Join(root, "config.json"))
+	if err != nil {
+		return "", 0, false
+	}
+	scale, isNum := config.Num("scale")
+	return config.Str("architecture"), scale, isNum && scale == float64(int(scale)) && config.Str("architecture") == "rrdbnet"
+}
+
+// buildSingleFile builds an esrgan bundle: one network weights file plus its configuration.
+func buildSingleFile(data *jsonv.Object, root string, files *jsonv.Object) (*jsonv.Object, error) {
+	handle := data.Str("artifact_handle")
+	weights, ok := singleFileLayout(files)
+	if !ok {
+		return nil, c.Err(400, "unsupported", "An esrgan bundle is one .safetensors network file plus config.json", "configuration")
+	}
+	if data.Obj("source").Has("conversion") {
+		return nil, c.Err(400, "invalid_request", "Conversion provenance applies to converted SDXL bundles", "source.conversion")
+	}
+	_, scale, ok := networkConfig(root)
+	if !ok {
+		return nil, c.Err(400, "unsupported", "config.json must describe an rrdbnet network with an integer scale", "configuration")
+	}
+	components := []any{
+		jsonv.O("role", "network", "artifact_handle", handle, "digest", c.Hash(jsonv.O(weights, files.Get(weights))), "tensor_format", "safetensors"),
+		jsonv.O("role", "configuration", "artifact_handle", handle, "digest", c.Hash(jsonv.O("config.json", files.Get("config.json"))), "tensor_format", "json"),
+	}
+	bundle := jsonv.O(
+		"schema_version", 1.0,
+		"bundle_id", data.Str("model_id"),
+		"family", "esrgan",
+		"format", "single-file-safetensors",
+		"pipeline", "upscale",
+		"components", components,
+		"configuration", jsonv.O("artifact_handle", handle, "files", files),
 		"source", data.Get("source"),
 	)
 	return jsonv.O(
 		"model_id", data.Str("model_id"),
 		"artifact_handle", handle,
+		"family", "esrgan",
+		"scale", scale,
 		"bundle", bundle.Clone().Set("bundle_digest", c.Hash(bundle)),
 	), nil
+}
+
+// readConversion validates a converted directory's conversion.json.
+func readConversion(root string) (*jsonv.Object, error) {
+	raw, err := readJSON(filepath.Join(root, "conversion.json"))
+	if err != nil {
+		return nil, err
+	}
+	record := jsonv.NewObject()
+	for _, k := range []string{"source_sha256", "reference_bundle_digest", "converter", "mapped_keys"} {
+		if raw.Has(k) {
+			record.Set(k, raw.Get(k))
+		}
+	}
+	return c.Validate(c.Conversion, record)
+}
+
+// withConversion records conversion.json provenance in the registration source. A supplied
+// source.conversion must equal the directory's file; it is never accepted on its own.
+func withConversion(source *jsonv.Object, root string, files *jsonv.Object) (*jsonv.Object, error) {
+	supplied := source.Get("conversion")
+	if !files.Has("conversion.json") {
+		if supplied != nil {
+			return nil, c.Err(400, "invalid_request", "This bundle has no conversion.json", "source.conversion")
+		}
+		return source, nil
+	}
+	conversion, err := readConversion(root)
+	if err != nil {
+		return nil, c.Err(400, "invalid_request", "conversion.json is missing a required provenance field", "source.conversion")
+	}
+	if supplied != nil && c.Hash(supplied) != c.Hash(conversion) {
+		return nil, c.Err(400, "invalid_request", "source.conversion differs from the bundle's conversion.json", "source.conversion")
+	}
+	return source.Clone().Set("conversion", conversion), nil
 }
 
 func readJSON(path string) (*jsonv.Object, error) {
@@ -222,18 +352,30 @@ func Inspect(catalog *jsonv.Object, handle string) []any {
 		}
 		var symlinks, forbiddenFiles, problems []string
 		present, fileCount, totalBytes := false, 0, int64(0)
-		var pipeline, scheduler any
+		var pipeline, scheduler, scale, conversion any
+		family, format := "sdxl-base", "diffusers-safetensors"
 		missing := append([]string(nil), ROLES...)
 		entry := func() *jsonv.Object {
 			complete := len(problems) == 0
 			var registration any
 			if complete {
-				registration = jsonv.O("model_id", artifactHandle, "artifact_handle", artifactHandle)
+				doc := jsonv.O("model_id", artifactHandle, "artifact_handle", artifactHandle)
+				if family != "sdxl-base" {
+					doc.Set("family", family)
+				}
+				if conversion != nil {
+					doc.Set("source", jsonv.O("conversion", conversion))
+				}
+				registration = doc
 			}
 			return jsonv.O(
 				"artifact_handle", artifactHandle,
 				"present", present,
+				"family", family,
+				"format", format,
 				"pipeline", pipeline,
+				"scale", jsonv.Maybe(scale),
+				"conversion", jsonv.Maybe(conversion),
 				"roles", roles,
 				"missing_roles", strs(missing),
 				"forbidden_files", strs(forbiddenFiles),
@@ -304,6 +446,46 @@ func Inspect(catalog *jsonv.Object, handle string) []any {
 			problems = append(problems, "Approved directory could not be read")
 			entries = append(entries, entry())
 			continue
+		}
+		if names, err := readdir(root); err == nil && len(symlinks) == 0 && len(forbiddenFiles) == 0 {
+			top := jsonv.NewObject()
+			for _, name := range names {
+				if info, err := os.Lstat(filepath.Join(root, name)); err == nil {
+					if info.IsDir() {
+						top.Set(name+"/", "")
+					} else {
+						top.Set(name, "")
+					}
+				}
+			}
+			if _, ok := singleFileLayout(top); ok && !top.Has("model_index.json") {
+				// A single-file network: the esrgan upscaler layout.
+				family, format, pipeline, missing = "esrgan", "single-file-safetensors", "upscale", nil
+				roles = jsonv.O(
+					"network", jsonv.O("present", true, "safetensors", 1.0, "files", 1.0),
+					"configuration", jsonv.O("present", true, "safetensors", 0.0, "files", 1.0),
+				)
+				if _, s, ok := networkConfig(root); ok {
+					scale = s
+				} else {
+					problems = append(problems, "config.json must describe an rrdbnet network with an integer scale")
+				}
+				entries = append(entries, entry())
+				continue
+			}
+			if bareCheckpoint(top) {
+				format, missing = "single-file-checkpoint", append([]string(nil), ROLES...)
+				problems = append(problems, "Single-file checkpoint: convert it with media-engine convert, then catalogue the converted directory")
+				entries = append(entries, entry())
+				continue
+			}
+			if top.Has("conversion.json") {
+				if record, err := readConversion(root); err == nil {
+					conversion = record
+				} else {
+					problems = append(problems, "conversion.json is missing a required provenance field")
+				}
+			}
 		}
 		if index, err := readJSON(filepath.Join(root, "model_index.json")); err == nil {
 			pipeline = className(index)

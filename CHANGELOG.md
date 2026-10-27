@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 — 2026-10-27
+
+Worker protocol `media-worker/1.2` (Engine 0.4.0), phase R1 of the implementation plan. Runtime
+records the worker's device identity, loader and task facts on every job and in manifest schema 3.
+**Multiple outputs:** `parameters.count` / `run --count` (text-to-image, worker-limited) commits
+`image` … `image_N` with per-output seeds; success requires every advertised output; per-MIME
+`max_output_bytes`; the outputs route and `outputs export` handle any output ID and MIME type.
+**Upscaling:** the `upscale` pipeline, the `esrgan` family (`family` in registrations, scale from
+the worker) and the default `enlarge` recipe with `tile`/`tile_overlap`; inputs are never resized
+and oversize results are refused before admission. **Conversion provenance:** catalog inspection
+and registration read `conversion.json` into `source.conversion`, manifests carry it, and bare
+single-file checkpoints are refused with field `format`. **Automatic settings and fallbacks:**
+`precision: "auto"` with recorded `resolved_options`/`resolutions`; `authorized_fallbacks`
+(`run --fallback`) for credentials with `allow_fallbacks`, recorded as `applied_fallbacks`, a
+`stage` event, in the dashboard and in the manifest. The gateway client gains typed submissions,
+jobs, output records and model summaries. Every 1.2 capability is refused against 1.0/1.1 workers;
+existing jobs, schema 2 manifests and 0.4.0 configurations remain readable. Tested against Engine
+0.4.0's fixture and, for the 1.1 path, Engine 0.3.0's ([compatibility record](docs/compatibility.md)).
+Companion Studio task: import every output of a multi-output job and the upscale task through the
+typed gateway client.
+
 ## 0.4.0 — 2026-10-27
 
 The service is rewritten in Go at exact 0.3.0 feature parity, as phase R0 of the implementation
