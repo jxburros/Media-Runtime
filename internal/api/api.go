@@ -32,9 +32,12 @@ type Server struct {
 	once    sync.Once
 }
 
-func New(rt *runtime.Runtime) *Server {
+func New(rt *runtime.Runtime) *Server { return NewWithTimeouts(rt, 10*time.Second, 30*time.Second) }
+
+// NewWithTimeouts sets the header and whole-request read limits (tests shorten them).
+func NewWithTimeouts(rt *runtime.Runtime, header, request time.Duration) *Server {
 	s := &Server{Runtime: rt, closing: make(chan struct{})}
-	s.http = &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second}
+	s.http = &http.Server{Handler: s, ReadHeaderTimeout: header, ReadTimeout: request}
 	return s
 }
 
@@ -562,6 +565,8 @@ func (s *Server) events(q *request, jobID string) error {
 	if !ok || cursor < 0 || cursor > last {
 		return c.Err(409, "resume_required", "Fetch a fresh job snapshot before resuming events")
 	}
+	// The request has been read; never let ReadTimeout bound a long-lived stream.
+	_ = http.NewResponseController(q.w).SetReadDeadline(time.Time{})
 	h := q.w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Connection", "keep-alive")

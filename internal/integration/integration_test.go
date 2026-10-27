@@ -247,6 +247,25 @@ func TestRuntimeAndEngineCooperate(t *testing.T) {
 		rejects(t, err, 410)
 	})
 
+	t.Run("an event stream outlives the request read timeout", func(t *testing.T) {
+		short := api.NewWithTimeouts(e.rt, time.Second, 200*time.Millisecond)
+		if err := short.Listen("127.0.0.1:0"); err != nil {
+			t.Fatal(err)
+		}
+		defer short.Close()
+		accepted := okObj(e.client.Submit(withSteps(40), ""))
+		res, err := client.New(short.URL(), token, "").Response("/v1/jobs/"+accepted.Str("job_id")+"/events", "GET", nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		started := time.Now()
+		stream, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if time.Since(started) < 300*time.Millisecond || !strings.Contains(string(stream), `"state":"succeeded"`) {
+			t.Fatalf("stream ended early after %v: %s", time.Since(started), stream)
+		}
+	})
+
 	t.Run("bounded FIFO, queued cancellation and running cancellation settle", func(t *testing.T) {
 		first := okObj(e.client.Submit(withSteps(100), ""))
 		e.wait(first.Str("job_id"), hasExecution)
