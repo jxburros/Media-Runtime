@@ -1,0 +1,29 @@
+{
+  "schema_version": 2,
+  "recipe_id": "portrait-4k",
+  "revision": 1,
+  "inputs": {
+    "prompt": { "type": "string", "required": true },
+    "negative_prompt": { "type": "string", "required": false }
+  },
+  "operations": [
+    {
+      "op_id": "generate",
+      "task": "text-to-image",
+      "model_family": "sdxl-base",
+      "inputs": {
+        "prompt": { "from": "input:prompt" },
+        "negative_prompt": { "from": "input:negative_prompt" }
+      },
+      "defaults": { "width": 1024, "height": 1024, "steps": 30, "guidance": 6 }
+    },
+    {
+      "op_id": "enlarge",
+      "task": "upscale",
+      "model_family": "esrgan",
+      "inputs": { "image": { "from": "op:generate/image" } },
+      "defaults": { "tile": 512, "tile_overlap": 16 }
+    }
+  ],
+  "publish": ["enlarge/image"]
+}

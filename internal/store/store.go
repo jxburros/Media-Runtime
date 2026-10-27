@@ -104,6 +104,63 @@ func decodeObject(text string) *jsonv.Object {
 	return o
 }
 
+// migrateJob reads a job written before 0.6.0 as a single-operation job: its top-level task,
+// model, inputs, adapters, parameters, backend, worker identities and outputs become operation
+// zero. Nothing is rewritten until the job is next saved.
+func migrateJob(job *jsonv.Object) *jsonv.Object {
+	if job == nil || job.Has("operations") {
+		return job
+	}
+	state := job.Str("state")
+	switch state {
+	case "queued":
+		state = "pending"
+	case "succeeded", "failed", "cancelled", "running":
+	default:
+		state = "pending"
+	}
+	request := job.Obj("request")
+	op := jsonv.O(
+		"op_id", c.OpName(job.Obj("recipe").Str("recipe_id")),
+		"task", job.Get("task"),
+		"state", state,
+		"model", jsonv.Clone(job.Get("model")),
+		"input", jsonv.Maybe(jsonv.Clone(job.Get("input"))),
+		"inputs", jsonv.Clone(request.Get("inputs")),
+		"adapters", jsonv.Clone(nullish(job.Get("adapters"), []any{})),
+		"parameters", jsonv.Clone(request.Get("parameters")),
+		"backend", jsonv.Clone(job.Get("backend")),
+	)
+	for _, k := range []string{"attempt_id", "session_id", "execution_id", "worker_input_id", "load_operation_id", "dispatch_phase", "worker_sequence", "applied_fallbacks", "released"} {
+		if job.Has(k) {
+			op.Set(k, jsonv.Clone(job.Get(k)))
+		}
+	}
+	if !op.Has("worker_sequence") {
+		op.Set("worker_sequence", 0.0)
+	}
+	op.Set("outputs", jsonv.Clone(nullish(job.Get("outputs"), []any{})))
+	if e := job.Get("error"); e != nil {
+		op.Set("error", jsonv.Clone(e))
+	}
+	return job.Set("operations", []any{op}).Set("current_operation", 0.0)
+}
+
+func nullish(v, fallback any) any {
+	if v == nil {
+		return fallback
+	}
+	return v
+}
+
+func (s *Store) jobs(query string, args ...any) []*jsonv.Object {
+	out := s.rows(query, args...)
+	for _, job := range out {
+		migrateJob(job)
+	}
+	return out
+}
+
 func (s *Store) rows(query string, args ...any) []*jsonv.Object {
 	rows, err := s.q().Query(query, args...)
 	if err != nil {
@@ -168,17 +225,17 @@ func (s *Store) DeleteInput(inputID string) { s.exec("DELETE FROM inputs WHERE i
 // All lists jobs in admission order, optionally in one state.
 func (s *Store) All(state string) []*jsonv.Object {
 	if state != "" {
-		return s.rows("SELECT data FROM jobs WHERE state=? ORDER BY ordinal", state)
+		return s.jobs("SELECT data FROM jobs WHERE state=? ORDER BY ordinal", state)
 	}
-	return s.rows("SELECT data FROM jobs ORDER BY ordinal")
+	return s.jobs("SELECT data FROM jobs ORDER BY ordinal")
 }
 
 // Get returns a job; an empty namespace matches any owner.
 func (s *Store) Get(jobID, namespace string) *jsonv.Object {
 	if namespace != "" {
-		return s.row("SELECT data FROM jobs WHERE job_id=? AND namespace=?", jobID, namespace)
+		return migrateJob(s.row("SELECT data FROM jobs WHERE job_id=? AND namespace=?", jobID, namespace))
 	}
-	return s.row("SELECT data FROM jobs WHERE job_id=?", jobID)
+	return migrateJob(s.row("SELECT data FROM jobs WHERE job_id=?", jobID))
 }
 
 // Page is one page of a namespace's jobs with their ordinals.
@@ -201,7 +258,7 @@ func (s *Store) Page(namespace string, newest bool, after, limit int) ([]*jsonv.
 		if err := rows.Scan(&ordinal, &data); err != nil {
 			panic(err)
 		}
-		jobs = append(jobs, decodeObject(data))
+		jobs = append(jobs, migrateJob(decodeObject(data)))
 		ordinals = append(ordinals, ordinal)
 	}
 	return jobs, ordinals

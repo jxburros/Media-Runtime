@@ -92,8 +92,16 @@ func num(o *jsonv.Object, key, unit string) string {
 	return jsString(o.Get(key)) + unit
 }
 
-// DescribeStage is the stage column: sampling progress, the stage, or the state.
+// DescribeStage is the stage column: sampling progress, the stage, or the state. A linear
+// job's running stage is prefixed with its current operation (op_id/stage).
 func DescribeStage(job *jsonv.Object) string {
+	if op := job.Str("current_op_id"); op != "" && job.Str("state") == "running" {
+		return op + "/" + describeStage(job)
+	}
+	return describeStage(job)
+}
+
+func describeStage(job *jsonv.Object) string {
 	switch job.Str("state") {
 	case "running":
 		progress := job.Obj("progress")

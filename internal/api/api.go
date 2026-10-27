@@ -66,7 +66,10 @@ var (
 	namespacePattern = regexp.MustCompile(`^[A-Za-z0-9_:.-]{1,200}$`)
 	inputPath        = regexp.MustCompile(`^/v1/inputs/(input_[a-f0-9]{32})$`)
 	modelPath        = regexp.MustCompile(`^/v1/models/([a-zA-Z0-9_-]{1,80})$`)
-	jobPath          = regexp.MustCompile(`^/v1/jobs/(job_[a-f0-9-]+)(?:/(events|cancel|manifest|outputs)(?:/([a-z][a-z0-9_]{0,31}))?)?$`)
+	recipePath       = regexp.MustCompile(`^/v1/recipes/([a-zA-Z0-9_-]{1,80})$`)
+	// Output IDs are the worker's (image, image_2 …) or, for a linear job's intermediates and
+	// colliding published outputs, <op_id>__<output_id>.
+	jobPath = regexp.MustCompile(`^/v1/jobs/(job_[a-f0-9-]+)(?:/(events|cancel|manifest|outputs)(?:/([a-z][a-z0-9_]{0,65}))?)?$`)
 )
 
 type request struct {
@@ -387,6 +390,12 @@ func (s *Server) route(q *request) error {
 		}
 		rt.Store.Register("recipes", recipe.Str("recipe_id"), value)
 		return q.send(201, value)
+	case recipePath.MatchString(path) && method == "GET":
+		recipe := rt.Store.Registry("recipes", recipePath.FindStringSubmatch(path)[1])
+		if recipe == nil {
+			return c.Err(404, "not_found", "Recipe not found")
+		}
+		return q.send(200, RecipeDetail(recipe))
 	case path == "/v1/jobs/validate" && method == "POST":
 		body, err := q.body()
 		if err != nil {
@@ -396,12 +405,28 @@ func (s *Server) route(q *request) error {
 		if err != nil {
 			return err
 		}
-		return q.send(200, jsonv.O(
+		response := jsonv.O(
 			"valid", true,
 			"request", result.Get("request"),
 			"recipe_digest", result.Obj("recipe").Get("digest"),
 			"bundle_digest", result.Obj("model").Obj("bundle").Get("bundle_digest"),
-		))
+		)
+		if c.IsLinear(result.Obj("recipe")) {
+			// The per-operation plan: each operation's model, task and effective parameters.
+			plan := []any{}
+			for _, op := range runtime.Operations(result) {
+				plan = append(plan, jsonv.O(
+					"op_id", op.Get("op_id"),
+					"task", op.Get("task"),
+					"model_id", op.Obj("model").Get("model_id"),
+					"bundle_digest", op.Obj("model").Obj("bundle").Get("bundle_digest"),
+					"input_from", jsonv.Maybe(op.Get("input_from")),
+					"parameters", op.Get("parameters"),
+				))
+			}
+			response.Set("operations", plan)
+		}
+		return q.send(200, response)
 	case path == "/v1/jobs" && method == "POST":
 		var key *string
 		if k, ok := header(r, "Idempotency-Key"); ok {
@@ -533,7 +558,8 @@ func (s *Server) modelDetail(q *request, modelID string, verify bool) error {
 
 func (s *Server) output(q *request, job *jsonv.Object, outputID string) error {
 	var output *jsonv.Object
-	for _, raw := range job.Arr("outputs") {
+	// The job owns its intermediates, so they are served beside the published outputs.
+	for _, raw := range append(append([]any{}, job.Arr("outputs")...), job.Arr("intermediate_outputs")...) {
 		if o, ok := raw.(*jsonv.Object); ok && o.Str("output_id") == outputID {
 			output = o
 			break
@@ -715,6 +741,53 @@ func PublicInput(record *jsonv.Object) *jsonv.Object {
 	return out
 }
 
+// publicOperation is an operation without its registry snapshots or input owner.
+func publicOperation(op *jsonv.Object) *jsonv.Object {
+	out := jsonv.NewObject()
+	for _, k := range op.Keys() {
+		switch k {
+		case "model":
+			model := op.Obj("model")
+			out.Set(k, jsonv.O("model_id", model.Get("model_id"), "bundle_digest", model.Obj("bundle").Get("bundle_digest")))
+		case "input":
+			if input := op.Obj("input"); input != nil {
+				out.Set(k, PublicInput(input))
+			}
+		case "adapters":
+			out.Set(k, publicAdapters(op))
+		default:
+			out.Set(k, op.Get(k))
+		}
+	}
+	return out
+}
+
+func publicAdapters(holder *jsonv.Object) []any {
+	adapters := []any{}
+	for _, raw := range holder.Arr("adapters") {
+		a := raw.(*jsonv.Object)
+		adapter := a.Obj("adapter")
+		adapters = append(adapters, jsonv.O("adapter_id", adapter.Get("adapter_id"), "digest", adapter.Get("digest"), "scale", a.Get("scale")))
+	}
+	return adapters
+}
+
+// RecipeDetail is a recipe as GET /v1/recipes/{id} returns it: its registered identity and
+// schema version with the typed input declarations, operations, bindings and publish list of
+// its schema-2 form, which Studio's native-workflow path maps inputs from.
+func RecipeDetail(recipe *jsonv.Object) *jsonv.Object {
+	normalized := c.NormalizeRecipe(recipe)
+	return jsonv.O(
+		"recipe_id", recipe.Get("recipe_id"),
+		"revision", recipe.Get("revision"),
+		"schema_version", recipe.Get("schema_version"),
+		"digest", recipe.Get("digest"),
+		"inputs", normalized.Get("inputs"),
+		"operations", normalized.Get("operations"),
+		"publish", normalized.Get("publish"),
+	)
+}
+
 // PublicJob is a job without its namespace, registry snapshots or manifest.
 func PublicJob(job *jsonv.Object) *jsonv.Object {
 	out := jsonv.NewObject()
@@ -722,19 +795,26 @@ func PublicJob(job *jsonv.Object) *jsonv.Object {
 		switch k {
 		case "namespace", "model", "backend", "recipe", "manifest", "input", "adapters":
 			continue
+		case "operations":
+			ops := []any{}
+			for _, op := range runtime.Operations(job) {
+				ops = append(ops, publicOperation(op))
+			}
+			out.Set(k, ops)
+			continue
 		}
 		out.Set(k, job.Get(k))
+	}
+	if c.IsLinear(job.Obj("recipe")) {
+		if ops := runtime.Operations(job); len(ops) > 0 {
+			index, _ := job.Num("current_operation")
+			out.Set("current_op_id", ops[min(int(index), len(ops)-1)].Get("op_id"))
+		}
 	}
 	if input := job.Obj("input"); input != nil {
 		out.Set("input", PublicInput(input))
 	}
-	adapters := []any{}
-	for _, raw := range job.Arr("adapters") {
-		a := raw.(*jsonv.Object)
-		adapter := a.Obj("adapter")
-		adapters = append(adapters, jsonv.O("adapter_id", adapter.Get("adapter_id"), "digest", adapter.Get("digest"), "scale", a.Get("scale")))
-	}
-	out.Set("adapters", adapters)
+	out.Set("adapters", publicAdapters(job))
 	model := job.Obj("model")
 	out.Set("model", jsonv.O("model_id", model.Get("model_id"), "bundle_digest", model.Obj("bundle").Get("bundle_digest")))
 	recipe := job.Obj("recipe")

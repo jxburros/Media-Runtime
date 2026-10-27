@@ -156,3 +156,37 @@ third-party module.
 - Manifest schema 3 adds `family`, `scale` (upscale), `device_identity`, `resolved_options`,
   `resolutions`, `applied_fallbacks` and every output with its seed. Schema 2 manifests are never
   rewritten.
+
+# Implementation decisions — 0.6.0
+
+- Operation model: every job carries `operations[]` and `current_operation`; the scheduler drives
+  only the current operation, and its worker identities (`attempt_id`, `session_id`,
+  `execution_id`, `worker_input_id`, `load_operation_id`, `dispatch_phase`, `worker_sequence`,
+  `applied_fallbacks`, `released`) are mirrored at the top level, where single-operation jobs have
+  always recorded them. Top-level `task`, `model`, `input`, `adapters` and `backend` are the first
+  operation's. A stored job without `operations` is read as one operation; nothing is rewritten
+  until the job is next saved.
+- Selection: `model_id`, `parameters` and `adapters` apply to the first operation; `models`
+  names every later operation explicitly (no default to `model_id`, since the model is always
+  selected explicitly); later operations' parameters come only from recipe defaults, bound number
+  inputs and worker defaults. A bound number that conflicts with an explicit parameter is refused.
+  Load options and fallbacks are job-wide.
+- Names: operation IDs are lowercase words joined by single underscores (at most 32 characters),
+  so `<op_id>__<output_id>` is unambiguous. Published outputs keep the worker's output ID unless
+  two published outputs share it, in which case both carry the prefix; intermediates always do.
+  A `publish` entry or binding names a base output (`image`); publishing it publishes each image
+  of a batch, and binding it passes the first. `prompt`, `negative_prompt` and `image` keep their
+  schema-1 types in every recipe, so a submission using only those names is validated exactly as
+  before.
+- Intermediate retention: intermediates follow `output_retention_days` exactly like published
+  outputs, are kept with the job (never deleted when the job succeeds) and are served to the job's
+  owner; `publish` controls exposure, not retention. Committed operation outputs of a job that
+  later failed or was cancelled are kept and expire the same way.
+- Durability order per operation: output bytes and their directories are fsynced and the
+  operation is recorded as succeeded before the next operation is dispatched; the manifest is
+  written once, after the last operation, before the job is recorded as succeeded. Retry is a new
+  job running every operation again; no partial resume is offered.
+- Compatibility: schema-1 jobs keep manifest schema 3, their events carry no operation fields and
+  their output IDs are unchanged; schema 4 manifests and operation-annotated events are written for
+  schema-2 recipes. A schema-2 recipe holds at most 8 operations and 16 publish entries.
+- No new dependency; the ledger is unchanged.

@@ -142,8 +142,16 @@ func (r *Runtime) OwnedInput(inputID, namespace string) (*jsonv.Object, error) {
 
 func (r *Runtime) referenced(inputID string) bool {
 	for _, j := range r.Store.All("") {
-		if !c.Terminal(j.Str("state")) && j.Obj("input").Str("input_id") == inputID {
+		if c.Terminal(j.Str("state")) {
+			continue
+		}
+		if j.Obj("input").Str("input_id") == inputID {
 			return true
+		}
+		for _, op := range Operations(j) {
+			if op.Obj("input").Str("input_id") == inputID {
+				return true
+			}
 		}
 	}
 	return false
@@ -210,7 +218,9 @@ func forbidden(field, message string) error {
 }
 
 // Resolve validates a submission against the registries and the live worker. The result is
-// the job's task, request, input, adapters, model, recipe and backend, in that order.
+// the job's task, request, input, adapters, model, recipe and backend, in that order, followed by
+// every operation resolved up front so admission is all-or-nothing. The top-level task, input,
+// adapters, model and backend are those of the first operation.
 func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 	namespace := caller.Namespace
 	request, err := c.Validate(c.Submission, body)
@@ -230,19 +240,222 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 			return nil, err
 		}
 	}
-	task := recipe.Str("pipeline")
 	p, err := r.Worker.Probe()
 	if err != nil {
 		return nil, err
 	}
-	info, caps, protocol := p.Info, p.Caps, p.Protocol
-	minor := c.Minor(protocol)
-	if !truthy(info.Get("service_ready")) || !(truthy(caps.Get("ready")) || cpuFallbackReady(caps, protocol, request)) {
+	w := &workerView{info: p.Info, caps: p.Caps, protocol: p.Protocol, minor: c.Minor(p.Protocol)}
+	if !truthy(w.info.Get("service_ready")) || !(truthy(w.caps.Get("ready")) || cpuFallbackReady(w.caps, w.protocol, request)) {
 		return nil, c.Err(503, "backend_unavailable", "Worker dependencies or selected device are not ready")
 	}
-	if b := request.Str("backend_id"); b != "" && b != caps.Str("backend_id") {
+	if b := request.Str("backend_id"); b != "" && b != w.caps.Str("backend_id") {
 		return nil, c.Err(400, "unsupported_backend", "Selected backend is not available", "backend_id")
 	}
+	inputs := request.Obj("inputs")
+	params := request.Obj("parameters")
+	var plans []*operationPlan
+	if !c.IsLinear(recipe) {
+		if request.Has("models") {
+			return nil, forbidden("models", "models selects later operations of schema-2 recipes")
+		}
+		if _, err := c.Inputs(inputs, []string{"inputs"}); err != nil {
+			return nil, err
+		}
+		plans = []*operationPlan{{
+			op:     c.NormalizeRecipe(recipe).Arr("operations")[0].(*jsonv.Object),
+			model:  model,
+			inputs: inputs,
+			params: params,
+			uses:   asArray(nullish(request.Get("adapters"), recipe.Get("adapters"), []any{})),
+			first:  true,
+		}}
+	} else if plans, err = r.linearPlans(recipe, request, model); err != nil {
+		return nil, err
+	}
+	resolved := []*jsonv.Object{}
+	var first *resolvedOperation
+	for i, plan := range plans {
+		if from := plan.from; from != nil {
+			// The bound image's size is the producing operation's output size.
+			producer := resolved[int(from.index)]
+			width, _ := producer.Obj("parameters").Num("width")
+			height, _ := producer.Obj("parameters").Num("height")
+			if producer.Str("task") == "upscale" {
+				scale, _ := producer.Obj("model").Num("scale")
+				width, height = width*scale, height*scale
+			}
+			plan.fromSize = [2]float64{width, height}
+		}
+		op, err := r.resolveOperation(plan, request, w, caller)
+		if err != nil {
+			var job jobLevel
+			if errors.As(err, &job) {
+				return nil, job.err
+			}
+			if c.IsLinear(recipe) {
+				return nil, inOperation(err, plan.op.Str("op_id"))
+			}
+			return nil, err
+		}
+		if i == 0 {
+			first = op
+		}
+		resolved = append(resolved, op.operation)
+	}
+	resolvedRequest := request.Clone().
+		Set("parameters", first.operation.Get("parameters")).
+		Set("adapters", first.uses).
+		Set("backend_id", first.backendID).
+		Set("backend_options", jsonv.O(first.backendID, first.options))
+	operations := make([]any, len(resolved))
+	for i, op := range resolved {
+		operations[i] = op
+	}
+	return jsonv.O(
+		"task", first.operation.Get("task"),
+		"request", resolvedRequest,
+		"input", jsonv.Maybe(first.operation.Get("input")),
+		"adapters", first.operation.Get("adapters"),
+		"model", model,
+		"recipe", recipe,
+		"backend", first.operation.Get("backend"),
+		"operations", operations,
+	), nil
+}
+
+// workerView is the probed worker a submission is resolved against.
+type workerView struct {
+	info, caps *jsonv.Object
+	protocol   string
+	minor      int
+}
+
+// operationPlan is one operation of a submission before resolution: its recipe operation, the
+// model selected for it, its task inputs, its parameter overrides and its adapters.
+type operationPlan struct {
+	op       *jsonv.Object
+	model    *jsonv.Object
+	inputs   *jsonv.Object
+	from     *binding
+	fromSize [2]float64
+	params   *jsonv.Object
+	uses     []any
+	// first is the operation the submission's model_id, parameters and adapters select.
+	first bool
+}
+
+// binding is an image bound from an earlier operation's output.
+type binding struct {
+	index        float64
+	opID, output string
+}
+
+type resolvedOperation struct {
+	operation *jsonv.Object
+	uses      []any
+	backendID string
+	options   *jsonv.Object
+}
+
+// jobLevel marks an error about the whole submission (load options, fallbacks) rather than one
+// operation, so it is reported without an operation prefix.
+type jobLevel struct{ err error }
+
+func (j jobLevel) Error() string { return j.err.Error() }
+
+// inOperation names the operation in an error's field: operations.<op_id>.<field>.
+func inOperation(err error, opID string) error {
+	var api *c.ApiError
+	if !errors.As(err, &api) {
+		return err
+	}
+	named := *api
+	named.Field = "operations." + opID
+	if api.Field != "" {
+		named.Field += "." + api.Field
+	}
+	return &named
+}
+
+// linearPlans binds a schema-2 submission to the recipe's operations: declared inputs are
+// checked, every operation gets its model (model_id for the first, models[op_id] for the rest),
+// and the first operation takes the submission's parameters and adapters.
+func (r *Runtime) linearPlans(recipe, request, model *jsonv.Object) ([]*operationPlan, error) {
+	normalized := c.NormalizeRecipe(recipe)
+	declared := normalized.Obj("inputs")
+	submitted := request.Obj("inputs")
+	if err := c.SubmittedInputs(declared, submitted); err != nil {
+		return nil, err
+	}
+	ops := normalized.Arr("operations")
+	index := map[string]int{}
+	for i, raw := range ops {
+		index[raw.(*jsonv.Object).Str("op_id")] = i
+	}
+	models := request.Obj("models")
+	for _, opID := range models.Keys() {
+		if i, ok := index[opID]; !ok || i == 0 {
+			return nil, c.Err(400, "invalid_request", "models names operations after the first; model_id selects the first", "models."+opID)
+		}
+	}
+	var plans []*operationPlan
+	for i, raw := range ops {
+		op := raw.(*jsonv.Object)
+		opID := op.Str("op_id")
+		plan := &operationPlan{op: op, model: model, inputs: jsonv.NewObject(), params: jsonv.NewObject()}
+		if i == 0 {
+			plan.first = true
+			plan.params = request.Obj("parameters").Clone()
+			plan.uses = asArray(nullish(request.Get("adapters"), op.Get("adapters"), []any{}))
+		} else {
+			plan.uses = asArray(nullish(op.Get("adapters"), []any{}))
+			if !models.Has(opID) {
+				return nil, c.Err(400, "invalid_request", "Select a model for operation "+opID, "models."+opID)
+			}
+			if plan.model = r.Store.Registry("models", models.Str(opID)); plan.model == nil {
+				return nil, c.Err(400, "unknown_model", "Register the selected model before submitting", "models."+opID)
+			}
+		}
+		bound := op.Obj("inputs")
+		for _, key := range bound.Keys() {
+			kind, name, output := c.Binding(bound.Obj(key))
+			if kind == "op" {
+				plan.from = &binding{index: float64(index[name]), opID: name, output: output}
+				continue
+			}
+			if !submitted.Has(name) {
+				continue
+			}
+			value := submitted.Get(name)
+			if declared.Obj(name).Str("type") == "number" {
+				// A bound number is a request override of that parameter.
+				if plan.params.Has(key) && !jsonEqual(plan.params.Get(key), value) {
+					return nil, c.Err(400, "invalid_request", key+" is bound to input "+name, "parameters."+key)
+				}
+				plan.params.Set(key, value)
+				continue
+			}
+			plan.inputs.Set(key, value)
+		}
+		if _, err := c.PartialParameters(plan.params, []string{"parameters"}); err != nil {
+			return nil, inOperation(err, opID)
+		}
+		if _, err := c.Inputs(plan.inputs, []string{"inputs"}); err != nil {
+			return nil, inOperation(err, opID)
+		}
+		plans = append(plans, plan)
+	}
+	return plans, nil
+}
+
+// resolveOperation resolves one operation against the live worker: task support, the model's
+// family and loader, inputs, effective parameters, adapters and load options, then asks the
+// worker to validate the bundle. The checks and their order are those of a schema-1 recipe.
+func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w *workerView, caller Caller) (*resolvedOperation, error) {
+	namespace := caller.Namespace
+	info, caps, protocol, minor := w.info, w.caps, w.protocol, w.minor
+	op, model, inputs, params := plan.op, plan.model, plan.inputs, plan.params
+	task := op.Str("task")
 	tasks := []string{"text-to-image"}
 	if _, ok := caps.Get("tasks").([]any); ok {
 		tasks = strList(caps.Get("tasks"))
@@ -253,8 +466,8 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 	// The model's family must serve the recipe, and from 1.2 the worker must load that family.
 	bundle := model.Obj("bundle")
 	family := bundle.Str("family")
-	if family != recipe.Str("model_family") {
-		return nil, c.Err(400, "unsupported", "Model "+model.Str("model_id")+" is a "+family+" bundle; recipe "+recipe.Str("recipe_id")+" needs "+recipe.Str("model_family"), "model_id")
+	if family != op.Str("model_family") {
+		return nil, c.Err(400, "unsupported", "Model "+model.Str("model_id")+" is a "+family+" bundle; recipe "+request.Str("recipe_id")+" needs "+op.Str("model_family"), "model_id")
 	}
 	if minor >= 2 && !loads(caps, family) {
 		return nil, c.Err(400, "unsupported", "The connected worker does not load the "+family+" family", "model_id")
@@ -263,8 +476,6 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 	if minor >= 2 {
 		taskParameters = caps.Obj("task_parameters").Obj(task)
 	}
-	inputs := request.Obj("inputs")
-	params := request.Obj("parameters")
 	usesImage := task == "image-to-image" || task == "upscale"
 	if task == "upscale" {
 		if inputs.Has("prompt") || inputs.Has("negative_prompt") {
@@ -279,7 +490,7 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 				return nil, forbidden("parameters."+k, "An upscale has no "+k+"; it enlarges by the model's fixed factor")
 			}
 		}
-		if request.Has("adapters") {
+		if (plan.first && request.Has("adapters")) || op.Has("adapters") {
 			return nil, forbidden("adapters", "Adapters do not apply to an upscale")
 		}
 	} else if !inputs.Has("prompt") {
@@ -306,8 +517,11 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 		}
 	}
 	var input *jsonv.Object
+	var err error
 	imageDefaults := jsonv.NewObject()
-	if usesImage {
+	if usesImage && plan.from != nil {
+		imageDefaults.Set("width", plan.fromSize[0]).Set("height", plan.fromSize[1])
+	} else if usesImage {
 		if !inputs.Has("image") {
 			return nil, c.Err(400, "invalid_request", "This recipe requires an uploaded image input", "inputs.image")
 		}
@@ -325,7 +539,7 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 		}
 		return nil, c.Err(400, "invalid_request", "Image and strength apply to image-to-image recipes only", field)
 	}
-	defaults := recipe.Obj("defaults")
+	defaults := op.Obj("defaults")
 	var effective *jsonv.Object
 	if task == "upscale" {
 		merged := jsonv.NewObject().Assign(caps.Obj("task_defaults").Obj(task)).Assign(taskParameters.Obj("defaults"))
@@ -350,10 +564,11 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 			return nil, err
 		}
 	}
-	if input != nil {
-		if !jsonEqual(effective.Get("width"), input.Get("width")) || !jsonEqual(effective.Get("height"), input.Get("height")) {
+	if usesImage {
+		size := []any{imageDefaults.Get("width"), imageDefaults.Get("height")}
+		if !jsonEqual(effective.Get("width"), size[0]) || !jsonEqual(effective.Get("height"), size[1]) {
 			field := "parameters.height"
-			if !jsonEqual(effective.Get("width"), input.Get("width")) {
+			if !jsonEqual(effective.Get("width"), size[0]) {
 				field = "parameters.width"
 			}
 			return nil, c.Err(400, "invalid_request", "Width and height must equal the uploaded image size; nothing is resized", field)
@@ -379,7 +594,7 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 			return nil, c.Err(400, "invalid_request", "The upscaled image would exceed the worker's output_side limit", "output_side")
 		}
 	}
-	uses := asArray(nullish(request.Get("adapters"), recipe.Get("adapters"), []any{}))
+	uses := plan.uses
 	adapters := []any{}
 	seen := map[string]bool{}
 	for _, raw := range uses {
@@ -402,39 +617,9 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 	if float64(len(adapters)) > maxAdapters {
 		return nil, c.Err(400, "unsupported", "Too many adapters for this worker", "adapters")
 	}
-	backendID := caps.Str("backend_id")
-	backendOptions := request.Obj("backend_options")
-	options, err := c.Validate(c.LoadOptions, jsonv.NewObject().Assign(caps.Obj("load_defaults")).Assign(backendOptions.Obj(backendID)))
+	backendID, options, fallbacks, err := loadPlan(request, w, caller)
 	if err != nil {
-		return nil, err
-	}
-	for _, other := range backendOptions.Keys() {
-		if other != backendID && truthy(backendOptions.Get(other)) {
-			return nil, c.Err(400, "unsupported_backend", "Options for "+other+" do not apply to the "+backendID+" worker", "backend_options")
-		}
-	}
-	if options.Str("precision") == "auto" {
-		if minor < 2 || !c.Contains(strList(caps.Get("auto_options")), "precision") {
-			return nil, c.Err(400, "unsupported", "The connected worker does not resolve automatic precision", "precision")
-		}
-	} else if !c.Contains(strList(caps.Get("precisions")), options.Str("precision")) {
-		return nil, c.Err(400, "unsupported", "Requested precision is unavailable", "precision")
-	}
-	fallbacks := strList(request.Get("authorized_fallbacks"))
-	if len(fallbacks) > 0 {
-		if !caller.AllowFallbacks {
-			return nil, c.Err(403, "fallbacks_not_allowed", "This credential may not authorize fallbacks", "authorized_fallbacks")
-		}
-		distinct := map[string]bool{}
-		for _, f := range fallbacks {
-			if minor < 2 || !c.Contains(strList(caps.Get("fallbacks")), f) {
-				return nil, c.Err(400, "unsupported", "The connected worker does not advertise the "+f+" fallback", "authorized_fallbacks")
-			}
-			distinct[f] = true
-		}
-		if len(distinct) != len(fallbacks) {
-			return nil, c.Err(400, "invalid_request", "Fallbacks must be distinct", "authorized_fallbacks")
-		}
+		return nil, jobLevel{err}
 	}
 	validateBody := jsonv.O("protocol", protocol, "bundle", bundle, "options", options)
 	if len(adapters) > 0 {
@@ -447,11 +632,6 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	resolvedRequest := request.Clone().
-		Set("parameters", effective).
-		Set("adapters", uses).
-		Set("backend_id", backendID).
-		Set("backend_options", jsonv.O(backendID, options))
 	ownership := nullish(caps.Get("ownership"), "reference")
 	backend := jsonv.O(
 		"backend_id", backendID,
@@ -473,15 +653,66 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 		backend.Set("resolved_options", jsonv.Maybe(validation.Get("resolved_options")))
 		backend.Set("resolutions", nullish(validation.Get("resolutions"), []any{}))
 	}
-	return jsonv.O(
+	var from any = jsonv.Absent
+	if plan.from != nil {
+		from = jsonv.O("op_id", plan.from.opID, "output_id", plan.from.output)
+	}
+	operation := jsonv.O(
+		"op_id", op.Get("op_id"),
 		"task", task,
-		"request", resolvedRequest,
-		"input", jsonv.Maybe(input),
-		"adapters", adapters,
+		"state", "pending",
 		"model", model,
-		"recipe", recipe,
+		"input", jsonv.Maybe(input),
+		"input_from", from,
+		"inputs", inputs,
+		"adapters", adapters,
+		"parameters", effective,
 		"backend", backend,
-	), nil
+		"worker_sequence", 0.0,
+		"outputs", []any{},
+	)
+	return &resolvedOperation{operation: operation, uses: uses, backendID: backendID, options: options}, nil
+}
+
+// loadPlan resolves the job's backend, load options and authorized fallbacks; every operation
+// loads with the same options.
+func loadPlan(request *jsonv.Object, w *workerView, caller Caller) (string, *jsonv.Object, []string, error) {
+	caps, minor := w.caps, w.minor
+	backendID := caps.Str("backend_id")
+	backendOptions := request.Obj("backend_options")
+	options, err := c.Validate(c.LoadOptions, jsonv.NewObject().Assign(caps.Obj("load_defaults")).Assign(backendOptions.Obj(backendID)))
+	if err != nil {
+		return "", nil, nil, err
+	}
+	for _, other := range backendOptions.Keys() {
+		if other != backendID && truthy(backendOptions.Get(other)) {
+			return "", nil, nil, c.Err(400, "unsupported_backend", "Options for "+other+" do not apply to the "+backendID+" worker", "backend_options")
+		}
+	}
+	if options.Str("precision") == "auto" {
+		if minor < 2 || !c.Contains(strList(caps.Get("auto_options")), "precision") {
+			return "", nil, nil, c.Err(400, "unsupported", "The connected worker does not resolve automatic precision", "precision")
+		}
+	} else if !c.Contains(strList(caps.Get("precisions")), options.Str("precision")) {
+		return "", nil, nil, c.Err(400, "unsupported", "Requested precision is unavailable", "precision")
+	}
+	fallbacks := strList(request.Get("authorized_fallbacks"))
+	if len(fallbacks) > 0 {
+		if !caller.AllowFallbacks {
+			return "", nil, nil, c.Err(403, "fallbacks_not_allowed", "This credential may not authorize fallbacks", "authorized_fallbacks")
+		}
+		distinct := map[string]bool{}
+		for _, f := range fallbacks {
+			if minor < 2 || !c.Contains(strList(caps.Get("fallbacks")), f) {
+				return "", nil, nil, c.Err(400, "unsupported", "The connected worker does not advertise the "+f+" fallback", "authorized_fallbacks")
+			}
+			distinct[f] = true
+		}
+		if len(distinct) != len(fallbacks) {
+			return "", nil, nil, c.Err(400, "invalid_request", "Fallbacks must be distinct", "authorized_fallbacks")
+		}
+	}
+	return backendID, options, fallbacks, nil
 }
 
 // cpuFallbackReady is a worker whose selected device is unavailable but which can run the request
@@ -570,6 +801,7 @@ func (r *Runtime) Submit(body any, caller Caller, key *string) (*jsonv.Object, e
 		).Assign(resolved).
 			Set("worker_sequence", 0.0).
 			Set("outputs", []any{}).
+			Set("current_operation", 0.0).
 			Set("retry_of", jsonv.Maybe(parsed.Get("retry_of")))
 		tx.Insert(job)
 		tx.Event(job, "job_state", jsonv.O("state", "queued"))
@@ -640,6 +872,7 @@ func (r *Runtime) save(job *jsonv.Object, events func(tx *store.Store) error) er
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.refresh(job)
+	mirror(job)
 	return r.Store.Transaction(func(tx *store.Store) error {
 		if events != nil {
 			if err := events(tx); err != nil {
@@ -651,11 +884,75 @@ func (r *Runtime) save(job *jsonv.Object, events func(tx *store.Store) error) er
 	})
 }
 
+// finish settles a job and its current operation; a linear job's error names the operation.
 func (r *Runtime) finish(job *jsonv.Object, state string, errorRecord *jsonv.Object) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.refresh(job)
+	if op, _ := current(job); op != nil && !c.Terminal(op.Str("state")) {
+		op.Set("state", state)
+		if errorRecord != nil {
+			op.Set("error", errorRecord.Clone())
+			if c.IsLinear(job.Obj("recipe")) {
+				errorRecord.Set("operation", op.Get("op_id"))
+			}
+		}
+	}
+	mirror(job)
 	r.Store.Finish(job, state, errorRecord)
+}
+
+// Operations returns a job's operation records; they are shared with the job, so changes to
+// them are saved with it.
+func Operations(job *jsonv.Object) []*jsonv.Object {
+	var out []*jsonv.Object
+	for _, raw := range job.Arr("operations") {
+		if op, ok := raw.(*jsonv.Object); ok {
+			out = append(out, op)
+		}
+	}
+	return out
+}
+
+// current is the operation the scheduler is driving and its index.
+func current(job *jsonv.Object) (*jsonv.Object, int) {
+	ops := Operations(job)
+	index, _ := job.Num("current_operation")
+	if int(index) < 0 || int(index) >= len(ops) {
+		return nil, 0
+	}
+	return ops[int(index)], int(index)
+}
+
+// mirrored are the current operation's worker identities, also kept at the top level of the
+// job where single-operation jobs have always recorded them.
+var mirrored = []string{"attempt_id", "session_id", "execution_id", "worker_input_id", "load_operation_id", "dispatch_phase", "worker_sequence", "applied_fallbacks", "released"}
+
+func mirror(job *jsonv.Object) {
+	op, index := current(job)
+	if op == nil {
+		return
+	}
+	for _, k := range mirrored {
+		if op.Has(k) {
+			job.Set(k, op.Get(k))
+		} else {
+			job.Delete(k)
+		}
+	}
+	if index == 0 {
+		job.Set("backend", op.Get("backend"))
+	}
+}
+
+// annotate adds a linear job's operation to the data of a stage or progress event; schema-1
+// jobs keep the worker's data unchanged.
+func annotate(job, op *jsonv.Object, index int, data any) any {
+	o, ok := data.(*jsonv.Object)
+	if !ok || !c.IsLinear(job.Obj("recipe")) {
+		return data
+	}
+	return o.Clone().Set("op_id", op.Get("op_id")).Set("operation_index", float64(index)).Set("operation_count", float64(len(Operations(job))))
 }
 
 func (r *Runtime) firstRunning() *jsonv.Object {
@@ -710,31 +1007,39 @@ func (r *Runtime) tick() (err error) {
 	}
 	info, caps, protocol := p.Info, p.Caps, p.Protocol
 	session := info.Get("session_id")
-	// Release only after durable terminal commit. Retry collection acknowledgements after disconnects.
+	// Release an operation's worker records only after its durable terminal commit: every
+	// operation of a finished job, and each committed operation of a running linear job. Retry
+	// collection acknowledgements after disconnects.
 	for _, done := range r.Store.All("") {
-		if !c.Terminal(done.Str("state")) || truthy(done.Get("released")) ||
-			!(truthy(done.Get("execution_id")) || truthy(done.Get("worker_input_id"))) || !jsonEqual(done.Get("session_id"), session) {
-			continue
-		}
-		err := func() error {
-			if id := done.Str("execution_id"); id != "" {
-				if _, err := r.Worker.JSON("/v1/executions/"+id, "DELETE", nil, ""); err != nil {
-					return err
-				}
+		changed := false
+		for _, op := range Operations(done) {
+			if !c.Terminal(op.Str("state")) || truthy(op.Get("released")) ||
+				!(truthy(op.Get("execution_id")) || truthy(op.Get("worker_input_id"))) || !jsonEqual(op.Get("session_id"), session) {
+				continue
 			}
-			if id := done.Str("worker_input_id"); id != "" {
-				if _, err := r.Worker.JSON("/v1/inputs/"+id, "DELETE", nil, ""); err != nil {
-					var api *c.ApiError
-					if !errors.As(err, &api) || api.Status != 404 {
+			err := func() error {
+				if id := op.Str("execution_id"); id != "" {
+					if _, err := r.Worker.JSON("/v1/executions/"+id, "DELETE", nil, ""); err != nil {
 						return err
 					}
 				}
+				if id := op.Str("worker_input_id"); id != "" {
+					if _, err := r.Worker.JSON("/v1/inputs/"+id, "DELETE", nil, ""); err != nil {
+						var api *c.ApiError
+						if !errors.As(err, &api) || api.Status != 404 {
+							return err
+						}
+					}
+				}
+				return nil
+			}()
+			var api *c.ApiError
+			if err == nil || (errors.As(err, &api) && api.Status == 404) {
+				op.Set("released", true)
+				changed = true
 			}
-			return nil
-		}()
-		var api *c.ApiError
-		if err == nil || (errors.As(err, &api) && api.Status == 404) {
-			done.Set("released", true)
+		}
+		if changed {
 			if err := r.save(done, nil); err != nil {
 				return err
 			}
@@ -754,11 +1059,10 @@ func (r *Runtime) tick() (err error) {
 		job = queued[0]
 		err := r.Store.Transaction(func(tx *store.Store) error {
 			job.Set("state", "running")
-			job.Obj("backend").Set("worker_version", jsonv.Maybe(caps.Get("worker_version")))
 			job.Set("stage", nil)
-			job.Set("attempt_id", "attempt_"+c.UUID())
-			job.Set("session_id", jsonv.Maybe(session))
-			job.Set("dispatch_phase", "loading")
+			op, _ := current(job)
+			dispatch(op, caps, session)
+			mirror(job)
 			tx.Save(job)
 			tx.Event(job, "job_state", jsonv.O("state", "running"))
 			return nil
@@ -768,7 +1072,15 @@ func (r *Runtime) tick() (err error) {
 			return err
 		}
 	}
-	if !jsonEqual(job.Get("session_id"), session) {
+	op, index := current(job)
+	if op.Str("attempt_id") == "" {
+		// The next operation of a linear job: its predecessor's outputs are already committed.
+		dispatch(op, caps, session)
+		if err := r.save(job, nil); err != nil {
+			return err
+		}
+	}
+	if !jsonEqual(op.Get("session_id"), session) {
 		r.finish(job, "failed", jsonv.O("code", "execution_interrupted", "message", "Worker session ended; this job was not regenerated"))
 		return nil
 	}
@@ -785,8 +1097,9 @@ func (r *Runtime) tick() (err error) {
 			return r.Worker.Start()
 		}
 	}
-	if job.Str("dispatch_phase") == "loading" {
-		if opID := job.Str("load_operation_id"); opID != "" {
+	backend := op.Obj("backend")
+	if op.Str("dispatch_phase") == "loading" {
+		if opID := op.Str("load_operation_id"); opID != "" {
 			operation, err := r.Worker.Obj("/v1/operations/"+opID, "GET", nil)
 			if err != nil {
 				return err
@@ -797,7 +1110,7 @@ func (r *Runtime) tick() (err error) {
 			if _, err := r.Worker.JSON("/v1/operations/"+opID, "DELETE", nil, ""); err != nil {
 				return err
 			}
-			job.Delete("load_operation_id")
+			op.Delete("load_operation_id")
 			if operation.Str("state") == "failed" {
 				code := operation.Obj("error").Str("code")
 				if code == "" {
@@ -807,11 +1120,11 @@ func (r *Runtime) tick() (err error) {
 				return nil
 			}
 			if estimate := operation.Get("memory_estimate"); truthy(estimate) {
-				job.Obj("backend").Set("memory_estimate", estimate)
+				backend.Set("memory_estimate", estimate)
 			}
 			for _, k := range []string{"resolved_options", "resolutions"} {
 				if v := operation.Get(k); v != nil {
-					job.Obj("backend").Set(k, v)
+					backend.Set(k, v)
 				}
 			}
 			return r.save(job, nil)
@@ -820,13 +1133,14 @@ func (r *Runtime) tick() (err error) {
 			return nil
 		}
 		r.refresh(job)
+		// Cancellation is honored before every dispatch, including between operations.
 		if truthy(job.Get("cancel_requested")) {
 			r.finish(job, "cancelled", nil)
 			return nil
 		}
-		desired := job.Obj("request").Obj("backend_options").Get(job.Obj("backend").Str("backend_id"))
+		desired := job.Obj("request").Obj("backend_options").Get(backend.Str("backend_id"))
 		identity := []any{}
-		for _, raw := range asArray(job.Get("adapters")) {
+		for _, raw := range asArray(op.Get("adapters")) {
 			a := raw.(*jsonv.Object)
 			adapter := a.Obj("adapter")
 			identity = append(identity, jsonv.O("adapter_id", adapter.Get("adapter_id"), "digest", adapter.Get("digest"), "scale", a.Get("scale")))
@@ -837,37 +1151,39 @@ func (r *Runtime) tick() (err error) {
 			a, _ := raw.(*jsonv.Object)
 			loadedIdentity = append(loadedIdentity, jsonv.O("adapter_id", jsonv.Maybe(a.Get("adapter_id")), "digest", jsonv.Maybe(a.Get("digest")), "scale", jsonv.Maybe(a.Get("scale"))))
 		}
-		if loaded == nil || !jsonEqual(loaded.Get("bundle_digest"), job.Obj("model").Obj("bundle").Get("bundle_digest")) ||
+		model := op.Obj("model")
+		if loaded == nil || !jsonEqual(loaded.Get("bundle_digest"), model.Obj("bundle").Get("bundle_digest")) ||
 			c.Hash(loaded.Get("options")) != c.Hash(desired) || c.Hash(loadedIdentity) != c.Hash(identity) {
-			body := jsonv.O("protocol", protocol, "bundle", job.Obj("model").Get("bundle"), "options", desired)
+			body := jsonv.O("protocol", protocol, "bundle", model.Get("bundle"), "options", desired)
 			if len(identity) > 0 {
-				body.Set("adapters", job.Get("adapters"))
+				body.Set("adapters", op.Get("adapters"))
 			}
 			if fallbacks := job.Obj("request").Arr("authorized_fallbacks"); len(fallbacks) > 0 {
 				body.Set("authorized_fallbacks", fallbacks)
 			}
-			op, err := r.Worker.Obj("/v1/model/load", "POST", body)
+			load, err := r.Worker.Obj("/v1/model/load", "POST", body)
 			if err != nil {
 				return err
 			}
-			job.Set("load_operation_id", jsonv.Maybe(op.Get("operation_id")))
+			op.Set("load_operation_id", jsonv.Maybe(load.Get("operation_id")))
 			job.Set("stage", "loading")
+			job.Delete("progress")
 			return r.save(job, func(tx *store.Store) error {
-				tx.Event(job, "stage", jsonv.O("stage", "loading"))
+				tx.Event(job, "stage", annotate(job, op, index, jsonv.O("stage", "loading")))
 				return nil
 			})
 		}
-		job.Set("dispatch_phase", "executing")
+		op.Set("dispatch_phase", "executing")
 		// Record any fallback the loaded bundle runs on; it was authorized by this or an earlier job.
 		var applied []any
 		if c.Minor(protocol) >= 2 {
 			applied = asArray(nullish(loaded.Get("applied_fallbacks"), []any{}))
-			job.Set("applied_fallbacks", applied)
-			job.Obj("backend").Set("applied_fallbacks", applied)
+			op.Set("applied_fallbacks", applied)
+			backend.Set("applied_fallbacks", applied)
 		}
 		if err := r.save(job, func(tx *store.Store) error {
 			if len(applied) > 0 {
-				tx.Event(job, "stage", jsonv.O("stage", "loading", "fallback", applied))
+				tx.Event(job, "stage", annotate(job, op, index, jsonv.O("stage", "loading", "fallback", applied)))
 			}
 			return nil
 		}); err != nil {
@@ -875,9 +1191,9 @@ func (r *Runtime) tick() (err error) {
 		}
 	}
 	var snapshot *jsonv.Object
-	if job.Str("execution_id") == "" {
+	if op.Str("execution_id") == "" {
 		// Query the same session before resending an ambiguous acceptance. A retry uses the SAME attempt.
-		snapshot, err = r.Worker.Obj("/v1/executions?attempt_id="+url.QueryEscape(job.Str("attempt_id")), "GET", nil)
+		snapshot, err = r.Worker.Obj("/v1/executions?attempt_id="+url.QueryEscape(op.Str("attempt_id")), "GET", nil)
 		if err != nil {
 			var api *c.ApiError
 			if !errors.As(err, &api) || api.Status != 404 {
@@ -888,55 +1204,54 @@ func (r *Runtime) tick() (err error) {
 				r.finish(job, "cancelled", nil)
 				return nil
 			}
-			inputs := job.Obj("request").Obj("inputs").Clone()
-			if task := job.Str("task"); task == "image-to-image" || task == "upscale" {
-				if job.Str("worker_input_id") == "" {
+			inputs := op.Obj("inputs").Clone()
+			if task := op.Str("task"); task == "image-to-image" || task == "upscale" {
+				if op.Str("worker_input_id") == "" {
 					// Hand the worker the verified bytes under a session-scoped handle, never a path.
-					record := job.Obj("input")
-					bytes, err := os.ReadFile(r.InputPath(record.Str("input_id")))
-					if err != nil || c.SHA256Hex(bytes) != record.Str("sha256") {
-						return c.Err(410, "input_unavailable", "Input bytes changed or disappeared before dispatch")
+					bytes, digest, err := r.operationInput(job, op)
+					if err != nil {
+						return err
 					}
 					uploaded, err := r.Worker.JSON("/v1/inputs", "POST", bytes, "image/png")
 					if err != nil {
 						return err
 					}
 					up, _ := uploaded.(*jsonv.Object)
-					if up.Str("sha256") != record.Str("sha256") {
+					if up.Str("sha256") != digest {
 						return c.Err(503, "protocol_mismatch", "Worker input digest mismatch")
 					}
-					job.Set("worker_input_id", jsonv.Maybe(up.Get("input_id")))
+					op.Set("worker_input_id", jsonv.Maybe(up.Get("input_id")))
 					if err := r.save(job, nil); err != nil {
 						return err
 					}
 				}
-				inputs.Set("image", job.Get("worker_input_id"))
+				inputs.Set("image", op.Get("worker_input_id"))
 			}
 			snapshot, err = r.Worker.Obj("/v1/executions", "POST", jsonv.O(
 				"protocol", protocol,
-				"attempt_id", job.Get("attempt_id"),
-				"bundle_digest", job.Obj("model").Obj("bundle").Get("bundle_digest"),
-				"task", job.Get("task"),
+				"attempt_id", op.Get("attempt_id"),
+				"bundle_digest", op.Obj("model").Obj("bundle").Get("bundle_digest"),
+				"task", op.Get("task"),
 				"inputs", inputs,
-				"parameters", job.Obj("request").Get("parameters"),
+				"parameters", op.Get("parameters"),
 			))
 			if err != nil {
 				return err
 			}
 		}
-		if !jsonEqual(snapshot.Get("session_id"), job.Get("session_id")) || !jsonEqual(snapshot.Get("attempt_id"), job.Get("attempt_id")) {
+		if !jsonEqual(snapshot.Get("session_id"), op.Get("session_id")) || !jsonEqual(snapshot.Get("attempt_id"), op.Get("attempt_id")) {
 			return c.Err(503, "protocol_mismatch", "Worker execution identity mismatch")
 		}
-		job.Set("execution_id", jsonv.Maybe(snapshot.Get("execution_id")))
+		op.Set("execution_id", jsonv.Maybe(snapshot.Get("execution_id")))
 		if err := r.save(job, nil); err != nil {
 			return err
 		}
-	} else if snapshot, err = r.Worker.Obj("/v1/executions/"+job.Str("execution_id"), "GET", nil); err != nil {
+	} else if snapshot, err = r.Worker.Obj("/v1/executions/"+op.Str("execution_id"), "GET", nil); err != nil {
 		return err
 	}
 	r.refresh(job)
 	if truthy(job.Get("cancel_requested")) && !c.Terminal(snapshot.Str("state")) {
-		if snapshot, err = r.Worker.Obj("/v1/executions/"+job.Str("execution_id")+"/cancel", "POST", jsonv.NewObject()); err != nil {
+		if snapshot, err = r.Worker.Obj("/v1/executions/"+op.Str("execution_id")+"/cancel", "POST", jsonv.NewObject()); err != nil {
 			return err
 		}
 	}
@@ -944,14 +1259,14 @@ func (r *Runtime) tick() (err error) {
 		for _, raw := range snapshot.Arr("events") {
 			event, _ := raw.(*jsonv.Object)
 			sequence, _ := event.Num("sequence")
-			current, _ := job.Num("worker_sequence")
+			current, _ := op.Num("worker_sequence")
 			if sequence <= current {
 				continue
 			}
 			if sequence != current+1 {
 				return c.Err(503, "event_gap", "Worker event history has a gap")
 			}
-			data := event.Get("data")
+			data := annotate(job, op, index, event.Get("data"))
 			switch event.Str("type") {
 			case "stage":
 				job.Set("stage", jsonv.Maybe(event.Obj("data").Get("stage")))
@@ -961,7 +1276,8 @@ func (r *Runtime) tick() (err error) {
 				job.Set("progress", jsonv.Maybe(data))
 				tx.Event(job, "progress", data)
 			}
-			job.Set("worker_sequence", sequence)
+			op.Set("worker_sequence", sequence)
+			mirror(job)
 		}
 		return nil
 	})
@@ -979,6 +1295,51 @@ func (r *Runtime) tick() (err error) {
 		r.finish(job, "failed", jsonv.O("code", code, "message", "Worker execution failed", "restart_required", truthy(snapshot.Obj("error").Get("restart_required"))))
 	case "cancelled":
 		r.finish(job, "cancelled", nil)
+	}
+	return nil
+}
+
+// dispatch persists an operation's dispatch intent: a unique attempt bound to the worker session.
+func dispatch(op, caps *jsonv.Object, session any) {
+	op.Set("state", "running")
+	op.Obj("backend").Set("worker_version", jsonv.Maybe(caps.Get("worker_version")))
+	op.Set("attempt_id", "attempt_"+c.UUID())
+	op.Set("session_id", jsonv.Maybe(session))
+	op.Set("dispatch_phase", "loading")
+}
+
+// operationInput is the verified image an operation hands the worker: the submitted input, or
+// an earlier operation's committed output, read back from durable storage.
+func (r *Runtime) operationInput(job, op *jsonv.Object) ([]byte, string, error) {
+	var path, digest string
+	if from := op.Obj("input_from"); from != nil {
+		output := operationOutput(job, from.Str("op_id"), from.Str("output_id"))
+		if output == nil {
+			return nil, "", c.Err(410, "input_unavailable", "The bound output of operation "+from.Str("op_id")+" is not committed")
+		}
+		path, digest = r.OutputFile(job.Str("job_id"), output), output.Str("sha256")
+	} else {
+		record := op.Obj("input")
+		path, digest = r.InputPath(record.Str("input_id")), record.Str("sha256")
+	}
+	bytes, err := os.ReadFile(path)
+	if err != nil || c.SHA256Hex(bytes) != digest {
+		return nil, "", c.Err(410, "input_unavailable", "Input bytes changed or disappeared before dispatch")
+	}
+	return bytes, digest, nil
+}
+
+// operationOutput is the committed output of an operation by the worker's output ID.
+func operationOutput(job *jsonv.Object, opID, outputID string) *jsonv.Object {
+	for _, op := range Operations(job) {
+		if op.Str("op_id") != opID {
+			continue
+		}
+		for _, raw := range op.Arr("outputs") {
+			if o, ok := raw.(*jsonv.Object); ok && nullish(o.Get("operation_output_id"), o.Get("output_id")) == outputID {
+				return o
+			}
+		}
 	}
 	return nil
 }
@@ -1017,33 +1378,108 @@ func isInt(v any) bool {
 	return ok && f == float64(int64(f))
 }
 
-// OutputFile is the stored path of one committed output.
+// OutputFile is the stored path of one committed output. A linear job's intermediate output
+// lives under its operation's directory; every other output sits beside the manifest.
 func (r *Runtime) OutputFile(jobID string, output *jsonv.Object) string {
 	ext := c.Extensions[output.Str("mime_type")]
 	if ext == "" {
 		ext = "png"
 	}
+	if output.Get("published") == false {
+		return filepath.Join(r.OutputDirectory(jobID), output.Str("op_id"), output.Str("operation_output_id")+"."+ext)
+	}
 	return filepath.Join(r.OutputDirectory(jobID), output.Str("output_id")+"."+ext)
 }
 
-// commitOutputs verifies every output the worker advertised for the task, then writes their
-// bytes, the manifest and the database in that order; success is recorded only after
-// everything is durable, and a partial set is output_unavailable.
+// outputName is the job-level identity of one operation output.
+type outputName struct {
+	id        string
+	published bool
+}
+
+// outputNames maps every operation's outputs to their job-level IDs. Schema-1 jobs publish the
+// worker's IDs unchanged. A linear job publishes the outputs its recipe lists (an entry naming a
+// repeated output publishes each image of the batch) under the worker's ID, prefixed with
+// "<op_id>__" when two published outputs share it; unpublished intermediates are always prefixed.
+func outputNames(job *jsonv.Object) []map[string]outputName {
+	ops := Operations(job)
+	linear := c.IsLinear(job.Obj("recipe"))
+	publish := map[string]bool{}
+	for _, entry := range strList(c.NormalizeRecipe(job.Obj("recipe")).Get("publish")) {
+		publish[entry] = true
+	}
+	expected := make([][]string, len(ops))
+	uses := map[string]int{}
+	for i, op := range ops {
+		count, ok := op.Obj("parameters").Num("count")
+		if !ok {
+			count = 1
+		}
+		expected[i] = c.OutputIDs(op.Obj("backend").Obj("task_parameters"), int(count))
+		for _, id := range expected[i] {
+			if published(publish, op.Str("op_id"), id, linear) {
+				uses[id]++
+			}
+		}
+	}
+	names := make([]map[string]outputName, len(ops))
+	for i, op := range ops {
+		names[i] = map[string]outputName{}
+		for _, id := range expected[i] {
+			name := outputName{id: id, published: published(publish, op.Str("op_id"), id, linear)}
+			if linear && (!name.published || uses[id] > 1) {
+				name.id = op.Str("op_id") + "__" + id
+			}
+			names[i][id] = name
+		}
+	}
+	return names
+}
+
+func published(publish map[string]bool, opID, outputID string, linear bool) bool {
+	if !linear {
+		return true
+	}
+	base := outputID
+	if i := strings.LastIndex(outputID, "_"); i > 0 && isDigits(outputID[i+1:]) {
+		base = outputID[:i]
+	}
+	return publish[opID+"/"+base]
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// commitOutputs verifies every output the worker advertised for the current operation's task,
+// then writes their bytes. An intermediate operation's outputs are fsynced and recorded before
+// the next operation is dispatched; after the last operation the manifest and the database are
+// written in that order, success is recorded only after everything is durable, and a partial set
+// is output_unavailable.
 func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
 	directory := r.OutputDirectory(job.Str("job_id"))
+	op, index := current(job)
+	linear := c.IsLinear(job.Obj("recipe"))
+	ops := Operations(job)
 	err := func() error {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			return err
 		}
-		backend := job.Obj("backend")
-		params := job.Obj("request").Obj("parameters")
-		task := job.Str("task")
+		backend := op.Obj("backend")
+		params := op.Obj("parameters")
+		task := op.Str("task")
 		count, ok := params.Num("count")
 		if !ok {
 			count = 1
 		}
 		taskParameters := backend.Obj("task_parameters")
 		expected := c.OutputIDs(taskParameters, int(count))
+		names := outputNames(job)[index]
 		formats := taskParameters.Obj("output_formats")
 		records := map[string]*jsonv.Object{}
 		for _, raw := range snapshot.Arr("outputs") {
@@ -1060,11 +1496,12 @@ func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
 		height, _ := params.Num("height")
 		var scale float64
 		if task == "upscale" {
-			scale, _ = job.Obj("model").Num("scale")
+			scale, _ = op.Obj("model").Num("scale")
 			width, height = width*scale, height*scale
 		}
 		seed, seeded := params.Num("seed")
 		committed := []any{}
+		synced := map[string]bool{directory: true}
 		for k, id := range expected {
 			output := records[id]
 			if output == nil {
@@ -1080,7 +1517,7 @@ func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
 			if check == nil || limit == 0 || !isInt(output.Get("size")) || size < 1 || size > float64(limit) {
 				return errors.New("invalid output")
 			}
-			res, err := r.Worker.Response("/v1/executions/"+job.Str("execution_id")+"/outputs/"+id, "GET", nil, "")
+			res, err := r.Worker.Response("/v1/executions/"+op.Str("execution_id")+"/outputs/"+id, "GET", nil, "")
 			if err != nil {
 				return err
 			}
@@ -1103,70 +1540,78 @@ func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
 					return errors.New("output dimensions changed")
 				}
 			}
-			if err := atomicFile(r.OutputFile(job.Str("job_id"), output), bytes); err != nil {
+			record := output.Clone()
+			if linear {
+				name := names[id]
+				record.Set("output_id", name.id).Set("op_id", op.Get("op_id")).Set("operation_output_id", id).Set("published", name.published)
+			}
+			file := r.OutputFile(job.Str("job_id"), record)
+			if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
 				return err
 			}
-			record := output.Clone()
+			synced[filepath.Dir(file)] = true
+			if err := atomicFile(file, bytes); err != nil {
+				return err
+			}
 			if seeded && task == "text-to-image" {
 				// Output k of a batch used seed + k − 1, so any one image can be reproduced alone.
 				record.Set("seed", seed+float64(k))
 			}
 			committed = append(committed, record.Set("expires_at", r.expiry()))
 		}
-		job.Set("outputs", committed)
-		input := job.Obj("input")
-		inputs := []any{}
-		if input != nil {
-			inputs = append(inputs, jsonv.O(
-				"input_id", input.Get("input_id"),
-				"mime_type", input.Get("mime_type"),
-				"size", input.Get("size"),
-				"sha256", input.Get("sha256"),
-				"width", input.Get("width"),
-				"height", input.Get("height"),
-			))
+		op.Set("outputs", committed)
+		op.Set("worker", jsonv.Maybe(snapshot.Get("implementation")))
+		op.Set("effective_settings", jsonv.Maybe(snapshot.Get("effective_settings")))
+		op.Set("measurements", jsonv.Maybe(snapshot.Get("measurements")))
+		for path := range synced {
+			if path != directory {
+				if err := syncDir(path); err != nil {
+					return err
+				}
+			}
 		}
-		adapters := []any{}
-		for _, raw := range asArray(job.Get("adapters")) {
-			a := raw.(*jsonv.Object)
-			adapter := a.Obj("adapter")
-			adapters = append(adapters, jsonv.O(
-				"adapter_id", adapter.Get("adapter_id"),
-				"digest", adapter.Get("digest"),
-				"scale", a.Get("scale"),
-				"source", jsonv.Maybe(adapter.Get("source")),
-			))
+		if index < len(ops)-1 {
+			// The operation's outputs are durable before the next operation is dispatched.
+			for _, path := range []string{directory, filepath.Join(r.Config.Directory, "outputs"), r.Config.Directory} {
+				if err := syncDir(path); err != nil {
+					return err
+				}
+			}
+			op.Set("state", "succeeded")
+			job.Set("current_operation", float64(index+1))
+			job.Set("stage", nil)
+			job.Delete("progress")
+			err := r.save(job, func(tx *store.Store) error {
+				for _, output := range committed {
+					tx.Event(job, "output", output)
+				}
+				return nil
+			})
+			if err != nil {
+				op.Set("state", "running")
+				job.Set("current_operation", float64(index))
+			}
+			return err
 		}
-		var scaleValue any = jsonv.Absent
-		if task == "upscale" {
-			scaleValue = scale
+		var manifest *jsonv.Object
+		if linear {
+			outputs, intermediates := []any{}, []any{}
+			for _, o := range ops {
+				for _, raw := range o.Arr("outputs") {
+					if raw.(*jsonv.Object).Get("published") == false {
+						intermediates = append(intermediates, raw)
+					} else {
+						outputs = append(outputs, raw)
+					}
+				}
+			}
+			job.Set("outputs", outputs)
+			job.Set("intermediate_outputs", intermediates)
+			manifest = r.linearManifest(job)
+		} else {
+			job.Set("outputs", committed)
+			manifest = r.manifest(job, op, snapshot, committed, scale)
 		}
-		manifest := jsonv.O(
-			"schema_version", 3.0,
-			"runtime_version", c.VERSION,
-			"job_id", job.Get("job_id"),
-			"task", job.Get("task"),
-			"family", job.Obj("model").Obj("bundle").Get("family"),
-			"scale", scaleValue,
-			"recipe", job.Get("recipe"),
-			"model", job.Obj("model").Get("bundle"),
-			"request", job.Get("request"),
-			"inputs", inputs,
-			"adapters", adapters,
-			"backend", job.Get("backend"),
-			"device_identity", nullish(backend.Get("device_identity")),
-			"resolved_options", nullish(backend.Get("resolved_options"), backend.Get("options")),
-			"resolutions", nullish(backend.Get("resolutions"), []any{}),
-			"applied_fallbacks", nullish(job.Get("applied_fallbacks"), []any{}),
-			"worker", jsonv.Maybe(snapshot.Get("implementation")),
-			"effective_settings", jsonv.Maybe(snapshot.Get("effective_settings")),
-			"measurements", jsonv.Maybe(snapshot.Get("measurements")),
-			"attempt_id", job.Get("attempt_id"),
-			"session_id", job.Get("session_id"),
-			"execution_id", job.Get("execution_id"),
-			"outputs", committed,
-			"determinism", "Seed reproducibility depends on hardware, software and dependency versions; matching bytes are not guaranteed.",
-		)
 		job.Set("manifest", manifest)
 		if err := atomicFile(filepath.Join(directory, "manifest.json"), jsonv.Indent(manifest)); err != nil {
 			return err
@@ -1176,6 +1621,7 @@ func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
 				return err
 			}
 		}
+		op.Set("state", "succeeded")
 		job.Set("state", "succeeded")
 		job.Set("stage", nil)
 		return r.save(job, func(tx *store.Store) error {
@@ -1189,12 +1635,139 @@ func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
 	if err != nil {
 		var api *c.ApiError
 		job.Set("state", "running")
+		op.Set("state", "running")
 		if errors.As(err, &api) && api.Code == "backend_unavailable" {
 			return err
 		}
 		r.finish(job, "failed", jsonv.O("code", "output_unavailable", "message", "Output could not be verified and committed to durable storage"))
 	}
 	return nil
+}
+
+// manifestInput is the provenance of a submitted input, without its owner or expiry.
+func manifestInput(input *jsonv.Object) *jsonv.Object {
+	return jsonv.O(
+		"input_id", input.Get("input_id"),
+		"mime_type", input.Get("mime_type"),
+		"size", input.Get("size"),
+		"sha256", input.Get("sha256"),
+		"width", input.Get("width"),
+		"height", input.Get("height"),
+	)
+}
+
+func manifestAdapters(op *jsonv.Object) []any {
+	adapters := []any{}
+	for _, raw := range asArray(op.Get("adapters")) {
+		a := raw.(*jsonv.Object)
+		adapter := a.Obj("adapter")
+		adapters = append(adapters, jsonv.O(
+			"adapter_id", adapter.Get("adapter_id"),
+			"digest", adapter.Get("digest"),
+			"scale", a.Get("scale"),
+			"source", jsonv.Maybe(adapter.Get("source")),
+		))
+	}
+	return adapters
+}
+
+// manifest is the schema-3 manifest of a single-operation job.
+func (r *Runtime) manifest(job, op, snapshot *jsonv.Object, committed []any, scale float64) *jsonv.Object {
+	backend := op.Obj("backend")
+	inputs := []any{}
+	if input := op.Obj("input"); input != nil {
+		inputs = append(inputs, manifestInput(input))
+	}
+	var scaleValue any = jsonv.Absent
+	if op.Str("task") == "upscale" {
+		scaleValue = scale
+	}
+	return jsonv.O(
+		"schema_version", 3.0,
+		"runtime_version", c.VERSION,
+		"job_id", job.Get("job_id"),
+		"task", op.Get("task"),
+		"family", op.Obj("model").Obj("bundle").Get("family"),
+		"scale", scaleValue,
+		"recipe", job.Get("recipe"),
+		"model", op.Obj("model").Get("bundle"),
+		"request", job.Get("request"),
+		"inputs", inputs,
+		"adapters", manifestAdapters(op),
+		"backend", backend,
+		"device_identity", nullish(backend.Get("device_identity")),
+		"resolved_options", nullish(backend.Get("resolved_options"), backend.Get("options")),
+		"resolutions", nullish(backend.Get("resolutions"), []any{}),
+		"applied_fallbacks", nullish(op.Get("applied_fallbacks"), []any{}),
+		"worker", jsonv.Maybe(snapshot.Get("implementation")),
+		"effective_settings", jsonv.Maybe(snapshot.Get("effective_settings")),
+		"measurements", jsonv.Maybe(snapshot.Get("measurements")),
+		"attempt_id", op.Get("attempt_id"),
+		"session_id", op.Get("session_id"),
+		"execution_id", op.Get("execution_id"),
+		"outputs", committed,
+		"determinism", determinism,
+	)
+}
+
+const determinism = "Seed reproducibility depends on hardware, software and dependency versions; matching bytes are not guaranteed."
+
+// linearManifest is the schema-4 manifest of a linear job: every operation with its model,
+// inputs, settings, worker identity and outputs, then the published and intermediate outputs.
+func (r *Runtime) linearManifest(job *jsonv.Object) *jsonv.Object {
+	inputs, operations := []any{}, []any{}
+	seen := map[string]bool{}
+	for _, op := range Operations(job) {
+		backend := op.Obj("backend")
+		var input any = jsonv.Absent
+		if record := op.Obj("input"); record != nil {
+			input = manifestInput(record)
+			if !seen[record.Str("input_id")] {
+				seen[record.Str("input_id")] = true
+				inputs = append(inputs, input)
+			}
+		}
+		var scale any = jsonv.Absent
+		if op.Str("task") == "upscale" {
+			scale = op.Obj("model").Get("scale")
+		}
+		operations = append(operations, jsonv.O(
+			"op_id", op.Get("op_id"),
+			"task", op.Get("task"),
+			"family", op.Obj("model").Obj("bundle").Get("family"),
+			"scale", scale,
+			"model_id", op.Obj("model").Get("model_id"),
+			"model", op.Obj("model").Get("bundle"),
+			"input", input,
+			"input_from", jsonv.Maybe(op.Get("input_from")),
+			"adapters", manifestAdapters(op),
+			"parameters", op.Get("parameters"),
+			"backend", backend,
+			"device_identity", nullish(backend.Get("device_identity")),
+			"resolved_options", nullish(backend.Get("resolved_options"), backend.Get("options")),
+			"resolutions", nullish(backend.Get("resolutions"), []any{}),
+			"applied_fallbacks", nullish(op.Get("applied_fallbacks"), []any{}),
+			"worker", jsonv.Maybe(op.Get("worker")),
+			"effective_settings", jsonv.Maybe(op.Get("effective_settings")),
+			"measurements", jsonv.Maybe(op.Get("measurements")),
+			"attempt_id", op.Get("attempt_id"),
+			"session_id", op.Get("session_id"),
+			"execution_id", op.Get("execution_id"),
+			"outputs", op.Get("outputs"),
+		))
+	}
+	return jsonv.O(
+		"schema_version", 4.0,
+		"runtime_version", c.VERSION,
+		"job_id", job.Get("job_id"),
+		"recipe", job.Get("recipe"),
+		"request", job.Get("request"),
+		"inputs", inputs,
+		"operations", operations,
+		"outputs", job.Get("outputs"),
+		"intermediate_outputs", job.Get("intermediate_outputs"),
+		"determinism", determinism,
+	)
 }
 
 func be32(b []byte) uint32 {
@@ -1306,7 +1879,16 @@ func (r *Runtime) Doctor() (*jsonv.Object, error) {
 	}
 	recipes := []any{}
 	for _, recipe := range r.Store.RegistryAll("recipes") {
-		recipes = append(recipes, jsonv.O("recipe_id", recipe.Get("recipe_id"), "pipeline", recipe.Get("pipeline")))
+		entry := jsonv.O("recipe_id", recipe.Get("recipe_id"), "pipeline", recipe.Get("pipeline"))
+		if c.IsLinear(recipe) {
+			// A linear recipe's pipeline is its operations' tasks in order.
+			tasks := []string{}
+			for _, raw := range recipe.Arr("operations") {
+				tasks = append(tasks, raw.(*jsonv.Object).Str("task"))
+			}
+			entry.Set("pipeline", strings.Join(tasks, " > ")).Set("operations", float64(len(tasks)))
+		}
+		recipes = append(recipes, entry)
 	}
 	queued, running := 0, 0
 	for _, j := range r.Store.All("") {
@@ -1338,13 +1920,23 @@ func (r *Runtime) Doctor() (*jsonv.Object, error) {
 	), nil
 }
 
-// Cleanup removes expired outputs and expired inputs no active job references.
+// Cleanup removes expired outputs, including a linear job's intermediates and the committed
+// operation outputs of a job that failed later, and expired inputs no active job references.
 func (r *Runtime) Cleanup() error {
-	for _, job := range r.Store.All("succeeded") {
-		for _, raw := range job.Arr("outputs") {
+	for _, job := range r.Store.All("") {
+		if !c.Terminal(job.Str("state")) {
+			continue
+		}
+		records := append(append([]any{}, job.Arr("outputs")...), job.Arr("intermediate_outputs")...)
+		for _, op := range Operations(job) {
+			records = append(records, op.Arr("outputs")...)
+		}
+		removed := map[string]bool{}
+		for _, raw := range records {
 			output, _ := raw.(*jsonv.Object)
-			if c.Expired(output.Get("expires_at")) {
-				path := r.OutputFile(job.Str("job_id"), output)
+			path := r.OutputFile(job.Str("job_id"), output)
+			if c.Expired(output.Get("expires_at")) && !removed[path] {
+				removed[path] = true
 				if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 					return err
 				}
