@@ -1,0 +1,362 @@
+{
+  "schema_version": 2,
+  "runtime_version": "0.3.0",
+  "job_id": "job_78493b9b-d206-489c-b549-e8eb6cf33419",
+  "task": "text-to-image",
+  "recipe": {
+    "schema_version": 1,
+    "recipe_id": "portrait",
+    "revision": 1,
+    "pipeline": "text-to-image",
+    "model_family": "sdxl-base",
+    "inputs": {
+      "prompt": {
+        "type": "string",
+        "required": true
+      }
+    },
+    "defaults": {
+      "width": 1024,
+      "height": 1024,
+      "steps": 30,
+      "guidance": 6
+    },
+    "digest": "sha256:0fb9507eb8a5c63a2fdf9c1d7b285bb7e4257eac9a35011b7dfe4a27177f48b4"
+  },
+  "model": {
+    "schema_version": 1,
+    "bundle_id": "fixture",
+    "family": "sdxl-base",
+    "pipeline": "text-to-image",
+    "components": [
+      {
+        "role": "unet",
+        "artifact_handle": "fixture",
+        "digest": "sha256:c045456e36ef6464ffe9e0b499c5526b83e41158d42a88590eb4ce902182582b",
+        "tensor_format": "safetensors"
+      },
+      {
+        "role": "vae",
+        "artifact_handle": "fixture",
+        "digest": "sha256:9d4332d26089d8f4e23f24f0a76c6f1b05d0ac157ba563baa0b6a10bd1ec7898",
+        "tensor_format": "safetensors"
+      },
+      {
+        "role": "text_encoder",
+        "artifact_handle": "fixture",
+        "digest": "sha256:53e07a44e2805b9328cf71025ad33e33350c216fdadfe5f3f1ceb38cd137ea01",
+        "tensor_format": "safetensors"
+      },
+      {
+        "role": "text_encoder_2",
+        "artifact_handle": "fixture",
+        "digest": "sha256:8218ba6cc624a3369ab6744922d8df476bf2d2b40bfbfe976e9b6c5f04977dab",
+        "tensor_format": "safetensors"
+      },
+      {
+        "role": "tokenizer",
+        "artifact_handle": "fixture",
+        "digest": "sha256:178f4094f9427e389ec5146c442a5ad6c9d05c591f76ee0d49f55643d8000c03",
+        "tensor_format": "json"
+      },
+      {
+        "role": "tokenizer_2",
+        "artifact_handle": "fixture",
+        "digest": "sha256:4ca9d6a5fb0b3caa663a65b1e61bd2704bd6730fd5c25ed3c903890a929741d1",
+        "tensor_format": "json"
+      },
+      {
+        "role": "scheduler",
+        "artifact_handle": "fixture",
+        "digest": "sha256:9356994135b0f8e7aa1b4f7abd0b617431e6d5d0ff6c5edccc6ad40f9a9e7f83",
+        "tensor_format": "json"
+      }
+    ],
+    "configuration": {
+      "artifact_handle": "fixture",
+      "files": {
+        "model_index.json": "5415ece44fef34e7f9669e5bcb4f83675c3308e70ee831bfda149c7cee4f5d7d",
+        "scheduler/config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "scheduler/scheduler_config.json": "9f408c41e3ed6d7fc7b1d516735e74564c9bd7a993fd68c1f19e01621ed485a3",
+        "text_encoder/config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "text_encoder/test.safetensors": "6ee33e4e5122e897e1c5799be29ba4db7d343d67a8ea4275ffb24dedeff465b5",
+        "text_encoder_2/config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "text_encoder_2/test.safetensors": "d2bd6597a226ca1665f0c878704ae600d0275a510d3714a62e34994b1aaa2980",
+        "tokenizer/config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "tokenizer_2/config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "unet/config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "unet/test.safetensors": "6262eb46297fbdd5be28d2b31bd276746d4c7218e5b3a2d500a09941910d94fe",
+        "vae/config.json": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "vae/test.safetensors": "b234690067be56c84b551fd76593e2818636e413b949a131fcd404c7a19e9d2e"
+      }
+    },
+    "source": {
+      "license": "test-only"
+    },
+    "bundle_digest": "sha256:23733436c73a3f5c3e2b2a677eadf7b8c7edf248c7ab2dbbdaae889bafa7550f"
+  },
+  "request": {
+    "recipe_id": "portrait",
+    "model_id": "fixture",
+    "inputs": {
+      "prompt": "migrated"
+    },
+    "parameters": {
+      "width": 64,
+      "height": 64,
+      "steps": 3,
+      "guidance": 6,
+      "seed": 7,
+      "sampler": "euler",
+      "scheduler": "euler"
+    },
+    "adapters": [],
+    "backend_id": "diffusers-sdxl",
+    "backend_options": {
+      "diffusers-sdxl": {
+        "precision": "float32",
+        "attention": "sdpa",
+        "offload": "none"
+      }
+    }
+  },
+  "inputs": [],
+  "adapters": [],
+  "backend": {
+    "backend_id": "diffusers-sdxl",
+    "ownership": "test-fixture",
+    "worker_version": "0.3.0-test-fixture",
+    "protocol": "media-worker/1.1",
+    "device": "test-only",
+    "options": {
+      "precision": "float32",
+      "attention": "sdpa",
+      "offload": "none"
+    },
+    "memory_budget_mb": null,
+    "memory_estimate": {
+      "value_mb": 0,
+      "source": "safetensors_headers",
+      "basis": "parameter count at the requested load precision",
+      "precision": "float32",
+      "device": "test-only",
+      "roles": {
+        "unet": {
+          "parameters": 8,
+          "stored_mb": 0,
+          "loaded_mb": 0
+        },
+        "vae": {
+          "parameters": 8,
+          "stored_mb": 0,
+          "loaded_mb": 0
+        },
+        "text_encoder": {
+          "parameters": 8,
+          "stored_mb": 0,
+          "loaded_mb": 0
+        },
+        "text_encoder_2": {
+          "parameters": 8,
+          "stored_mb": 0,
+          "loaded_mb": 0
+        }
+      },
+      "uncertainty": "excludes activations, VAE float32 upcast, allocator reserve and framework overhead",
+      "adapters": []
+    }
+  },
+  "worker": {
+    "protocol": "media-worker/1.1",
+    "supported_protocols": [
+      "media-worker/1.0",
+      "media-worker/1.1"
+    ],
+    "worker_version": "0.3.0-test-fixture",
+    "backend_id": "diffusers-sdxl",
+    "ownership": "test-fixture",
+    "test_fixture": true,
+    "ready": true,
+    "device": "test-only",
+    "device_available": true,
+    "memory_budget_mb": null,
+    "memory_estimate": {
+      "value_mb": 0,
+      "source": "safetensors_headers",
+      "basis": "parameter count at the requested load precision",
+      "precision": "float32",
+      "device": "test-only",
+      "roles": {
+        "unet": {
+          "parameters": 8,
+          "stored_mb": 0,
+          "loaded_mb": 0
+        },
+        "vae": {
+          "parameters": 8,
+          "stored_mb": 0,
+          "loaded_mb": 0
+        },
+        "text_encoder": {
+          "parameters": 8,
+          "stored_mb": 0,
+          "loaded_mb": 0
+        },
+        "text_encoder_2": {
+          "parameters": 8,
+          "stored_mb": 0,
+          "loaded_mb": 0
+        }
+      },
+      "uncertainty": "excludes activations, VAE float32 upcast, allocator reserve and framework overhead",
+      "adapters": []
+    },
+    "defaults": {
+      "width": 1024,
+      "height": 1024,
+      "steps": 30,
+      "guidance": 6,
+      "sampler": "euler",
+      "scheduler": "euler"
+    },
+    "task_defaults": {
+      "image-to-image": {
+        "strength": 0.75
+      }
+    },
+    "load_defaults": {
+      "precision": "float32",
+      "attention": "sdpa",
+      "offload": "none"
+    },
+    "limits": {
+      "width": [
+        64,
+        2048
+      ],
+      "height": [
+        64,
+        2048
+      ],
+      "steps": [
+        1,
+        150
+      ],
+      "guidance": [
+        0,
+        30
+      ],
+      "strength": [
+        0,
+        1
+      ],
+      "adapter_scale": [
+        0,
+        2
+      ],
+      "size_multiple": 8
+    },
+    "precisions": [
+      "float32"
+    ],
+    "tasks": [
+      "text-to-image",
+      "image-to-image"
+    ],
+    "task_parameters": {
+      "text-to-image": {
+        "inputs": [
+          "prompt",
+          "negative_prompt"
+        ]
+      },
+      "image-to-image": {
+        "inputs": [
+          "prompt",
+          "negative_prompt",
+          "image"
+        ],
+        "parameters": [
+          "strength"
+        ],
+        "input_formats": [
+          "image/png"
+        ]
+      }
+    },
+    "model_families": [
+      "sdxl-base"
+    ],
+    "adapters": {
+      "formats": [
+        "peft-lora"
+      ],
+      "targets": [
+        "unet",
+        "text_encoder",
+        "text_encoder_2"
+      ],
+      "max_adapters": 4,
+      "scale": [
+        0,
+        2
+      ],
+      "identity": "load"
+    },
+    "session_id": "40582635-f746-463f-9d75-b331ebdc6346",
+    "formats": [
+      "diffusers-safetensors"
+    ],
+    "output_formats": [
+      "png"
+    ],
+    "input_formats": [
+      "image/png"
+    ],
+    "progress": true,
+    "cancellation": true,
+    "retention": "until-discard-or-session-end",
+    "max_retained_executions": 128,
+    "max_storage_mb": 1024,
+    "max_input_mb": 32,
+    "required_roles": [
+      "unet",
+      "vae",
+      "text_encoder",
+      "text_encoder_2",
+      "tokenizer",
+      "tokenizer_2",
+      "scheduler"
+    ]
+  },
+  "effective_settings": {
+    "width": 64,
+    "height": 64,
+    "steps": 3,
+    "guidance": 6,
+    "seed": 7,
+    "sampler": "euler",
+    "scheduler": "euler",
+    "effective_steps": 3
+  },
+  "measurements": {
+    "test_fixture": true,
+    "effective_steps": 3,
+    "peak_allocated_mb": 0
+  },
+  "attempt_id": "attempt_795ff558-94ed-435d-907c-79810347b0ca",
+  "session_id": "40582635-f746-463f-9d75-b331ebdc6346",
+  "execution_id": "exec_dee7f272b2db405eaf3e6d2612594361",
+  "outputs": [
+    {
+      "output_id": "image",
+      "mime_type": "image/png",
+      "size": 179,
+      "sha256": "ca0ed54381c8665f5635303adc0dc41563dcff673a729d1baddf137ef14ac486",
+      "width": 64,
+      "height": 64,
+      "expires_at": null
+    }
+  ],
+  "determinism": "Seed reproducibility depends on hardware, software and dependency versions; matching bytes are not guaranteed."
+}

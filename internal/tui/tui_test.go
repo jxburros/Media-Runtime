@@ -1,0 +1,73 @@
+package tui
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/jxburros/media-runtime/internal/jsonv"
+)
+
+func parse(t *testing.T, text string) *jsonv.Object {
+	t.Helper()
+	v, err := jsonv.Parse([]byte(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v.(*jsonv.Object)
+}
+
+const running = `{"job_id":"job_11111111-1111-1111-1111-111111111111","state":"running","stage":"sampling","task":"image-to-image","progress":{"stage":"sampling","completed_steps":2,"total_steps":4},"model":{"model_id":"studio-sdxl"},"backend":{"backend_id":"owned-sdxl"},"request":{"parameters":{"seed":42,"width":64,"height":64,"steps":4,"strength":0.6}},"created_at":"2026-10-26T10:00:00.000Z","outputs":[]}`
+
+func TestDashboardRendersQueueStageModelBackendSeedOutputAndErrors(t *testing.T) {
+	run := parse(t, running)
+	done := run.Clone().Set("job_id", "job_22222222-2222-2222-2222-222222222222").Set("state", "succeeded").Set("stage", nil).
+		Set("outputs", []any{jsonv.O("output_id", "image", "expires_at", nil)})
+	done.Delete("progress")
+	failed := run.Clone().Set("job_id", "job_33333333-3333-3333-3333-333333333333").Set("state", "failed").
+		Set("error", jsonv.O("code", "execution_interrupted", "forced_termination", true))
+	rt := parse(t, `{"runtime_version":"0.2.0","worker":{"backend_id":"owned-sdxl","ownership":"owned-pipeline","worker_version":"0.2.0","protocol":"media-worker/1.1","device":"cuda:0","device_ready":true,"state":"busy","memory_estimate":{"value_mb":6500,"source":"safetensors_headers"}},"queue":{"running":1,"queued":0,"capacity":32},"models":[{"model_id":"studio-sdxl","loaded":true,"available":true}]}`)
+	lines := Render(State{Runtime: rt, Jobs: []*jsonv.Object{run, done, failed}, UpdatedAt: "10:00:00Z"}, 132, 20)
+	if len(lines) != 20 {
+		t.Fatalf("%d lines", len(lines))
+	}
+	for _, l := range lines {
+		if width(l) > 132 {
+			t.Fatalf("line too wide: %q", l)
+		}
+	}
+	text := strings.Join(lines, "\n")
+	for _, want := range []string{"owned-sdxl (owned-pipeline)", "1 running, 0 queued of 32", "studio-sdxl*", "sampling 2/4", "image-to-image", "output ready", "execution_interrupted (forced)", "strength 0.6", "6500 MiB"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in\n%s", want, text)
+		}
+	}
+	detail := strings.Join(Render(State{Jobs: []*jsonv.Object{done}}, 200, 12), "\n")
+	if !strings.Contains(detail, "/v1/jobs/"+done.Str("job_id")+"/outputs/image") {
+		t.Fatal(detail)
+	}
+	if s := DescribeStage(jsonv.O("state", "queued", "cancel_requested", true)); s != "cancelling" {
+		t.Fatal(s)
+	}
+	if s := OutputLocation(jsonv.O("state", "succeeded", "outputs", []any{jsonv.O("output_id", "image", "expires_at", "2000-01-01T00:00:00Z")})); s != "expired" {
+		t.Fatal(s)
+	}
+}
+
+func TestDashboardMatchesTheTypeScriptLayout(t *testing.T) {
+	// Produced by renderDashboard() of the TypeScript 0.3.0 release for the same state.
+	lines := Render(State{Jobs: []*jsonv.Object{parse(t, running)}}, 60, 9)
+	want := []string{
+		"Media Runtime ?    [q] quit  [j/k] select  [c] cancel  [r] …",
+		"worker: undefined (undefined) undefined  undefined  device …",
+		"queue: unknown running, unknown queued of unknown  models: …",
+		strings.Repeat("─", 60),
+		"job            stage              task           model     …",
+		">11111111-1111 sampling 2/4       image-to-image studio-sdx…",
+		strings.Repeat("─", 60),
+		"job_11111111-1111-1111-1111-111111111111  owned-sdxl  64×64…",
+		strings.Repeat(" ", 60),
+	}
+	if strings.Join(lines, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("got\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
+	}
+}
