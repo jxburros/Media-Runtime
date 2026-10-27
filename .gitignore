@@ -4,3 +4,4 @@ dist/
 *.log
 /runtime.config.json
 .env
+/media-runtime

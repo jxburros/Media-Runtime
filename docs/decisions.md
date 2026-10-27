@@ -62,7 +62,7 @@
 - Kohya-format files are refused by the worker rather than silently converted; operators convert
   to the PEFT layout first. The runtime surfaces the worker's `unsupported` error unchanged.
 
-# Implementation decisions — 0.4.0 (planned)
+# Implementation decisions — 0.4.0
 
 - The service is rewritten in Go at exact 0.3.0 parity before any deferred capability is built.
   Reasons: the parity target is smallest now (about 4,000 lines, one dependency); the worker pool
@@ -77,17 +77,44 @@
 - The TypeScript service is frozen at 0.3.0 when the rewrite starts and archived after 0.5.0.
 - Language split across the project: Go for the runtime, Python for the reference and owned
   Engine backends, Rust recommended for Engine's native backend (decided in Engine phase E6).
+- Toolchain as built and tested: Go 1.24.7 linux/amd64, `CGO_ENABLED=0`-compatible; `go.mod`
+  declares `go 1.24`. `modernc.org/sqlite` v1.38.2 is pinned in `go.mod`/`go.sum`.
+- Parity method: the 0.3.0 suites exercised the TypeScript classes in process (they replaced
+  `worker.json` and `worker.probe` at run time), so they could not launch a separate binary
+  unchanged. They were ported case for case to Go tests that construct the runtime in process the
+  same way, with explicit test hooks on the worker client (`SetHooks`) standing in for monkey
+  patching, plus binary-level CLI tests. Both 0.3.0 Node suites passed against Engine 0.3.0
+  immediately before the port, and every ported case passes against the same fixture.
+- Byte-level parity: records are built in an ordered JSON model (`internal/jsonv`) that keeps
+  JavaScript's key order, number formatting and string escaping, so stored jobs, manifests, API
+  bodies and the canonical digests (idempotency keys, recipe, bundle and adapter digests) are the
+  ones 0.3.0 produced. Tests pin digests and rendered dashboard/doctor text produced by 0.3.0.
+  Validation reports the first failing field path the way zod's first issue did.
+- Concurrency: HTTP handlers run concurrently with the scheduler goroutine, so one mutex
+  serializes job read-modify-write sequences (cancellation, admission, dispatch and every
+  scheduler save, which re-reads cancellation intent first) and SQLite uses one connection. The
+  scheduler still runs at most one tick at a time.
+- CLI flags use the standard `flag` package, re-parsed around positionals so options may follow
+  subcommands as before; Go also accepts single-dash spellings, and unknown-flag messages differ
+  in wording (exit code 2 is unchanged).
+- The 0.3.0 tag and a `typescript-0.3` maintenance branch are release-management steps for the
+  repository owner when this release is tagged; the 0.3.0 sources remain in history.
 - Dependency policy: standard library first; a third-party module is accepted only when it does
   something unsafe or impractical to own, is pinned by checksum and isolated in one package. Every
   module is listed in the ledger below with its justification; adding one is a recorded decision.
 
-## Dependency ledger — Go runtime (planned 0.4.0)
+## Dependency ledger — Go runtime (0.4.0)
 
 | Module               | Why it is not owned code                                                   |
 | -------------------- | -------------------------------------------------------------------------- |
 | modernc.org/sqlite   | Durable atomic admission, idempotency and event sequences; pure Go, no cgo |
 
-Standard library only: `net/http` (API and SSE), `crypto/tls` (network mode and remote workers),
+The driver brings its own transitive modules (`modernc.org/libc`, `mathutil`, `memory`,
+`github.com/dustin/go-humanize`, `github.com/google/uuid`, `github.com/mattn/go-isatty`,
+`github.com/ncruces/go-strftime`, `github.com/remyoudompheng/bigfft`, `golang.org/x/exp`,
+`golang.org/x/sys`), all pinned by `go.sum`; none is imported by runtime code.
+
+Standard library only: `net/http` (API and SSE), `crypto/tls` (reserved for network mode and remote workers),
 `encoding/json`, `flag`, `os/exec` (owned worker supervision), `archive/zip` (frame archive
 checks), terminal dashboard via ANSI escapes. Rejected: `bubbletea`/`tview` (the 0.3.0 dashboard
 already needs no library), `cobra` (stdlib `flag` suffices), any HTTP router or validation
@@ -95,3 +122,37 @@ framework (strict decoding with `DisallowUnknownFields` and hand-written range c
 
 The gateway client package keeps TypeScript's zero-dependency profile: it uses `fetch` and no
 third-party module.
+
+# Implementation decisions — 0.5.0
+
+- Protocol 1.2 is negotiated when the worker lists it; 1.0 and 1.1 remain. Each 1.2 field is
+  admitted only against a 1.2 worker that advertises it and is otherwise refused with
+  `unsupported` naming the field (`parameters.count`, `precision`, `authorized_fallbacks`,
+  `recipe_id` for `upscale`, `family` at registration).
+- Output limits: `max_output_bytes` is a per-MIME map with defaults `image/png` 32 MiB,
+  `application/zip` 256 MiB, `video/mp4` 256 MiB and `audio/wav` 64 MiB; the 0.4.0 number is
+  read as the PNG limit. The video and audio defaults are unmeasured guesses until those stages.
+- `count` is 1–4 in the request schema and further bounded by the worker's `limits.count`. The
+  expected output set is the worker's `task_parameters.<task>.outputs` with `repeated_outputs`
+  expanded to `id_2 … id_N`; an extra or missing output fails the job (`output_unavailable`).
+  Output `k` of a batch records seed `seed + k − 1`.
+- Upscale requests carry only `width`, `height` (the input's), `tile` and `tile_overlap`. The
+  registration's `scale` is the factor the worker reports when it validates the bundle; the
+  runtime checks `max(width, height) × scale ≤ limits.output_side` before admission and the worker
+  checks again. Model and recipe families must match before any worker call.
+- Conversion provenance comes only from the directory's `conversion.json`: a registration may
+  repeat it (it must match) but never supply it alone. A directory holding one `.safetensors` file
+  and no `model_index.json`/`config.json` is a bare checkpoint and is refused with field `format`.
+- Fallback policy: credentials default to `allow_fallbacks: false`; a request naming fallbacks with
+  such a credential is `403 fallbacks_not_allowed`, field `authorized_fallbacks`. The one
+  readiness relaxation is a 1.2 worker whose selected device is unavailable (`device_available:
+  false`, dependencies present) when the request authorizes `cpu`: it is admitted and dispatched
+  so the worker can apply that fallback. Without the authorization the 503 refusal is unchanged.
+  Applied fallbacks are recorded from the loaded bundle when the job is dispatched, so a job that
+  reuses an already loaded fallback bundle records it too.
+- `auto` stays in the request and the load identity (the worker reports the requested options as
+  the loaded options), so an identical request does not reload; resolved values are recorded,
+  never copied into a retry.
+- Manifest schema 3 adds `family`, `scale` (upscale), `device_identity`, `resolved_options`,
+  `resolutions`, `applied_fallbacks` and every output with its seed. Schema 2 manifests are never
+  rewritten.

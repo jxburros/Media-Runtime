@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "recipe_id": "enlarge",
+  "revision": 1,
+  "pipeline": "upscale",
+  "model_family": "esrgan",
+  "inputs": {
+    "image": {
+      "type": "image",
+      "required": true
+    }
+  },
+  "defaults": {
+    "tile": 0,
+    "tile_overlap": 16
+  }
+}

@@ -1,24 +1,27 @@
 # Media Runtime
 
-A standalone, authenticated local media service with a TypeScript CLI/API, terminal dashboard,
+A standalone, authenticated local media service with a Go CLI/API, terminal dashboard,
 SQLite FIFO jobs, resumable job events, cancellation, durable PNG inputs, immutable PNG outputs and
 provenance. Media Engine is its separately installed SDXL inference worker. Studio connects to this
 service through its gateway.
 
 This release implements the **first complete path**, the **operator experience** stage and
 image-to-image from the **additional media operations** stage in [runtime-spec.md](runtime-spec.md),
-and accepts Engine's **owned pipeline** backend behind the unchanged worker protocol. LoRA,
+and accepts Engine's **owned pipeline** backend behind the unchanged worker protocol. Release 0.4.0
+is the Go rewrite of the 0.3.0 TypeScript service at exact feature parity: the API, configuration,
+state directory, manifests and CLI are unchanged, and a 0.3.0 state directory is served as is.
+Release 0.5.0 speaks `media-worker/1.2` and adds multiple outputs per job, upscaling, the
+conversion provenance workflow, and automatic settings with authorized fallbacks. LoRA,
 upscaling, video, multi-GPU and native inference are later stages, specified in the same document and
 sequenced in [docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Install and run
 
-Use Node **24.19.0** (24 LTS), Python **3.12.14**, Linux x64 and the companion
-[Media Engine](https://github.com/jxburros/Media-Engine). Install dependencies explicitly:
+Use Go **1.24** or later (no cgo), Python **3.12.14**, Linux x64 and the companion
+[Media Engine](https://github.com/jxburros/Media-Engine). Build the single static binary:
 
 ```sh
-npm ci
-npm run build
+CGO_ENABLED=0 go build -o media-runtime ./cmd/media-runtime
 ```
 
 1. Prepare an already-downloaded, complete SDXL base Diffusers directory with safetensors weights.
@@ -29,29 +32,29 @@ npm run build
    Give Engine the same handle/path mapping using its catalog file. A model registration uses an
    opaque handle, never a caller-supplied filesystem path.
 3. Set separate random credentials through protected environment variables. For example, generate
-   a value with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` and store it
-   in your service manager's protected environment file. The sample config names
+   a value with `openssl rand -hex 32` and store it in your service manager's protected
+   environment file. The sample config names
    `MEDIA_RUNTIME_TOKEN`, `MEDIA_STUDIO_TOKEN`, and `MEDIA_ENGINE_TOKEN`; no credential ships here.
    Remove the Studio credential entry when using standalone mode only.
 4. Start Engine according to its README, then keep Runtime running as a service:
 
 ```sh
-node dist/cli.js serve --config runtime.config.json
+media-runtime serve --config runtime.config.json
 # In another terminal, with MEDIA_RUNTIME_TOKEN configured:
-node dist/cli.js doctor
-node dist/cli.js models inspect            # what each catalog handle is missing, before registering
-node dist/cli.js models register examples/model.json
-node dist/cli.js models show studio-sdxl --verify   # re-hash through the worker; memory estimate
-node dist/cli.js run portrait --model studio-sdxl --prompt "Soft window light" --seed 42 --wait
-node dist/cli.js run variation --model studio-sdxl --prompt "Softer light" --image ./source.png --strength 0.5 --wait
-node dist/cli.js adapters register examples/adapter.json
-node dist/cli.js run portrait --model studio-sdxl --prompt "Soft window light" --adapter studio-style:0.8 --wait
-node dist/cli.js jobs list
-node dist/cli.js outputs export JOB_ID --directory ./exports
-node dist/cli.js tui
+media-runtime doctor
+media-runtime models inspect            # what each catalog handle is missing, before registering
+media-runtime models register examples/model.json
+media-runtime models show studio-sdxl --verify   # re-hash through the worker; memory estimate
+media-runtime run portrait --model studio-sdxl --prompt "Soft window light" --seed 42 --wait
+media-runtime run variation --model studio-sdxl --prompt "Softer light" --image ./source.png --strength 0.5 --wait
+media-runtime adapters register examples/adapter.json
+media-runtime run portrait --model studio-sdxl --prompt "Soft window light" --adapter studio-style:0.8 --wait
+media-runtime jobs list
+media-runtime outputs export JOB_ID --directory ./exports
+media-runtime tui
 ```
 
-Use `npm link` if you want the `media-runtime` executable on PATH. `run` without `--wait` returns
+Install the binary anywhere on PATH; it has no runtime dependencies. `run` without `--wait` returns
 immediately; closing a CLI, dashboard or browser never cancels an accepted job. `jobs watch`,
 `jobs cancel`, `jobs retry`, `recipes list`, `recipes inspect`, `recipes register`, `inputs upload`,
 `inputs list` and `inputs delete` use the same public API. `--json` produces machine-readable
@@ -102,6 +105,54 @@ only for a credential with a matching `allowed_namespaces` grant. Never put an i
 in a browser. All routes except coarse `/health` require bearer authentication; browser origins
 are refused, and the server binds loopback only.
 
+## Multiple outputs
+
+`run portrait ... --count 3` (or `parameters.count`, text-to-image only, up to the worker's
+advertised limit) asks one execution for a batch. The outputs are `image`, `image_2`, `image_3`;
+output `k` used seed `seed + k − 1` and records it, so `--count 1 --seed S+k−1` reproduces one image
+alone. A job succeeds only when every output the worker advertises for the task is verified (size,
+SHA-256, PNG signature and dimensions) and committed; a missing or extra output fails the job with
+`output_unavailable`. `max_output_bytes` is a per-MIME map (a single number is still accepted as the
+PNG limit), `GET /v1/jobs/{id}/outputs/{output_id}` serves any committed output, and `outputs export`
+writes each one with an extension derived from its MIME type. Workers before 1.2 refuse `count`.
+
+## Upscaling
+
+The `enlarge` recipe (pipeline `upscale`, family `esrgan`) enlarges an uploaded PNG by the
+registered upscaler's fixed factor. Register the network like any bundle, naming its family:
+`models register examples/model.upscaler.json`; the directory holds one `.safetensors` network file
+and its `config.json`, and the worker reports the factor (`models show` and `doctor` print it). Then
+`run enlarge --model upscaler --image in.png [--tile 512] [--tile-overlap 16]`. Width and height are
+the input's and cannot be overridden; prompts, seeds, steps, guidance, `count` and adapters are
+refused, no seed is resolved or recorded, and a result larger than the worker's `output_side` limit
+is refused before admission. Progress reports tiles. Real-ESRGAN `.pth` releases must be converted to
+safetensors by the operator first; Runtime never converts weights.
+
+## Converted checkpoints
+
+A single-file SDXL checkpoint is not a bundle. Convert it offline with Engine
+(`media-engine convert --input model.safetensors --reference-handle sdxl-base --catalog catalog.json
+--output /approved/converted`), add the output directory to `artifact_catalog`, then run
+`models inspect`: it reports the source checkpoint digest, the reference bundle digest and the
+converter versions from `conversion.json`, and prints a registration document carrying them as
+`source.conversion`. `models register` records that provenance in the bundle, and every manifest of
+a job that used it carries it. Registering an unconverted checkpoint directory fails with
+`unsupported`, field `format`.
+
+## Automatic settings and fallbacks
+
+Against a 1.2 worker that advertises it, `--precision auto` (or `backend_options.<backend>.precision:
+"auto"`) lets the worker choose the precision; the job and manifest record `resolved_options` and the
+worker's `resolutions` with their reasons, and an identical request resolves identically without a
+reload. `--fallback cpu` and `--fallback lower_precision` (`authorized_fallbacks`) permit the worker to
+load on the host CPU or at a lower-memory precision when the selected device is unavailable or too
+small. Only credentials configured with `"allow_fallbacks": true` may authorize them (others get
+`403` with field `authorized_fallbacks`). An applied fallback is recorded in the job
+(`applied_fallbacks`), announced as a `stage` event, shown by `jobs watch` and the dashboard, and kept
+in the manifest. A fallback never changes the model, recipe or generation parameters. Without an
+authorization nothing changes: an unavailable device is still refused and an over-budget load still
+fails with the worker's code.
+
 ## Worker ownership
 
 By default the configured Engine is externally managed: Runtime never kills it. To supervise a
@@ -118,9 +169,12 @@ state the choice explicitly. A request for a backend other than the running one 
 leak prompts or grow without bound. Only this child can be terminated after the cancellation grace
 period; forced termination settles the job as `execution_interrupted`, not confirmed cancellation.
 
-The worker contract is [media-worker/1.1](https://github.com/jxburros/Media-Engine/blob/main/docs/protocol.md).
-Runtime 0.3.0 negotiates the highest minor the worker lists: Engine 0.2.0 and later give
-`media-worker/1.1` with image-to-image and (Engine 0.3.0) LoRA adapters; Engine 0.1.0 gives `media-worker/1.0` with text-to-image only. There is one
+The worker contract is [media-worker/1.2](https://github.com/jxburros/Media-Engine/blob/main/docs/protocol.md).
+Runtime 0.5.0 negotiates the highest minor the worker lists: Engine 0.4.0 gives `media-worker/1.2`
+with multiple outputs, upscaling, loaders, automatic settings, fallbacks and device identity;
+Engine 0.2.0 and later give `media-worker/1.1` with image-to-image and (Engine 0.3.0) LoRA adapters;
+Engine 0.1.0 gives `media-worker/1.0` with text-to-image only. Every 1.2 feature is refused with
+`unsupported` naming the field against an older worker. There is one
 active execution and at most 32 queued jobs by default; all operational limits are in the config.
 Requested model, backend, seed, dimensions, precision and scheduler are never silently changed.
 
@@ -151,11 +205,24 @@ model in Create. Its gateway derives `studio:<scope digest>` namespaces from aut
 and project context, preserves model routing, displays actual stage/step status, sends Stop to the
 runtime and imports verified output copies with provenance. Personal and project paths are the same.
 
+## Gateway client
+
+Studio's typed entry point is the TypeScript package in [`gateway-client/`](gateway-client/README.md)
+(`@media-runtime/gateway-client`, no runtime dependencies). It is versioned with the service and
+speaks only the public API.
+
 ## Development
 
-Keep Media-Engine beside this checkout (or set `MEDIA_ENGINE_REPO`) and run `npm test`.
-The integration suite drives the real worker HTTP server using an explicitly identified test backend
-located only in Engine's tests, covering text-to-image, image-to-image, 1.0 negotiation, catalog
-inspection, verification and LoRA adapters; `test/tui.test.mjs` renders the dashboard and doctor output. The
-fixture is not an inference fallback. GPU image quality and hardware
-compatibility require the selected real bundle; see [implementation decisions](docs/decisions.md).
+Keep Media-Engine beside this checkout (or set `MEDIA_ENGINE_REPO`; `MEDIA_ENGINE_PYTHON` selects
+the interpreter, default `python3`) and run `go test ./...`.
+The integration tests in `internal/integration` drive the real worker HTTP server using an explicitly
+identified test backend located only in Engine's tests, covering text-to-image, image-to-image, 1.0
+negotiation, restart reconciliation, owned-worker crashes and forced termination, catalog
+inspection, verification and LoRA adapters, and the 1.2 surface (multiple outputs, upscaling,
+conversion provenance, automatic precision, authorized fallbacks and a 1.1-pinned fixture's
+refusals; these skip against an Engine fixture older than 0.4.0). `cmd/media-runtime` tests build the binary and drive
+the CLI end to end, including a state directory written by the TypeScript 0.3.0 service
+(`testdata/state-0.3.0`); `internal/tui` and the doctor tests compare rendered text with the
+0.3.0 output. The fixture is not an inference fallback. GPU image quality and hardware
+compatibility require the selected real bundle; see [implementation decisions](docs/decisions.md)
+and the [compatibility record](docs/compatibility.md).

@@ -1,13 +1,49 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-10-27
+
+Worker protocol `media-worker/1.2` (Engine 0.4.0), phase R1 of the implementation plan. Runtime
+records the worker's device identity, loader and task facts on every job and in manifest schema 3.
+**Multiple outputs:** `parameters.count` / `run --count` (text-to-image, worker-limited) commits
+`image` … `image_N` with per-output seeds; success requires every advertised output; per-MIME
+`max_output_bytes`; the outputs route and `outputs export` handle any output ID and MIME type.
+**Upscaling:** the `upscale` pipeline, the `esrgan` family (`family` in registrations, scale from
+the worker) and the default `enlarge` recipe with `tile`/`tile_overlap`; inputs are never resized
+and oversize results are refused before admission. **Conversion provenance:** catalog inspection
+and registration read `conversion.json` into `source.conversion`, manifests carry it, and bare
+single-file checkpoints are refused with field `format`. **Automatic settings and fallbacks:**
+`precision: "auto"` with recorded `resolved_options`/`resolutions`; `authorized_fallbacks`
+(`run --fallback`) for credentials with `allow_fallbacks`, recorded as `applied_fallbacks`, a
+`stage` event, in the dashboard and in the manifest. The gateway client gains typed submissions,
+jobs, output records and model summaries. Every 1.2 capability is refused against 1.0/1.1 workers;
+existing jobs, schema 2 manifests and 0.4.0 configurations remain readable. Tested against Engine
+0.4.0's fixture and, for the 1.1 path, Engine 0.3.0's ([compatibility record](docs/compatibility.md)).
+Companion Studio task: import every output of a multi-output job and the upscale task through the
+typed gateway client.
+
+## 0.4.0 — 2026-10-27
+
+The service is rewritten in Go at exact 0.3.0 feature parity, as phase R0 of the implementation
+plan. One static `media-runtime` binary (no cgo; `go build ./cmd/media-runtime`) replaces
+`node dist/cli.js`; every HTTP route, error code, configuration field, environment variable,
+CLI command, flag, exit code and `--json` shape is unchanged, and the SQLite schema, pragmas,
+manifest schema 2, file modes and fsync order are those of 0.3.0, so an existing state directory
+is served without migration (tested against a directory the 0.3.0 service wrote). Records keep
+JavaScript's key order and number formatting, so idempotency digests and recipe digests written by
+0.3.0 still match. The only third-party module is `modernc.org/sqlite` (pure Go). The TypeScript
+gateway client moves to its own package, `gateway-client/` (`@media-runtime/gateway-client`);
+the rest of the TypeScript service and its Node test harness are removed, and `go test ./...`
+replaces `npm test`. Behavior fix found while porting: an image-to-image input whose file has
+disappeared before dispatch now fails the job with `input_unavailable` instead of retrying forever.
+No feature beyond 0.3.0 is added. Tested against Engine 0.3.0's fixture
+([compatibility record](docs/compatibility.md)).
 
 Specification revision 0.2.0 builds out every capability revision 0.1.0 deferred: multiple
 outputs per job, upscaling, the conversion provenance workflow, automatic settings with authorized
 fallbacks, linear typed recipes (schema 2), a worker pool for multiple GPUs, distributed workers
 with API network mode, video, audio and the native backend. `docs/implementation-plan.md` orders
 them into releases 0.5.0 through 1.0.0 against the matching Engine releases, after a Go rewrite
-of the service at 0.3.0 parity as 0.4.0. No code changed.
+of the service at 0.3.0 parity as 0.4.0.
 
 ## 0.3.0 — 2026-10-26
 
