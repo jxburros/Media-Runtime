@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.6.0 — 2026-10-27
+
+Linear typed recipes, phase R2 of the implementation plan (worker protocol unchanged: Engine 0.4.0,
+`media-worker/1.2`). **Recipe schema 2** declares typed inputs (`string`, `image`, `number` with a
+range) and up to eight operations, each with a task, model family, input bindings
+(`input:<name>`, `op:<op_id>/<output_id>`), defaults and adapters, plus a `publish` list; bindings
+are checked at registration (no forward references, outputs that exist, types the consuming task
+accepts, required task inputs always bound). Schema-1 recipes are unchanged and are normalized to
+one operation in memory; `GET /v1/recipes/{id}` and `recipes inspect` return any recipe's typed
+declarations, operations and bindings. **Submission**: `models: {op_id: model_id}` (`run
+--model-for OP=MODEL`) selects later operations' models and named inputs are given as `inputs`
+(`run --input NAME=VALUE`); every operation is resolved before admission and errors name it
+(`operations.<op_id>.…`). `POST /v1/jobs/validate` returns the per-operation plan. **Execution**:
+each operation is its own worker execution; its outputs are committed durably (intermediates under
+`outputs/<job>/<op_id>/`) before the next is dispatched, a bound output is uploaded to the worker
+from that copy, the worker reloads only when the load identity changes, cancellation is honored
+between operations, a failed operation fails the job with `error.operation`, and a restart
+reconciles only the current operation's attempt. Jobs gain `operations[]`, `current_operation`
+and, for linear jobs, `current_op_id`, `intermediate_outputs` and stage/progress events carrying
+`op_id`, `operation_index` and `operation_count`; the dashboard shows `op_id/stage`. Manifest
+schema 4 for linear jobs lists every operation and output; schema-1 jobs keep schema 3. Jobs written
+by 0.5.0 and earlier are read as one operation (running ones are reconciled through the same
+attempt); their API shape, events and manifests are unchanged. Cleanup also expires intermediates
+and the committed operation outputs of jobs that failed later. The gateway client gains recipe,
+operation and linear-job types. The CLI test no longer lists the `upscaler` catalog handle against
+an Engine fixture that does not create it, which made `models inspect` exit 2 against Engine
+0.3.0 (so the 0.5.0 row recording a pass against that Engine was wrong for the CLI package).
+Tested against Engine 0.4.0's and 0.5.0's fixtures and, for the 1.1 path, Engine 0.3.0's
+([compatibility record](docs/compatibility.md)). Companion Studio task: map native-workflow inputs
+from `GET /v1/recipes/{id}` and import a linear job's published outputs.
+
 ## 0.5.0 — 2026-10-27
 
 Worker protocol `media-worker/1.2` (Engine 0.4.0), phase R1 of the implementation plan. Runtime

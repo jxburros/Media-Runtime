@@ -128,6 +128,9 @@ func (c *Client) Model(modelID string, verify bool) (any, error) {
 	}
 	return c.JSON("/v1/models/"+esc(modelID)+suffix, "GET", nil)
 }
+func (c *Client) Recipe(recipeID string) (*jsonv.Object, error) {
+	return c.Obj("/v1/recipes/"+esc(recipeID), "GET", nil)
+}
 func (c *Client) Catalog(handle string) (any, error) {
 	path := "/v1/catalog"
 	if handle != "" {

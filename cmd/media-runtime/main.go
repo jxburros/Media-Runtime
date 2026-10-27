@@ -34,7 +34,8 @@ media-runtime recipes register recipe.json | recipes list | recipes inspect port
 media-runtime adapters register adapter.json | adapters list
 media-runtime inputs upload image.png | inputs list | inputs delete INPUT
 media-runtime run RECIPE --model MODEL [--prompt TEXT] [--image FILE|INPUT] [--strength S] [--adapter ID[:SCALE]]... [--seed N] [--count N]
-                   [--tile N] [--tile-overlap N] [--precision P|auto] [--fallback cpu|lower_precision]... [--wait] [--json]
+                   [--tile N] [--tile-overlap N] [--precision P|auto] [--fallback cpu|lower_precision]...
+                   [--model-for OP=MODEL]... [--input NAME=VALUE]... [--wait] [--json]
 media-runtime jobs list | jobs watch JOB | jobs cancel JOB | jobs retry JOB
 media-runtime outputs export JOB --directory DIR
 media-runtime tui
@@ -58,6 +59,8 @@ type options struct {
 	set       map[string]bool
 	adapters  multi
 	fallbacks multi
+	modelFor  multi
+	inputs    multi
 	wait      bool
 	json      bool
 	verify    bool
@@ -77,6 +80,8 @@ func parse(args []string) (*options, []string, error) {
 	}
 	fs.Var(&o.adapters, "adapter", "")
 	fs.Var(&o.fallbacks, "fallback", "")
+	fs.Var(&o.modelFor, "model-for", "")
+	fs.Var(&o.inputs, "input", "")
 	fs.BoolVar(&o.wait, "wait", false, "")
 	fs.BoolVar(&o.json, "json", false, "")
 	fs.BoolVar(&o.verify, "verify", false, "")
@@ -173,7 +178,7 @@ func run(argv []string) error {
 				return err
 			}
 			progress := job.Obj("progress")
-			stamp := string(jsonv.MustMarshal([]any{job.Get("state"), job.Get("stage"), job.Get("cancel_requested"), progress.Get("completed_steps"), progress.Get("completed"), job.Get("applied_fallbacks")}))
+			stamp := string(jsonv.MustMarshal([]any{job.Get("state"), job.Get("stage"), job.Get("cancel_requested"), progress.Get("completed_steps"), progress.Get("completed"), job.Get("applied_fallbacks"), job.Get("current_op_id")}))
 			if stamp != prior {
 				print(job)
 				prior = stamp
@@ -256,14 +261,17 @@ func run(argv []string) error {
 			return nil
 		}
 		if args[0] == "recipes" && at(1) == "inspect" {
-			items, _ := list.([]any)
-			for _, raw := range items {
-				if r, _ := raw.(*jsonv.Object); r.Str("recipe_id") == at(2) {
-					print(r)
-					return nil
-				}
+			// The typed declarations, operations and bindings, for schema 1 and 2 alike.
+			recipe, err := cl.Recipe(at(2))
+			var apiErr *client.Error
+			if errors.As(err, &apiErr) && apiErr.Status == 404 {
+				return errors.New("Recipe not found")
 			}
-			return errors.New("Recipe not found")
+			if err != nil {
+				return err
+			}
+			print(recipe)
+			return nil
 		}
 	}
 	if args[0] == "inputs" {
@@ -358,21 +366,28 @@ func runJob(cl *client.Client, values *options, recipe string, print func(any), 
 			parameters.Set(strings.ReplaceAll(field, "-", "_"), number(v))
 		}
 	}
-	image, hasImage := values.get("image")
-	if hasImage && image != "" && !inputID.MatchString(image) {
-		// A local file is uploaded first; the service never receives a client path.
+	// A local file is uploaded first; the service never receives a client path.
+	upload := func(image string) (string, error) {
+		if image == "" || inputID.MatchString(image) {
+			return image, nil
+		}
 		data, err := os.ReadFile(image)
 		if err != nil {
-			return err
+			return "", err
 		}
 		record, err := cl.UploadInput(data)
 		if err != nil {
-			return err
+			return "", err
 		}
-		image = record.Str("input_id")
 		if !values.json {
 			fmt.Fprintln(os.Stderr, string(jsonv.MustMarshal(jsonv.O("uploaded", record))))
 		}
+		return record.Str("input_id"), nil
+	}
+	image, _ := values.get("image")
+	image, err := upload(image)
+	if err != nil {
+		return err
 	}
 	inputs := jsonv.NewObject()
 	if prompt, ok := values.get("prompt"); ok {
@@ -383,6 +398,31 @@ func runJob(cl *client.Client, values *options, recipe string, print func(any), 
 	}
 	if image != "" {
 		inputs.Set("image", image)
+	}
+	if len(values.inputs) > 0 {
+		// Named inputs of a schema-2 recipe are typed by its declarations.
+		detail, err := cl.Recipe(recipe)
+		if err != nil {
+			return err
+		}
+		for _, entry := range values.inputs {
+			name, value, ok := strings.Cut(entry, "=")
+			if !ok || name == "" {
+				return errors.New("Use --input NAME=VALUE")
+			}
+			switch detail.Obj("inputs").Obj(name).Str("type") {
+			case "number":
+				inputs.Set(name, number(value))
+			case "image":
+				id, err := upload(value)
+				if err != nil {
+					return err
+				}
+				inputs.Set(name, id)
+			default:
+				inputs.Set(name, value)
+			}
+		}
 	}
 	body := jsonv.O("recipe_id", recipe)
 	if model, ok := values.get("model"); ok {
@@ -400,6 +440,17 @@ func runJob(cl *client.Client, values *options, recipe string, print func(any), 
 			list = append(list, use)
 		}
 		body.Set("adapters", list)
+	}
+	if len(values.modelFor) > 0 {
+		models := jsonv.NewObject()
+		for _, entry := range values.modelFor {
+			op, model, ok := strings.Cut(entry, "=")
+			if !ok || op == "" || model == "" {
+				return errors.New("Use --model-for OP=MODEL")
+			}
+			models.Set(op, model)
+		}
+		body.Set("models", models)
 	}
 	backend, _ := values.get("backend")
 	if backend != "" {

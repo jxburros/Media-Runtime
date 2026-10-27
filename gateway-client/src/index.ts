@@ -8,6 +8,10 @@ export type OutputRecord = {
   height?: number;
   /** Seed of this image in a text-to-image batch: seed + k − 1 for output k. */
   seed?: number;
+  /** Linear jobs: the producing operation, the worker's output ID and whether it is published. */
+  op_id?: string;
+  operation_output_id?: string;
+  published?: boolean;
   frames?: number;
   fps?: number;
   duration_seconds?: number;
@@ -20,8 +24,12 @@ export type Fallback = "cpu" | "lower_precision";
 
 export type Submission = {
   recipe_id: string;
+  /** The model of the first operation. */
   model_id: string;
-  inputs: { prompt?: string; negative_prompt?: string; image?: string };
+  /** Schema-2 recipes: the models of later operations by op_id. */
+  models?: Record<string, string>;
+  /** Schema-1 inputs, or the declared inputs of a schema-2 recipe (images are input IDs). */
+  inputs: { prompt?: string; negative_prompt?: string; image?: string } | Record<string, string | number>;
   parameters?: {
     width?: number;
     height?: number;
@@ -50,18 +58,75 @@ export type Submission = {
 
 export type JobState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
+export type Task = "text-to-image" | "image-to-image" | "upscale";
+
+export type InputDeclaration =
+  | { type: "string"; required: boolean; max_length?: number }
+  | { type: "image"; required: boolean }
+  | { type: "number"; required: boolean; minimum?: number; maximum?: number };
+
+/** A recipe operation input: "input:<name>" or "op:<op_id>/<output_id>". */
+export type Binding = { from: string };
+
+export type RecipeOperation = {
+  op_id: string;
+  task: Task;
+  model_family: "sdxl-base" | "esrgan";
+  inputs: Record<string, Binding>;
+  defaults: Record<string, number | string>;
+  adapters?: { adapter_id: string; scale?: number }[];
+};
+
+/** GET /v1/recipes/{id}: any recipe in its schema-2 form, for native-workflow input mapping. */
+export type RecipeDetail = {
+  recipe_id: string;
+  revision: number;
+  /** The registered schema; schema-1 recipes are shown as one operation. */
+  schema_version: 1 | 2;
+  digest: string;
+  inputs: Record<string, InputDeclaration>;
+  operations: RecipeOperation[];
+  /** op_id/output_id entries exposed under the job's outputs. */
+  publish: string[];
+};
+
+export type OperationState = "pending" | "running" | "succeeded" | "failed" | "cancelled";
+
+export type JobOperation = {
+  op_id: string;
+  task: Task;
+  state: OperationState;
+  model: { model_id: string; bundle_digest: string };
+  input_from?: { op_id: string; output_id: string };
+  parameters: Record<string, unknown>;
+  attempt_id?: string;
+  execution_id?: string;
+  outputs: OutputRecord[];
+  error?: { code: string; message: string };
+  [key: string]: unknown;
+};
+
 export type Job = {
   job_id: string;
   state: JobState;
   stage: string | null;
-  task: "text-to-image" | "image-to-image" | "upscale";
+  /** The first operation's task. */
+  task: Task;
   cancel_requested: boolean;
   created_at: string;
   updated_at: string;
   request: Submission;
+  /** Published outputs. */
   outputs: OutputRecord[];
+  /** Linear jobs: committed outputs the recipe does not publish. */
+  intermediate_outputs?: OutputRecord[];
+  operations: JobOperation[];
+  current_operation: number;
+  /** Linear jobs: the operation running now, or the last one run. */
+  current_op_id?: string;
   applied_fallbacks?: Fallback[];
-  error?: { code: string; message: string; [key: string]: unknown };
+  /** `operation` names the failed operation of a linear job. */
+  error?: { code: string; message: string; operation?: string; [key: string]: unknown };
   model: { model_id: string; bundle_digest: string };
   recipe: { recipe_id: string; revision: number; digest: string };
   backend: Record<string, unknown>;
@@ -149,6 +214,9 @@ export class MediaRuntimeClient {
   recipes() {
     return this.json("/v1/recipes");
   }
+  recipe(recipe_id: string): Promise<RecipeDetail> {
+    return this.json(`/v1/recipes/${encodeURIComponent(recipe_id)}`);
+  }
   validate(request: Submission | Record<string, unknown>) {
     return this.json("/v1/jobs/validate", "POST", request);
   }
@@ -176,7 +244,7 @@ export class MediaRuntimeClient {
   manifest(job: string) {
     return this.json(`/v1/jobs/${encodeURIComponent(job)}/manifest`);
   }
-  /** Download one committed output by its ID (image, image_2 …). */
+  /** Download one committed output by its ID (image, image_2 …, or generate__image). */
   output(job: string, output = "image") {
     return this.response(
       `/v1/jobs/${encodeURIComponent(job)}/outputs/${encodeURIComponent(output)}`,

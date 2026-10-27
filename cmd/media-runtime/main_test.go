@@ -41,8 +41,13 @@ type service struct {
 func start(t *testing.T, bin, root, directory string, fixture *integration.Fixture) *service {
 	t.Helper()
 	config := filepath.Join(root, "runtime.config.json")
-	doc := fmt.Sprintf(`{"port":0,"directory":%q,"poll_interval_ms":20,"credentials":[{"token_env":"MEDIA_RUNTIME_TOKEN","namespace":"owner","operator":true}],"artifact_catalog":{"fixture":%q,"upscaler":%q},"worker":{"url":%q,"token_env":"MEDIA_TEST_WORKER_TOKEN"}}`,
-		directory, filepath.Join(root, "model"), filepath.Join(root, "upscaler"), fixture.URL)
+	catalog := fmt.Sprintf(`{"fixture":%q}`, filepath.Join(root, "model"))
+	if _, err := os.Stat(filepath.Join(root, "upscaler")); err == nil {
+		// Only fixtures from Engine 0.4.0 create the upscaler; an absent handle fails inspection.
+		catalog = fmt.Sprintf(`{"fixture":%q,"upscaler":%q}`, filepath.Join(root, "model"), filepath.Join(root, "upscaler"))
+	}
+	doc := fmt.Sprintf(`{"port":0,"directory":%q,"poll_interval_ms":20,"credentials":[{"token_env":"MEDIA_RUNTIME_TOKEN","namespace":"owner","operator":true}],"artifact_catalog":%s,"worker":{"url":%q,"token_env":"MEDIA_TEST_WORKER_TOKEN"}}`,
+		directory, catalog, fixture.URL)
 	if err := os.WriteFile(config, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -301,5 +306,33 @@ func TestCommandLineMultipleOutputsAndUpscale(t *testing.T) {
 	}
 	if _, errText, code := s.cli(t, "run", "enlarge", "--model", "upscaler", "--image", png, "--seed", "3"); code != 2 || !strings.Contains(errText, "no seed") {
 		t.Fatalf("enlarge --seed must be refused: %d %s", code, errText)
+	}
+
+	// A linear recipe: generate, then enlarge, from the shipped example.
+	if _, errText, code := s.cli(t, "recipes", "register", filepath.Join("..", "..", "examples", "recipe.portrait-4k.json")); code != 0 {
+		t.Fatalf("register portrait-4k %d %s", code, errText)
+	}
+	if out, _, code := s.cli(t, "recipes", "inspect", "portrait-4k"); code != 0 || !strings.Contains(out, `"from": "op:generate/image"`) {
+		t.Fatalf("recipes inspect portrait-4k %d %s", code, out)
+	}
+	if _, errText, code := s.cli(t, "run", "portrait-4k", "--model", "fixture", "--prompt", "x"); code != 2 || !strings.Contains(errText, "Select a model for operation enlarge") {
+		t.Fatalf("a missing --model-for must be refused: %d %s", code, errText)
+	}
+	// The default tile is 512; the fixture's 128-pixel result needs no tiling.
+	out, errText, code = s.cli(t, "run", "portrait-4k", "--model", "fixture", "--model-for", "enlarge=upscaler", "--input", "prompt=a harbour",
+		"--width", "64", "--height", "64", "--steps", "3", "--wait", "--json")
+	if code != 0 {
+		t.Fatalf("run portrait-4k %d %s %s", code, out, errText)
+	}
+	linear := lastJSON(t, out)
+	if linear.Str("current_op_id") != "enlarge" || len(linear.Arr("outputs")) != 1 || linear.Arr("outputs")[0].(*jsonv.Object).Get("width") != 128.0 {
+		t.Fatalf("portrait-4k %s", out)
+	}
+	linearExports := filepath.Join(root, "linear")
+	if _, errText, code := s.cli(t, "outputs", "export", linear.Str("job_id"), "--directory", linearExports); code != 0 {
+		t.Fatalf("export portrait-4k %d %s", code, errText)
+	}
+	if entries, _ := os.ReadDir(linearExports); len(entries) != 2 {
+		t.Fatalf("export writes the published image and the manifest, got %d files", len(entries))
 	}
 }

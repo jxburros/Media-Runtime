@@ -11,9 +11,11 @@ and accepts Engine's **owned pipeline** backend behind the unchanged worker prot
 is the Go rewrite of the 0.3.0 TypeScript service at exact feature parity: the API, configuration,
 state directory, manifests and CLI are unchanged, and a 0.3.0 state directory is served as is.
 Release 0.5.0 speaks `media-worker/1.2` and adds multiple outputs per job, upscaling, the
-conversion provenance workflow, and automatic settings with authorized fallbacks. LoRA,
-upscaling, video, multi-GPU and native inference are later stages, specified in the same document and
-sequenced in [docs/implementation-plan.md](docs/implementation-plan.md).
+conversion provenance workflow, and automatic settings with authorized fallbacks. Release 0.6.0
+adds linear typed recipes (schema 2): several operations, each its own worker execution, chained
+through durable intermediate outputs. Multi-GPU pools, remote workers, video, audio and native
+inference are later stages, specified in the same document and sequenced in
+[docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Install and run
 
@@ -127,6 +129,45 @@ the input's and cannot be overridden; prompts, seeds, steps, guidance, `count` a
 refused, no seed is resolved or recorded, and a result larger than the worker's `output_side` limit
 is refused before admission. Progress reports tiles. Real-ESRGAN `.pth` releases must be converted to
 safetensors by the operator first; Runtime never converts weights.
+
+## Linear recipes
+
+A schema-2 recipe declares typed inputs (`string`, `image`, `number` with an optional range) and an
+ordered list of operations. Each operation names its task and model family, binds its inputs from a
+declared input (`input:<name>`) or from an earlier operation's output (`op:<op_id>/<output_id>`), and
+may carry defaults and adapters; `publish` lists the outputs the job exposes (default: the last
+operation's). A `number` input binds to a parameter of the task (for example `strength`).
+[`examples/recipe.portrait-4k.json`](examples/recipe.portrait-4k.json) generates an image and
+enlarges it:
+
+```sh
+media-runtime recipes register examples/recipe.portrait-4k.json
+media-runtime recipes inspect portrait-4k          # typed declarations, operations, bindings
+media-runtime run portrait-4k --model studio-sdxl --model-for enlarge=upscaler \
+  --prompt "a lighthouse at dusk" --wait
+```
+
+`--model` (`model_id`) selects the first operation's model and `--model-for OP=MODEL` (`models`)
+each later one; every operation must resolve to a registered model of its family and to a task the
+worker advertises, and the whole job is resolved before admission, so a problem in any operation
+refuses the submission with the operation named in `error.field` (`operations.<op_id>.…`). The
+submission's `parameters` and `adapters` apply to the first operation, like `model_id`; later
+operations take their recipe defaults, bound number inputs and worker defaults. Named inputs other
+than `prompt`, `negative_prompt` and `image` are given with `--input NAME=VALUE`.
+
+Operations run in order, each as its own worker execution with its own attempt. An operation's
+outputs are verified and committed to durable storage before the next one is dispatched; an output
+feeding a later operation is uploaded to the worker from that durable copy, and the worker reloads
+only when the next operation's bundle, adapters or options differ. `stage` and `progress` events
+carry `op_id`, `operation_index` and `operation_count`; there is no percentage across operations,
+and `jobs watch` and the dashboard show `op_id/stage`. The job lists `operations` with each one's
+state, model, parameters, worker identities and outputs. Published outputs appear under `outputs`
+(under the worker's ID, or `<op_id>__<id>` when two published outputs share one) and are what
+`outputs export` writes; unpublished intermediates are listed under `intermediate_outputs` as
+`<op_id>__<id>`, are served by the same outputs route, and follow the same retention. Cancellation
+between operations stops the job before the next dispatch; a failed operation fails the job with
+`error.operation`; a retry runs every operation again. The manifest (schema 4) lists every
+operation and output. Schema-1 recipes run exactly as before, as one operation.
 
 ## Converted checkpoints
 

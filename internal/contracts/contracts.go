@@ -16,7 +16,7 @@ import (
 	"github.com/jxburros/media-runtime/internal/jsonv"
 )
 
-const VERSION = "0.5.0"
+const VERSION = "0.6.0"
 
 var PROTOCOLS = []string{"media-worker/1.0", "media-worker/1.1", "media-worker/1.2"}
 var PROTOCOL = PROTOCOLS[len(PROTOCOLS)-1]
@@ -128,7 +128,7 @@ var adapterList = Array(AdapterUse, ArrOpts{Max: MaxAdapters})
 var Submission = StrictObject(
 	Field{Name: "recipe_id", Check: ID},
 	Field{Name: "model_id", Check: ID},
-	Field{Name: "inputs", Check: Inputs},
+	Field{Name: "inputs", Check: submissionInputs},
 	Field{Name: "parameters", Check: PartialParameters, Default: func() any { return jsonv.NewObject() }},
 	Field{Name: "adapters", Check: adapterList, Optional: true},
 	Field{Name: "backend_id", Check: Enum(BACKENDS...), Optional: true},
@@ -138,9 +138,12 @@ var Submission = StrictObject(
 	), Optional: true},
 	Field{Name: "retry_of", Check: ID, Optional: true},
 	Field{Name: "authorized_fallbacks", Check: Array(Enum(FALLBACKS...), ArrOpts{Max: len(FALLBACKS)}), Optional: true},
+	// Schema-2 recipes: the models of operations after the first, by operation ID.
+	Field{Name: "models", Check: keyed(opIDPattern, ID), Optional: true},
 )
 
-var RecipeSchema = Refine(StrictObject(
+// recipeSchemaV1 is the schema-1 recipe: one pipeline with its declared inputs and defaults.
+var recipeSchemaV1 = Refine(StrictObject(
 	Field{Name: "schema_version", Check: Literal(1.0)},
 	Field{Name: "recipe_id", Check: ID},
 	Field{Name: "revision", Check: Num(NumOpts{Int: true, GreaterThan: F(0)})},
@@ -162,22 +165,16 @@ var RecipeSchema = Refine(StrictObject(
 	r := v.(*jsonv.Object)
 	inputs, defaults := r.Obj("inputs"), r.Obj("defaults")
 	pipeline := r.Str("pipeline")
-	if r.Str("model_family") != TaskFamily(pipeline) {
+	if r.Str("model_family") != TaskFamily(pipeline) || !defaultsServe(pipeline, defaults, r.Has("adapters")) {
 		return false
 	}
 	switch pipeline {
 	case "image-to-image":
-		return inputs.Has("prompt") && inputs.Has("image") && !defaults.Has("count") && !hasTile(defaults)
+		return inputs.Has("prompt") && inputs.Has("image")
 	case "upscale":
-		// An upscale takes one image; only tiling has defaults and nothing adapts the network.
-		for _, k := range defaults.Keys() {
-			if k != "tile" && k != "tile_overlap" {
-				return false
-			}
-		}
-		return inputs.Has("image") && !inputs.Has("prompt") && !r.Has("adapters")
+		return inputs.Has("image") && !inputs.Has("prompt")
 	}
-	return inputs.Has("prompt") && !inputs.Has("image") && !defaults.Has("strength") && !hasTile(defaults)
+	return inputs.Has("prompt") && !inputs.Has("image")
 }, "inputs")
 
 func hasTile(defaults *jsonv.Object) bool {
