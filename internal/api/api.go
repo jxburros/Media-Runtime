@@ -67,6 +67,7 @@ var (
 	inputPath        = regexp.MustCompile(`^/v1/inputs/(input_[a-f0-9]{32})$`)
 	modelPath        = regexp.MustCompile(`^/v1/models/([a-zA-Z0-9_-]{1,80})$`)
 	recipePath       = regexp.MustCompile(`^/v1/recipes/([a-zA-Z0-9_-]{1,80})$`)
+	workerPattern    = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,80}$`)
 	// Output IDs are the worker's (image, image_2 …) or, for a linear job's intermediates and
 	// colliding published outputs, <op_id>__<output_id>.
 	jobPath = regexp.MustCompile(`^/v1/jobs/(job_[a-f0-9-]+)(?:/(events|cancel|manifest|outputs)(?:/([a-z][a-z0-9_]{0,65}))?)?$`)
@@ -224,6 +225,8 @@ func (s *Server) route(q *request) error {
 				"max_output_bytes", outputLimits(cfg),
 			)).
 			Set("protocols", protocols()))
+	case path == "/v1/workers" && method == "GET":
+		return q.send(200, rt.Workers(namespace))
 	case path == "/v1/catalog" && method == "GET":
 		if err := q.requireOperator(); err != nil {
 			return err
@@ -295,7 +298,8 @@ func (s *Server) route(q *request) error {
 		if err != nil {
 			return err
 		}
-		p, err := rt.Worker.Probe()
+		// Registration validates through the first available worker of the pool.
+		w, p, err := rt.Pool.First()
 		if err != nil {
 			return err
 		}
@@ -303,7 +307,7 @@ func (s *Server) route(q *request) error {
 		if family != "sdxl-base" && (c.Minor(p.Protocol) < 2 || !workerLoads(p.Caps, family)) {
 			return c.Err(503, "unsupported", "The connected worker does not load the "+family+" family", "family")
 		}
-		validation, err := rt.Worker.Obj("/v1/validate", "POST", jsonv.O("protocol", p.Protocol, "bundle", model.Get("bundle"), "options", jsonv.Maybe(p.Caps.Get("load_defaults"))))
+		validation, err := w.Client.Obj("/v1/validate", "POST", jsonv.O("protocol", p.Protocol, "bundle", model.Get("bundle"), "options", jsonv.Maybe(p.Caps.Get("load_defaults"))))
 		if err != nil {
 			return err
 		}
@@ -344,14 +348,14 @@ func (s *Server) route(q *request) error {
 		if err != nil {
 			return err
 		}
-		p, err := rt.Worker.Probe()
+		w, p, err := rt.Pool.First()
 		if err != nil {
 			return err
 		}
 		if !truthy(p.Caps.Get("adapters")) || p.Protocol == c.PROTOCOLS[0] {
 			return c.Err(503, "unsupported", "The connected worker does not advertise LoRA adapters")
 		}
-		validation, err := rt.Worker.Obj("/v1/validate", "POST", jsonv.O("protocol", p.Protocol, "adapters", []any{jsonv.O("adapter", adapter, "scale", 1.0)}))
+		validation, err := w.Client.Obj("/v1/validate", "POST", jsonv.O("protocol", p.Protocol, "adapters", []any{jsonv.O("adapter", adapter, "scale", 1.0)}))
 		if err != nil {
 			return err
 		}
@@ -405,11 +409,16 @@ func (s *Server) route(q *request) error {
 		if err != nil {
 			return err
 		}
+		candidates := []any{}
+		for _, raw := range result.Arr("candidates") {
+			candidates = append(candidates, raw.(*jsonv.Object).Get("worker_id"))
+		}
 		response := jsonv.O(
 			"valid", true,
 			"request", result.Get("request"),
 			"recipe_digest", result.Obj("recipe").Get("digest"),
 			"bundle_digest", result.Obj("model").Obj("bundle").Get("bundle_digest"),
+			"candidate_workers", candidates,
 		)
 		if c.IsLinear(result.Obj("recipe")) {
 			// The per-operation plan: each operation's model, task and effective parameters.
@@ -448,7 +457,11 @@ func (s *Server) route(q *request) error {
 			return c.Err(400, "invalid_pagination", "Use limit 1–200 and a nonnegative cursor")
 		}
 		newest := query.Get("order") == "newest"
-		jobs, ordinals := rt.Store.Page(namespace, newest, int(after), int(limit))
+		workerID := query.Get("worker_id")
+		if query.Has("worker_id") && !workerPattern.MatchString(workerID) {
+			return c.Err(400, "invalid_request", "worker_id must be a worker ID", "worker_id")
+		}
+		jobs, ordinals := rt.Store.Page(namespace, newest, int(after), int(limit), workerID)
 		list := []any{}
 		for _, job := range jobs {
 			list = append(list, PublicJob(job))
@@ -534,11 +547,11 @@ func (s *Server) modelDetail(q *request, modelID string, verify bool) error {
 		if err := q.requireOperator(); err != nil {
 			return err
 		}
-		p, err := rt.Worker.Probe()
+		w, p, err := rt.Pool.First()
 		if err != nil {
 			return err
 		}
-		result, err := rt.Worker.Obj("/v1/validate", "POST", jsonv.O("protocol", p.Protocol, "bundle", bundle, "options", jsonv.Maybe(p.Caps.Get("load_defaults"))))
+		result, err := w.Client.Obj("/v1/validate", "POST", jsonv.O("protocol", p.Protocol, "bundle", bundle, "options", jsonv.Maybe(p.Caps.Get("load_defaults"))))
 		if err != nil {
 			var api *c.ApiError
 			if !errors.As(err, &api) || api.Status >= 500 {

@@ -50,11 +50,14 @@ func (ch *Child) Exited() bool {
 func (ch *Child) Kill(sig syscall.Signal) { _ = ch.Cmd.Process.Signal(sig) }
 
 type Client struct {
-	cfg  *config.Config
-	mu   sync.Mutex
-	url  string
-	tok  string
-	disc string
+	// ID is the configured worker_id this client speaks to.
+	ID    string
+	cfg   *config.Config
+	entry config.Worker
+	mu    sync.Mutex
+	url   string
+	tok   string
+	disc  string
 	// Protocol is the minor negotiated with the current worker session; set by Probe.
 	Protocol string
 	child    *Child
@@ -77,12 +80,15 @@ func (w *Client) hooks() (func(string, string, any, any) (any, error), func(*Pro
 	return w.hookJSON, w.hookProbe
 }
 
-func New(cfg *config.Config) *Client {
+// New is the client of one configured worker; the runtime keeps one per pool entry.
+func New(cfg *config.Config, entry config.Worker) *Client {
 	timeout := time.Duration(cfg.WorkerTimeoutMS) * time.Millisecond
 	return &Client{
+		ID:       entry.WorkerID,
 		cfg:      cfg,
-		url:      strings.TrimSuffix(cfg.Worker.URL, "/"),
-		tok:      os.Getenv(cfg.Worker.TokenEnv),
+		entry:    entry,
+		url:      strings.TrimSuffix(entry.URL, "/"),
+		tok:      os.Getenv(entry.TokenEnv),
 		Protocol: c.PROTOCOLS[0],
 		http: &http.Client{
 			Timeout:       timeout,
@@ -91,6 +97,9 @@ func New(cfg *config.Config) *Client {
 		},
 	}
 }
+
+// Entry is the worker's configuration entry.
+func (w *Client) Entry() config.Worker { return w.entry }
 
 // Child returns the owned process, or nil for an externally managed worker.
 func (w *Client) Child() *Child {
@@ -115,7 +124,7 @@ func (w *Client) DiscoveredSession() string {
 
 // Start launches the configured worker command, or checks the external worker credential.
 func (w *Client) Start() error {
-	command := w.cfg.Worker.Command
+	command := w.entry.Command
 	if len(command) == 0 {
 		if len(w.token()) < 32 {
 			return errors.New("Set the configured worker token environment variable")
@@ -332,7 +341,7 @@ func (w *Client) Probe() (*Probe, error) {
 	w.mu.Lock()
 	w.Protocol = protocol
 	w.mu.Unlock()
-	expected := w.cfg.Worker.BackendID
+	expected := w.entry.BackendID
 	backend := caps.Str("backend_id")
 	if !c.Contains(c.BACKENDS, backend) || (expected != "" && backend != expected) {
 		message := "Supported backends are " + strings.Join(c.BACKENDS, ", ")
@@ -340,6 +349,10 @@ func (w *Client) Probe() (*Probe, error) {
 			message = "Configured backend " + expected + " is not the running worker's backend"
 		}
 		return nil, c.Err(503, "unsupported_backend", message)
+	}
+	// The configured device is a statement of intent; the worker's report is what is recorded.
+	if device := w.entry.Device; device != "" && caps.Str("device") != device {
+		return nil, c.Err(503, "backend_unavailable", "Configured device "+device+" is not worker "+w.ID+"'s device")
 	}
 	p := &Probe{Info: info, Caps: caps, Protocol: protocol}
 	if _, hook := w.hooks(); hook != nil {

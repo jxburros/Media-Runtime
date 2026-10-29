@@ -140,6 +140,8 @@ var Submission = StrictObject(
 	Field{Name: "authorized_fallbacks", Check: Array(Enum(FALLBACKS...), ArrOpts{Max: len(FALLBACKS)}), Optional: true},
 	// Schema-2 recipes: the models of operations after the first, by operation ID.
 	Field{Name: "models", Check: keyed(opIDPattern, ID), Optional: true},
+	// Pins the job to one configured worker of the pool.
+	Field{Name: "worker_id", Check: ID, Optional: true},
 )
 
 // recipeSchemaV1 is the schema-1 recipe: one pipeline with its declared inputs and defaults.

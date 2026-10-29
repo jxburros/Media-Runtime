@@ -1,0 +1,53 @@
+{
+  "directory": ".runtime",
+  "port": 7810,
+  "queue_capacity": 32,
+  "cancellation_grace_ms": 10000,
+  "worker_timeout_ms": 30000,
+  "poll_interval_ms": 250,
+  "output_retention_days": null,
+  "artifact_catalog": {
+    "sdxl-base": "/absolute/path/to/local/sdxl-base",
+    "studio-style-lora": "/absolute/path/to/local/studio-style-lora",
+    "esrgan-x2": "/absolute/path/to/local/esrgan-x2"
+  },
+  "credentials": [
+    {
+      "token_env": "MEDIA_RUNTIME_TOKEN",
+      "namespace": "owner",
+      "operator": true,
+      "allow_fallbacks": true
+    },
+    {
+      "token_env": "MEDIA_STUDIO_TOKEN",
+      "namespace": "studio",
+      "operator": false,
+      "allowed_namespaces": [
+        "studio:*"
+      ]
+    }
+  ],
+  "workers": [
+    {
+      "worker_id": "gpu0",
+      "url": "http://127.0.0.1:7811",
+      "token_env": "MEDIA_ENGINE_TOKEN",
+      "command": ["/absolute/Media-Engine/.venv/bin/media-engine", "--catalog", "/absolute/catalog.json", "--directory", "/absolute/worker-gpu0", "--port", "0", "--device", "cuda:0"],
+      "backend_id": "diffusers-sdxl",
+      "device": "cuda:0",
+      "memory_budget_mb": 22000
+    },
+    {
+      "worker_id": "gpu1",
+      "url": "http://127.0.0.1:7812",
+      "token_env": "MEDIA_ENGINE_TOKEN",
+      "command": ["/absolute/Media-Engine/.venv/bin/media-engine", "--catalog", "/absolute/catalog.json", "--directory", "/absolute/worker-gpu1", "--port", "0", "--device", "cuda:1"],
+      "backend_id": "diffusers-sdxl",
+      "device": "cuda:1",
+      "memory_budget_mb": 22000
+    }
+  ],
+  "strict_devices": true,
+  "allow_reordering": false,
+  "max_input_bytes": 33554432
+}
