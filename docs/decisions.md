@@ -190,3 +190,67 @@ third-party module.
   their output IDs are unchanged; schema 4 manifests and operation-annotated events are written for
   schema-2 recipes. A schema-2 recipe holds at most 8 operations and 16 publish entries.
 - No new dependency; the ledger is unchanged.
+
+# Implementation decisions — 0.7.0
+
+- Configuration: `workers` lists the pool, each entry with `worker_id`, `url`, `token_env`,
+  optional `command`, `backend_id`, `device` and `memory_budget_mb`, with the 0.6.0 defaults for
+  `url` and `token_env`. The 0.6.0 single `worker` object is still accepted and read as a pool of
+  one named `default`; giving both is an error. Worker IDs, configured devices and the URLs of
+  externally managed workers must be distinct. `device` is the operator's expectation only: a
+  worker whose reported device differs is unavailable, and the worker's own report is what jobs
+  record. `memory_budget_mb` is displayed beside the worker's own budget and enforces nothing; the
+  worker's budget remains the one applied.
+- Execution: one scheduler loop per worker, each on its own poll ticker, and at most one running
+  job per worker. Dispatch decisions are taken under the job mutex, so two loops never take the
+  same job; a loop reads the other workers' readiness from their last probe, which is at most one
+  poll interval old and corrects itself on the next probe. Queue capacity stays global.
+- Admission: every configured worker (only the pinned one when `worker_id` is given) is probed and
+  checked against the request's tasks, families, protocol minor, options and fallbacks. The workers
+  that pass are the job's `candidates`, each recorded with the minor it negotiated. The first
+  candidate in configuration order resolves the job and validates its bundles, so a submission
+  hashes its bundles once, not once per worker; with no candidate the first worker's refusal is
+  returned, exactly as a pool of one refuses. An unknown pinned worker is `400 unknown_worker`,
+  field `worker_id`. Every worker must therefore serve the same artifact catalog (same handles,
+  same bytes); a worker that cannot load a bundle fails the job with its own load error.
+  Registration and `models show --verify` validate through the first available worker.
+- Scheduling: the FIFO head goes to an idle, ready, eligible worker whose loaded identity (bundle,
+  load options, adapter set and scales) equals the job's, else to the first idle eligible worker.
+  Eligible means the pinned worker, or a candidate still negotiating at least the minor it did at
+  admission and still advertising every operation's task, family loader and backend. The tie-break
+  among several matching workers, and among several non-matching ones, is configuration order:
+  deterministic, visible in the configuration file (list the preferred device first) and free of
+  hidden state; least-recently-used was rejected because it makes placement depend on history.
+- Reordering default: `allow_reordering` is false, so FIFO is literal. When the head is pinned to
+  a busy worker, or no idle worker can run it, nothing behind it is dispatched even if a worker is
+  free; this can idle a worker and is the documented trade-off for predictable order. With
+  `allow_reordering` a later job may use a worker the head cannot, and the head still takes the
+  first worker it can use.
+- Linear jobs: every operation of a schema-2 job runs on the worker its first operation was
+  dispatched to. The job stays running between operations and so keeps the worker; the next
+  operation reloads there when its load identity differs. Moving an operation to another worker
+  would let unrelated jobs interleave, split one job's reconciliation across sessions and gain
+  nothing for intermediates, which are uploaded from durable storage either way.
+- Device identity: two workers are the same device when their 1.2 `device_identity` has the same
+  `host_id`, `device` and `index` (`pid` is the process, not the device). Workers before 1.2 report
+  no identity and are not compared. With `strict_devices` (default true) a duplicate at start
+  refuses to start the service; with it false, both workers stay configured but unavailable. A
+  duplicate that appears while serving (a worker restarted onto another's device) always makes both
+  unavailable until one changes, since a running service cannot refuse to start.
+- Attribution: a job records `worker_id` (null while queued) and `device_identity` at dispatch, as
+  does every operation's `worker_id`; the worker facts in each operation's `backend` (protocol,
+  device, device identity, ownership, budget, worker version) are refreshed from the dispatching
+  worker, while the capability facts the job was admitted against are kept. The `running`
+  `job_state` event carries `worker_id` and, from 1.2, `device_identity`. Manifests 3 and 4 gain
+  `worker_id` (and schema 4 the job's `device_identity`); their schema numbers are unchanged.
+- Recovery: each worker reconciles only its own running job against its own session, and a lost
+  owned worker interrupts only its job. Jobs written before 0.7.0 that were dispatched read as
+  `worker_id: "default"`; never-dispatched ones have none and may run on any worker. A running job
+  whose worker is no longer configured fails `execution_interrupted` at start; a queued job whose
+  pinned worker or every candidate is no longer configured fails `backend_unavailable` instead of
+  holding the queue.
+- Operator surfaces: `GET /v1/runtime` keeps `worker` (the first worker) and adds `workers`;
+  `doctor` exits 3 when any worker is unavailable. A pool of one keeps the 0.6.0 doctor and
+  dashboard layout exactly; a larger pool prints one section and header line per worker and a
+  worker column.
+- No new dependency; the ledger is unchanged.
