@@ -4,6 +4,7 @@ package client
 
 import (
 	"bytes"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +13,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jxburros/media-runtime/internal/config"
 	"github.com/jxburros/media-runtime/internal/jsonv"
+	"github.com/jxburros/media-runtime/internal/transport"
 )
 
 // Error is a non-2xx API response.
@@ -44,6 +47,35 @@ func New(base, token, namespace string) *Client {
 			return errors.New("redirects are refused")
 		}},
 	}
+}
+
+// Secure checks the transport before any credential is sent: plain http:// only to a loopback
+// address, https:// for anything else. caFile (MEDIA_RUNTIME_CA) is a PEM CA bundle that
+// replaces the system roots for a runtime serving a certificate from a private CA.
+func (c *Client) Secure(caFile string) error {
+	u, err := url.Parse(c.URL)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return errors.New("MEDIA_RUNTIME_URL must be an http:// or https:// URL")
+	}
+	if u.Scheme == "http" {
+		if !config.IsLoopback(u.Hostname()) {
+			return errors.New("MEDIA_RUNTIME_URL must use https:// for a non-loopback runtime; the credential is never sent in clear text")
+		}
+		if caFile != "" {
+			return errors.New("MEDIA_RUNTIME_CA needs an https:// MEDIA_RUNTIME_URL")
+		}
+		return nil
+	}
+	tc := &tls.Config{MinVersion: tls.VersionTLS12}
+	if caFile != "" {
+		roots, err := transport.CertPool(caFile, "MEDIA_RUNTIME_CA")
+		if err != nil {
+			return err
+		}
+		tc.RootCAs = roots
+	}
+	c.http.Transport = &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: tc, ForceAttemptHTTP2: true}
+	return nil
 }
 
 // Response performs a request; body is nil, []byte (sent as given) or a JSON value.

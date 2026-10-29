@@ -52,3 +52,29 @@ func TestMigrateJobAssignsTheLegacyWorker(t *testing.T) {
 		}
 	}
 }
+
+// A remote worker's fingerprint survives a reopen and is kept per worker ID, whatever its URL.
+func TestCertificateFingerprintsPersist(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.CertificateFingerprint("far") != "" {
+		t.Fatal("first contact has no record")
+	}
+	if err := s.RecordCertificateFingerprint("far", "https://10.0.0.2:7811", "aa"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordCertificateFingerprint("far", "https://10.0.0.3:7811", "bb"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if s, err = Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if got := s.CertificateFingerprint("far"); got != "bb" || s.CertificateFingerprint("near") != "" {
+		t.Fatalf("recorded %q", got)
+	}
+}

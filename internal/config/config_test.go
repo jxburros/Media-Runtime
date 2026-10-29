@@ -60,6 +60,94 @@ func TestExampleConfigurationParses(t *testing.T) {
 	}
 }
 
+func TestRemoteExampleParses(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "examples", "runtime.remote.config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := jsonv.Parse(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Parse(raw, tokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := cfg.Pool()
+	if cfg.Bind != "0.0.0.0" || cfg.TLS == nil || cfg.TLS.KeyFile != "/etc/media-runtime/runtime.key" || len(cfg.AllowedOrigins) != 0 ||
+		len(pool) != 2 || pool[0].Remote || !pool[1].Remote || pool[1].TLS.CAFile != "/etc/media-runtime/workers-ca.pem" ||
+		pool[1].TLS.PinnedSHA256 != strings.Repeat("0", 64) || pool[1].RemoteTimeoutMS != 60000 || len(pool[1].Command) != 0 {
+		t.Fatalf("the remote example: %+v %+v", cfg, pool)
+	}
+}
+
+// Remote workers speak mutual TLS and are never owned; a non-loopback API bind needs TLS.
+func TestNetworkModeConfiguration(t *testing.T) {
+	const creds = `"credentials":[{"token_env":"MEDIA_RUNTIME_TOKEN","namespace":"owner"}],"artifact_catalog":{}`
+	const material = `"tls":{"ca_file":"/c/ca.pem","cert_file":"/c/client.pem","key_file":"/c/client.key"}`
+	parse := func(text string) (*Config, error) {
+		raw, err := jsonv.Parse([]byte("{" + creds + "," + text + "}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Parse(raw, tokens)
+	}
+	cfg, err := parse(`"workers":[{"worker_id":"far","url":"https://10.0.0.2:7811",` + material + `}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := cfg.Pool()[0]; !w.Remote || w.TLS.KeyFile != "/c/client.key" || w.TLS.PinnedSHA256 != "" || w.RemoteTimeoutMS != 0 {
+		t.Fatalf("%+v", w)
+	}
+	if cfg.Bind != "127.0.0.1" || cfg.TLS != nil || len(cfg.AllowedOrigins) != 0 {
+		t.Fatalf("API defaults: %+v", cfg)
+	}
+	pin := strings.Repeat("AB", 32)
+	cfg, err = parse(`"worker":{"url":"https://render.internal:7811","remote_timeout_ms":90000,"tls":{"ca_file":"ca.pem","cert_file":"c.pem","key_file":"c.key","pinned_sha256":"` + pin + `"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := cfg.Pool()[0]; w.TLS.PinnedSHA256 != strings.ToLower(pin) || w.RemoteTimeoutMS != 90000 || !filepath.IsAbs(w.TLS.CAFile) {
+		t.Fatalf("%+v", w.TLS)
+	}
+	cfg, err = parse(`"bind":"0.0.0.0","tls":{"cert_file":"/s/runtime.pem","key_file":"/s/runtime.key"},"allowed_origins":["https://Studio.Example","http://localhost:5173"],"worker":{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLS.CertFile != "/s/runtime.pem" || strings.Join(cfg.AllowedOrigins, " ") != "https://studio.example http://localhost:5173" {
+		t.Fatalf("%+v", cfg)
+	}
+	for text, want := range map[string]string{
+		`"workers":[{"worker_id":"far","url":"https://10.0.0.2:7811","command":["engine"],` + material + `}]`:                                            "cannot have a command",
+		`"worker":{"url":"https://127.0.0.1:7811","command":["engine"],` + material + `}`:                                                                "never owns a remote process",
+		`"workers":[{"worker_id":"far","url":"https://10.0.0.2:7811"}]`:                                                                                  "needs tls",
+		`"workers":[{"worker_id":"near","url":"http://127.0.0.1:7811",` + material + `}]`:                                                                "need an https:// worker URL",
+		`"workers":[{"worker_id":"near","url":"http://127.0.0.1:7811","remote_timeout_ms":1000}]`:                                                        "need an https:// worker URL",
+		`"workers":[{"worker_id":"far","url":"https://10.0.0.2:7811/v1",` + material + `}]`:                                                              "https:// URL with tls",
+		`"workers":[{"worker_id":"far","url":"ftp://10.0.0.2:7811",` + material + `}]`:                                                                   "https:// URL with tls",
+		`"workers":[{"worker_id":"far","url":"https://10.0.0.2:7811","tls":{"ca_file":"/c/ca.pem","cert_file":"/c/client.pem"}}]`:                        "workers.0.tls.key_file",
+		`"workers":[{"worker_id":"far","url":"https://10.0.0.2:7811","tls":{"ca_file":"a","cert_file":"b","key_file":"c","pinned_sha256":"sha256:00"}}]`: "workers.0.tls.pinned_sha256",
+		`"workers":[{"worker_id":"far","url":"https://10.0.0.2:7811","remote_timeout_ms":0,` + material + `}]`:                                           "workers.0.remote_timeout_ms",
+		`"bind":"0.0.0.0","worker":{}`:                              "Refusing to listen on non-loopback address 0.0.0.0 without tls",
+		`"bind":"192.168.1.20","worker":{}`:                         "non-loopback",
+		`"bind":"::","worker":{}`:                                   "non-loopback",
+		`"bind":"runtime.local","worker":{}`:                        "Invalid configuration field bind",
+		`"tls":{"cert_file":"a"},"worker":{}`:                       "tls.key_file",
+		`"allowed_origins":["*"],"worker":{}`:                       "allowed_origins.0",
+		`"allowed_origins":["https://studio.example/"],"worker":{}`: "allowed_origins.0",
+	} {
+		if _, err := parse(text); err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: got %v, want %q", text, err, want)
+		}
+	}
+	// Loopback binds stay plain HTTP; TLS there is accepted.
+	for _, text := range []string{`"bind":"127.0.0.1","worker":{}`, `"bind":"::1","worker":{}`, `"bind":"127.0.0.2","tls":{"cert_file":"a","key_file":"b"},"worker":{}`} {
+		if _, err := parse(text); err != nil {
+			t.Fatalf("%s: %v", text, err)
+		}
+	}
+}
+
 func TestConfigurationIsStrict(t *testing.T) {
 	cases := map[string]string{
 		`{"credentials":[{"token_env":"MEDIA_RUNTIME_TOKEN","namespace":"owner"}],"artifact_catalog":{},"worker":{"url":"http://10.0.0.2:7811"}}`:                     "loopback",

@@ -1,0 +1,60 @@
+{
+  "directory": ".runtime",
+  "bind": "0.0.0.0",
+  "port": 7810,
+  "tls": {
+    "cert_file": "/etc/media-runtime/runtime.pem",
+    "key_file": "/etc/media-runtime/runtime.key"
+  },
+  "allowed_origins": [],
+  "queue_capacity": 32,
+  "cancellation_grace_ms": 10000,
+  "worker_timeout_ms": 30000,
+  "poll_interval_ms": 250,
+  "output_retention_days": null,
+  "artifact_catalog": {
+    "sdxl-base": "/absolute/path/to/local/sdxl-base",
+    "esrgan-x2": "/absolute/path/to/local/esrgan-x2"
+  },
+  "credentials": [
+    {
+      "token_env": "MEDIA_RUNTIME_TOKEN",
+      "namespace": "owner",
+      "operator": true
+    },
+    {
+      "token_env": "MEDIA_STUDIO_TOKEN",
+      "namespace": "studio",
+      "operator": false,
+      "allowed_namespaces": [
+        "studio:*"
+      ]
+    }
+  ],
+  "workers": [
+    {
+      "worker_id": "local",
+      "url": "http://127.0.0.1:7811",
+      "token_env": "MEDIA_ENGINE_TOKEN",
+      "command": ["/absolute/Media-Engine/.venv/bin/media-engine", "--catalog", "/absolute/catalog.json", "--directory", "/absolute/worker-local", "--port", "0", "--device", "cuda:0"],
+      "backend_id": "diffusers-sdxl",
+      "device": "cuda:0"
+    },
+    {
+      "worker_id": "render-host",
+      "url": "https://render-host.internal:7811",
+      "token_env": "MEDIA_RENDER_HOST_TOKEN",
+      "backend_id": "diffusers-sdxl",
+      "tls": {
+        "ca_file": "/etc/media-runtime/workers-ca.pem",
+        "cert_file": "/etc/media-runtime/supervisor.pem",
+        "key_file": "/etc/media-runtime/supervisor.key",
+        "pinned_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "remote_timeout_ms": 60000
+    }
+  ],
+  "strict_devices": true,
+  "allow_reordering": false,
+  "max_input_bytes": 33554432
+}

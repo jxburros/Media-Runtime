@@ -3,6 +3,7 @@ package api
 
 import (
 	"crypto/subtle"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ import (
 	c "github.com/jxburros/media-runtime/internal/contracts"
 	"github.com/jxburros/media-runtime/internal/jsonv"
 	"github.com/jxburros/media-runtime/internal/runtime"
+	"github.com/jxburros/media-runtime/internal/transport"
 )
 
 // Server is the runtime's HTTP service. Close ends open event streams before shutting down.
@@ -30,6 +32,10 @@ type Server struct {
 	ln      net.Listener
 	closing chan struct{}
 	once    sync.Once
+	// scheme is "https" when the listener serves TLS; fingerprint is its certificate's SHA-256.
+	scheme      string
+	host        string
+	fingerprint string
 }
 
 func New(rt *runtime.Runtime) *Server { return NewWithTimeouts(rt, 10*time.Second, 30*time.Second) }
@@ -41,11 +47,51 @@ func NewWithTimeouts(rt *runtime.Runtime, header, request time.Duration) *Server
 	return s
 }
 
-// Listen binds the address (port 0 picks a free port) and serves in the background.
+// Listen binds a loopback address (port 0 picks a free port) and serves plain HTTP in the
+// background; it refuses any other address. Serve is the configured listener.
 func (s *Server) Listen(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	if err := config.CheckBind(host, nil); err != nil {
+		return err
+	}
+	return s.listen(addr, nil)
+}
+
+// Serve listens on the configured bind and port: HTTPS with the configured certificate when tls
+// is set, plain HTTP only on loopback. A non-loopback bind without tls is refused before any
+// socket is opened.
+func (s *Server) Serve(bind string, port int, material *config.ServerTLS) error {
+	if bind == "" {
+		bind = config.DefaultBind
+	}
+	if err := config.CheckBind(bind, material); err != nil {
+		return err
+	}
+	var tc *tls.Config
+	if material != nil {
+		var err error
+		if tc, s.fingerprint, err = transport.Server(material.CertFile, material.KeyFile); err != nil {
+			return err
+		}
+	}
+	return s.listen(net.JoinHostPort(bind, fmt.Sprint(port)), tc)
+}
+
+func (s *Server) listen(addr string, tc *tls.Config) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
+	}
+	s.scheme, s.host = "http", "127.0.0.1"
+	if ip := ln.Addr().(*net.TCPAddr).IP; !ip.IsUnspecified() {
+		s.host = ip.String()
+	}
+	if tc != nil {
+		s.scheme = "https"
+		ln = tls.NewListener(ln, tc)
 	}
 	s.ln = ln
 	go func() { _ = s.http.Serve(ln) }()
@@ -54,7 +100,16 @@ func (s *Server) Listen(addr string) error {
 
 func (s *Server) Port() int { return s.ln.Addr().(*net.TCPAddr).Port }
 
-func (s *Server) URL() string { return fmt.Sprintf("http://127.0.0.1:%d", s.Port()) }
+// URL is where a client on this host reaches the API (loopback for a wildcard bind).
+func (s *Server) URL() string {
+	return s.scheme + "://" + net.JoinHostPort(s.host, fmt.Sprint(s.Port()))
+}
+
+// Scheme is "http" or "https".
+func (s *Server) Scheme() string { return s.scheme }
+
+// Fingerprint is the SHA-256 of the API certificate's DER, or "" without TLS.
+func (s *Server) Fingerprint() string { return s.fingerprint }
 
 // Close ends event streams and closes every connection.
 func (s *Server) Close() error {
@@ -160,6 +215,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = q.send(api.Status, jsonv.O("error", body, "request_id", requestID))
 }
 
+// allowedOrigin matches a request's Origin exactly (scheme, host and port) against the
+// configured allow-list; an empty list refuses every browser origin.
+func allowedOrigin(allowed []string, origin string) bool {
+	normalized, ok := config.NormalizeOrigin(origin)
+	if !ok || normalized != strings.ToLower(origin) {
+		return false
+	}
+	for _, a := range allowed {
+		if a == normalized {
+			return true
+		}
+	}
+	return false
+}
+
 func header(r *http.Request, name string) (string, bool) {
 	values, ok := r.Header[http.CanonicalHeaderKey(name)]
 	if !ok {
@@ -175,8 +245,23 @@ func (s *Server) route(q *request) error {
 	path := r.URL.EscapedPath()
 	method := r.Method
 	query := r.URL.Query()
-	if _, ok := header(r, "Origin"); ok {
-		return c.Err(403, "browser_origin_denied", "Use an authenticated application gateway")
+	if origin, ok := header(r, "Origin"); ok {
+		if !allowedOrigin(cfg.AllowedOrigins, origin) {
+			return c.Err(403, "browser_origin_denied", "Use an authenticated application gateway")
+		}
+		// An allow-listed origin may read responses; it still needs a bearer credential.
+		h := q.w.Header()
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Add("Vary", "Origin")
+		h.Set("Access-Control-Expose-Headers", "Retry-After")
+		if method == "OPTIONS" {
+			h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE")
+			h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Media-Namespace, Idempotency-Key, Last-Event-ID")
+			h.Set("Access-Control-Max-Age", "600")
+			q.w.WriteHeader(204)
+			q.sent = true
+			return nil
+		}
 	}
 	if path == "/health" && method == "GET" {
 		return q.send(200, jsonv.O("status", "ok"))
