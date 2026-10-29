@@ -54,6 +54,46 @@ export type Submission = {
   /** Forwarded only for credentials configured with allow_fallbacks. */
   authorized_fallbacks?: Fallback[];
   retry_of?: string;
+  /** Pins the job to one configured worker of the pool; it waits for that worker. */
+  worker_id?: string;
+};
+
+/** The device a 1.2 worker reports; host, device and index name it, pid is the process. */
+export type DeviceIdentity = {
+  device: string;
+  index: number | null;
+  name: string | null;
+  total_memory_mb: number | null;
+  host_id: string;
+  host_id_source?: string;
+  pid: number;
+  [key: string]: unknown;
+};
+
+/** GET /v1/workers: one configured worker of the pool. */
+export type WorkerSummary = {
+  worker_id: string;
+  ready: boolean;
+  state: string | null;
+  protocol: string | null;
+  backend_id: string | null;
+  device: string | null;
+  device_identity: DeviceIdentity | null;
+  configured_device: string | null;
+  configured_memory_budget_mb: number | null;
+  owned_process: boolean;
+  /** The loaded identity: bundle, the registered models with that bundle, options and adapters. */
+  loaded: {
+    bundle_digest: string | null;
+    model_ids: string[];
+    options: Record<string, unknown> | null;
+    adapters: { adapter_id: string | null; digest: string | null; scale: number | null }[];
+  } | null;
+  busy: boolean;
+  /** Set only when the running job belongs to the caller's namespace. */
+  running_job_id: string | null;
+  error?: string;
+  message?: string;
 };
 
 export type JobState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
@@ -101,6 +141,8 @@ export type JobOperation = {
   parameters: Record<string, unknown>;
   attempt_id?: string;
   execution_id?: string;
+  /** The worker the operation ran on; a linear job runs every operation on one worker. */
+  worker_id?: string;
   outputs: OutputRecord[];
   error?: { code: string; message: string };
   [key: string]: unknown;
@@ -125,6 +167,11 @@ export type Job = {
   /** Linear jobs: the operation running now, or the last one run. */
   current_op_id?: string;
   applied_fallbacks?: Fallback[];
+  /** The worker the job was dispatched to (null while queued) and its device identity. */
+  worker_id: string | null;
+  device_identity?: DeviceIdentity | null;
+  /** The workers the job was admitted against, with the minor each negotiated then. */
+  candidates?: { worker_id: string; protocol: string }[];
   /** `operation` names the failed operation of a linear job. */
   error?: { code: string; message: string; operation?: string; [key: string]: unknown };
   model: { model_id: string; bundle_digest: string };
@@ -227,8 +274,12 @@ export class MediaRuntimeClient {
       headers: key ? { "Idempotency-Key": key } : {},
     }).then((r) => r.json());
   }
-  jobs(options: { limit?: number; after?: number; newest?: boolean } = {}) {
+  workers(): Promise<WorkerSummary[]> {
+    return this.json("/v1/workers");
+  }
+  jobs(options: { limit?: number; after?: number; newest?: boolean; worker_id?: string } = {}) {
     const query = new URLSearchParams();
+    if (options.worker_id) query.set("worker_id", options.worker_id);
     if (options.limit) query.set("limit", String(options.limit));
     if (options.after) query.set("after", String(options.after));
     if (options.newest) query.set("order", "newest");

@@ -176,6 +176,27 @@ func slice(s string, start, end int) string {
 	return string(runes[start:end])
 }
 
+// workerLine is one worker's header line: its backend, protocol and device, or its error.
+func workerLine(label string, worker *jsonv.Object) string {
+	if worker == nil {
+		worker = jsonv.NewObject()
+	}
+	if truthy(worker.Get("error")) {
+		message := ""
+		if worker.Get("message") != nil {
+			message = jsString(worker.Get("message"))
+		}
+		return fmt.Sprintf("%s: %s — %s", label, js(worker, "error"), message)
+	}
+	ready := "not ready"
+	if truthy(worker.Get("device_ready")) {
+		ready = "ready"
+	}
+	return fmt.Sprintf("%s: %s (%s) %s  %s  device %s  %s  state %s", label,
+		js(worker, "backend_id"), js(worker, "ownership"), js(worker, "worker_version"), js(worker, "protocol"),
+		js(worker, "device"), ready, js(worker, "state"))
+}
+
 // Render is the pure renderer: state in, screen lines out.
 func Render(state State, columns, rows int) []string {
 	lines := []string{}
@@ -193,20 +214,17 @@ func Render(state State, columns, rows int) []string {
 		version = jsString(rt.Get("runtime_version"))
 	}
 	lines = append(lines, pad(fmt.Sprintf("Media Runtime %s  %s  [q] quit  [j/k] select  [c] cancel  [r] refresh", version, state.UpdatedAt), columns))
-	if truthy(worker.Get("error")) {
-		message := ""
-		if worker.Get("message") != nil {
-			message = jsString(worker.Get("message"))
+	// A pool of one keeps the single worker line; a pool shows one line per worker and a worker
+	// column in the job table.
+	workers := rt.Arr("workers")
+	pool := len(workers) > 1
+	if pool {
+		for _, raw := range workers {
+			w, _ := raw.(*jsonv.Object)
+			lines = append(lines, pad(workerLine("worker "+js(w, "worker_id"), w), columns))
 		}
-		lines = append(lines, pad(fmt.Sprintf("worker: %s — %s", js(worker, "error"), message), columns))
 	} else {
-		ready := "not ready"
-		if truthy(worker.Get("device_ready")) {
-			ready = "ready"
-		}
-		lines = append(lines, pad(fmt.Sprintf("worker: %s (%s) %s  %s  device %s  %s  state %s",
-			js(worker, "backend_id"), js(worker, "ownership"), js(worker, "worker_version"), js(worker, "protocol"),
-			js(worker, "device"), ready, js(worker, "state")), columns))
+		lines = append(lines, pad(workerLine("worker", worker), columns))
 	}
 	models := []string{}
 	for _, raw := range rt.Arr("models") {
@@ -233,11 +251,13 @@ func Render(state State, columns, rows int) []string {
 		num(queue, "running", ""), num(queue, "queued", ""), num(queue, "capacity", ""), modelText,
 		num(estimate, "value_mb", " MiB"), source), columns))
 	lines = append(lines, strings.Repeat("─", columns))
-	const wID, wState, wTask, wModel, wSeed, wCreated = 14, 18, 14, 12, 11, 15
-	lines = append(lines, pad(strings.Join([]string{
-		pad("job", wID), pad("stage", wState), pad("task", wTask), pad("model", wModel),
-		pad("seed", wSeed), pad("created", wCreated), "error / output",
-	}, " "), columns))
+	const wID, wState, wTask, wWorker, wModel, wSeed, wCreated = 14, 18, 14, 10, 12, 11, 15
+	header := []string{pad("job", wID), pad("stage", wState), pad("task", wTask)}
+	if pool {
+		header = append(header, pad("worker", wWorker))
+	}
+	header = append(header, pad("model", wModel), pad("seed", wSeed), pad("created", wCreated), "error / output")
+	lines = append(lines, pad(strings.Join(header, " "), columns))
 	available := rows - len(lines) - 4
 	if available < 1 {
 		available = 1
@@ -292,15 +312,16 @@ func Render(state State, columns, rows int) []string {
 		if s, ok := job.Get("created_at").(string); ok {
 			created = strings.Replace(slice(s, 5, 19), "T", " ", 1)
 		}
-		lines = append(lines, pad(marker+strings.Join([]string{
+		row := []string{
 			pad(slice(job.Str("job_id"), 4, 4+wID-1), wID-1),
 			pad(DescribeStage(job), wState),
 			pad(task, wTask),
-			pad(model, wModel),
-			pad(seed, wSeed),
-			pad(created, wCreated),
-			tail,
-		}, " "), columns))
+		}
+		if pool {
+			row = append(row, pad(job.Str("worker_id"), wWorker))
+		}
+		row = append(row, pad(model, wModel), pad(seed, wSeed), pad(created, wCreated), tail)
+		lines = append(lines, pad(marker+strings.Join(row, " "), columns))
 	}
 	if len(state.Jobs) == 0 {
 		lines = append(lines, pad("  no jobs in this namespace", columns))
@@ -329,6 +350,9 @@ func Render(state State, columns, rows int) []string {
 			where = fmt.Sprintf("output %s (export: media-runtime outputs export %s --directory DIR)", location, js(selected, "job_id"))
 		} else if c.Terminal(selected.Str("state")) {
 			where = "no output"
+		}
+		if pool && selected.Str("worker_id") != "" {
+			backend = selected.Str("worker_id") + " " + backend
 		}
 		detail = fmt.Sprintf("%s  %s  %s×%s steps %s%s  %s", js(selected, "job_id"), backend, js(p, "width"), js(p, "height"), js(p, "steps"), strength, where)
 	}

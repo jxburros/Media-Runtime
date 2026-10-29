@@ -40,12 +40,22 @@ var defaultOutputBytes = map[string]int{
 	"audio/wav":       64 * 1024 * 1024,
 }
 
+// Worker is one configured Engine process on one device.
 type Worker struct {
+	// WorkerID names the worker in jobs, manifests and the API; a legacy single worker is "default".
+	WorkerID  string
 	URL       string
 	TokenEnv  string
 	Command   []string
 	BackendID string
+	// Device is the device the operator expects; informational until the probe confirms it.
+	Device string
+	// MemoryBudgetMB is the operator's per-worker budget (0 when unset); informational.
+	MemoryBudgetMB int
 }
+
+// DefaultWorkerID is the ID a legacy single `worker` entry receives.
+const DefaultWorkerID = "default"
 
 type Config struct {
 	Port                int
@@ -62,8 +72,28 @@ type Config struct {
 	Credentials         []Credential
 	// ArtifactCatalog maps opaque handles to absolute directories, in file order.
 	ArtifactCatalog *jsonv.Object
-	Worker          Worker
+	// Worker is the legacy single worker; Parse sets it to the first pool entry. A configuration
+	// built in process with only Worker is a pool of one (see Pool).
+	Worker  Worker
+	Workers []Worker
+	// StrictDevices refuses to start when two workers report one device identity; Parse
+	// defaults it to true. Otherwise both workers are marked unavailable.
+	StrictDevices bool
+	// AllowReordering lets a later queued job run on a free worker the FIFO head cannot use.
+	AllowReordering bool
 	Tokens          []Token
+}
+
+// Pool is the configured workers in order: Workers, or the single legacy Worker as "default".
+func (cfg *Config) Pool() []Worker {
+	if len(cfg.Workers) > 0 {
+		return cfg.Workers
+	}
+	w := cfg.Worker
+	if w.WorkerID == "" {
+		w.WorkerID = DefaultWorkerID
+	}
+	return []Worker{w}
 }
 
 // DefaultOutputLimits is a fresh copy of the default per-MIME output limits.
@@ -103,13 +133,28 @@ var schema = c.StrictObject(
 		c.Field{Name: "allow_fallbacks", Check: c.Bool(), Default: def(false)},
 	), c.ArrOpts{Min: 1})},
 	c.Field{Name: "artifact_catalog", Check: c.Record(c.Str(c.StrOpts{Refine: filepath.IsAbs}))},
-	c.Field{Name: "worker", Check: c.StrictObject(
+	c.Field{Name: "worker", Check: workerEntry(false), Optional: true},
+	c.Field{Name: "workers", Check: c.Array(workerEntry(true), c.ArrOpts{Min: 1}), Optional: true},
+	c.Field{Name: "strict_devices", Check: c.Bool(), Default: def(true)},
+	c.Field{Name: "allow_reordering", Check: c.Bool(), Default: def(false)},
+)
+
+// workerEntry is one worker's fields; a pool entry must name its worker_id, the legacy single
+// worker may not (it is "default").
+func workerEntry(pool bool) c.Check {
+	fields := []c.Field{}
+	if pool {
+		fields = append(fields, c.Field{Name: "worker_id", Check: c.ID})
+	}
+	return c.StrictObject(append(fields,
 		c.Field{Name: "url", Check: c.Str(c.StrOpts{Refine: func(s string) bool { u, err := url.Parse(s); return err == nil && u.Scheme != "" && u.Host != "" }}), Default: def("http://127.0.0.1:7811")},
 		c.Field{Name: "token_env", Check: c.Str(c.StrOpts{}), Default: def("MEDIA_ENGINE_TOKEN")},
 		c.Field{Name: "command", Check: c.Array(c.Str(c.StrOpts{}), c.ArrOpts{Min: 1}), Optional: true},
 		c.Field{Name: "backend_id", Check: c.Enum(c.BACKENDS...), Optional: true},
-	)},
-)
+		c.Field{Name: "device", Check: c.Str(c.StrOpts{Min: 1, Max: 80}), Optional: true},
+		c.Field{Name: "memory_budget_mb", Check: positive, Optional: true},
+	)...)
+}
 
 // outputLimits accepts the 0.4.0 number (the PNG limit) or a map of the known MIME types.
 var outputLimits c.Check = func(v any, path []string) (any, error) {
@@ -122,6 +167,60 @@ var outputLimits c.Check = func(v any, path []string) (any, error) {
 	}
 	return c.StrictObject(fields...)(v, path)
 }
+
+// workers reads the pool: `workers`, or the legacy single `worker` as a pool of one named
+// "default". Worker IDs, configured devices and external URLs must each be distinct.
+func workers(parsed *jsonv.Object, cfg *Config) error {
+	var entries []any
+	switch {
+	case parsed.Has("worker") && parsed.Has("workers"):
+		return errors.New("Configure either worker or workers, not both")
+	case parsed.Has("workers"):
+		entries = parsed.Arr("workers")
+	case parsed.Has("worker"):
+		entries = []any{parsed.Obj("worker").Clone().Set("worker_id", DefaultWorkerID)}
+	default:
+		return errors.New("Invalid configuration field workers")
+	}
+	ids, devices, urls := map[string]bool{}, map[string]bool{}, map[string]bool{}
+	for _, raw := range entries {
+		o := raw.(*jsonv.Object)
+		w := Worker{WorkerID: o.Str("worker_id"), URL: o.Str("url"), TokenEnv: o.Str("token_env"), BackendID: o.Str("backend_id"),
+			Device: o.Str("device"), MemoryBudgetMB: num(o, "memory_budget_mb")}
+		for _, part := range o.Arr("command") {
+			w.Command = append(w.Command, part.(string))
+		}
+		u, _ := url.Parse(w.URL)
+		host := strings.ToLower(u.Hostname())
+		if u.Scheme != "http" || (host != "127.0.0.1" && host != "localhost" && host != "::1") ||
+			u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || (u.Path != "/" && u.Path != "") {
+			return errors.New("Worker must use an authenticated loopback HTTP URL")
+		}
+		if ids[w.WorkerID] {
+			return fmt.Errorf("Worker IDs must be unique: %s", w.WorkerID)
+		}
+		ids[w.WorkerID] = true
+		if w.Device != "" {
+			if devices[w.Device] {
+				return fmt.Errorf("Device %s is listed for more than one worker", w.Device)
+			}
+			devices[w.Device] = true
+		}
+		// An owned worker announces its own port; an external one is reached at its URL.
+		if len(w.Command) == 0 {
+			address := strings.ToLower(strings.TrimSuffix(w.URL, "/"))
+			if urls[address] {
+				return fmt.Errorf("Workers must use distinct URLs: %s", w.URL)
+			}
+			urls[address] = true
+		}
+		cfg.Workers = append(cfg.Workers, w)
+	}
+	cfg.Worker = cfg.Workers[0]
+	return nil
+}
+
+func num(o *jsonv.Object, k string) int { f, _ := o.Num(k); return int(f) }
 
 // Read loads the file named by the argument, $MEDIA_RUNTIME_CONFIG or runtime.config.json.
 func Read(file string) (*Config, error) {
@@ -152,8 +251,6 @@ func Parse(raw any, env func(string) string) (*Config, error) {
 		}
 		return nil, errors.New("Invalid configuration")
 	}
-	num := func(o *jsonv.Object, k string) int { f, _ := o.Num(k); return int(f) }
-	w := parsed.Obj("worker")
 	cfg := &Config{
 		Port:                num(parsed, "port"),
 		Directory:           parsed.Str("directory"),
@@ -164,7 +261,8 @@ func Parse(raw any, env func(string) string) (*Config, error) {
 		MaxOutputBytes:      DefaultOutputLimits(),
 		MaxInputBytes:       num(parsed, "max_input_bytes"),
 		ArtifactCatalog:     parsed.Obj("artifact_catalog"),
-		Worker:              Worker{URL: w.Str("url"), TokenEnv: w.Str("token_env"), BackendID: w.Str("backend_id")},
+		StrictDevices:       parsed.Bool("strict_devices"),
+		AllowReordering:     parsed.Bool("allow_reordering"),
 	}
 	switch limits := parsed.Get("max_output_bytes").(type) {
 	case float64:
@@ -177,14 +275,8 @@ func Parse(raw any, env func(string) string) (*Config, error) {
 	if days, ok := parsed.Num("output_retention_days"); ok {
 		cfg.OutputRetentionDays = &days
 	}
-	for _, part := range w.Arr("command") {
-		cfg.Worker.Command = append(cfg.Worker.Command, part.(string))
-	}
-	u, _ := url.Parse(cfg.Worker.URL)
-	host := strings.ToLower(u.Hostname())
-	if u.Scheme != "http" || (host != "127.0.0.1" && host != "localhost" && host != "::1") ||
-		u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || (u.Path != "/" && u.Path != "") {
-		return nil, errors.New("Worker must use an authenticated loopback HTTP URL")
+	if err := workers(parsed, cfg); err != nil {
+		return nil, err
 	}
 	seen := map[string]bool{}
 	for _, raw := range parsed.Arr("credentials") {

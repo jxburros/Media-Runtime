@@ -1,5 +1,5 @@
 // Package runtime is the service core: request resolution, durable admission, the FIFO
-// scheduler that drives the worker, output commitment, diagnostics and retention cleanup.
+// scheduler that drives the worker pool, output commitment, diagnostics and retention cleanup.
 package runtime
 
 import (
@@ -19,6 +19,7 @@ import (
 	"github.com/jxburros/media-runtime/internal/config"
 	c "github.com/jxburros/media-runtime/internal/contracts"
 	"github.com/jxburros/media-runtime/internal/jsonv"
+	"github.com/jxburros/media-runtime/internal/pool"
 	"github.com/jxburros/media-runtime/internal/store"
 	"github.com/jxburros/media-runtime/internal/worker"
 )
@@ -26,12 +27,17 @@ import (
 type Runtime struct {
 	Config *config.Config
 	Store  *store.Store
+	// Pool is every configured worker. Worker is the first of them, the only one of a legacy
+	// single-worker configuration.
+	Pool   *pool.Pool
 	Worker *worker.Client
 
-	// mu serializes every read-modify-write of a job between the scheduler and API handlers,
-	// which the single-threaded TypeScript service got from its event loop.
-	mu       sync.Mutex
-	tickMu   sync.Mutex
+	// mu serializes every read-modify-write of a job between the worker loops and API handlers,
+	// which the single-threaded TypeScript service got from its event loop. Dispatch decisions
+	// are taken under it, so two workers never take the same job.
+	mu sync.Mutex
+	// lanes run at most one scheduler step at a time for each worker.
+	lanes    map[string]*sync.Mutex
 	stopping atomic.Bool
 	quit     chan struct{}
 	loop     sync.WaitGroup
@@ -42,45 +48,66 @@ func New(cfg *config.Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runtime{Config: cfg, Store: s, Worker: worker.New(cfg), quit: make(chan struct{})}, nil
+	p := pool.New(cfg)
+	lanes := map[string]*sync.Mutex{}
+	for _, m := range p.Members {
+		lanes[m.ID] = &sync.Mutex{}
+	}
+	return &Runtime{Config: cfg, Store: s, Pool: p, Worker: p.Members[0].Client, lanes: lanes, quit: make(chan struct{})}, nil
 }
 
-// Start launches or checks the worker, then runs the scheduler every poll interval.
+// Start launches or checks every worker, then runs one scheduler loop per worker, each every
+// poll interval.
 func (r *Runtime) Start() error {
-	if err := r.Worker.Start(); err != nil {
+	if err := r.Pool.Start(); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Join(r.Config.Directory, "inputs"), 0o700); err != nil {
 		return err
 	}
-	r.loop.Add(1)
-	go func() {
-		defer r.loop.Done()
-		ticker := time.NewTicker(time.Duration(r.Config.PollIntervalMS) * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-r.quit:
-				return
-			case <-ticker.C:
-				r.Tick()
+	r.unconfigured()
+	for _, m := range r.Pool.Members {
+		r.loop.Add(1)
+		go func(m *pool.Member) {
+			defer r.loop.Done()
+			ticker := time.NewTicker(time.Duration(r.Config.PollIntervalMS) * time.Millisecond)
+			defer ticker.Stop()
+			r.Tick(m)
+			for {
+				select {
+				case <-r.quit:
+					return
+				case <-ticker.C:
+					r.Tick(m)
+				}
 			}
-		}
-	}()
-	r.Tick()
+		}(m)
+	}
 	return nil
 }
 
-// Stop waits for the current tick, stops an owned worker and closes the store.
+// unconfigured fails running jobs whose worker is no longer in the configuration: nothing can
+// reconcile their attempt.
+func (r *Runtime) unconfigured() {
+	for _, job := range r.Store.All("running") {
+		if r.Pool.Get(job.Str("worker_id")) == nil {
+			r.finish(job, "failed", jsonv.O("code", "execution_interrupted", "message", "Worker "+job.Str("worker_id")+" is no longer configured; this job was not regenerated"))
+		}
+	}
+}
+
+// Stop waits for every worker's current step, stops owned workers and closes the store.
 func (r *Runtime) Stop() {
 	if r.stopping.Swap(true) {
 		return
 	}
 	close(r.quit)
 	r.loop.Wait()
-	r.tickMu.Lock()
-	r.tickMu.Unlock()
-	r.Worker.Stop()
+	for _, lane := range r.lanes {
+		lane.Lock()
+		lane.Unlock()
+	}
+	r.Pool.Stop()
 	r.Store.Close()
 }
 
@@ -217,10 +244,15 @@ func forbidden(field, message string) error {
 	return c.Err(400, "invalid_request", message, field)
 }
 
-// Resolve validates a submission against the registries and the live worker. The result is
+// Resolve validates a submission against the registries and the worker pool. The result is
 // the job's task, request, input, adapters, model, recipe and backend, in that order, followed by
-// every operation resolved up front so admission is all-or-nothing. The top-level task, input,
-// adapters, model and backend are those of the first operation.
+// every operation resolved up front so admission is all-or-nothing, and the candidate workers.
+// The top-level task, input, adapters, model and backend are those of the first operation.
+//
+// Every probed worker (or only the pinned one) is checked against the request's tasks, families,
+// protocol minor and options; the workers that pass are the job's candidates. The first candidate
+// in configuration order resolves the job, including the worker's bundle validation. With no
+// candidate the first worker's refusal is returned, exactly as a pool of one refuses.
 func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 	namespace := caller.Namespace
 	request, err := c.Validate(c.Submission, body)
@@ -240,11 +272,55 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 			return nil, err
 		}
 	}
-	p, err := r.Worker.Probe()
+	members := r.Pool.Members
+	if pin := request.Str("worker_id"); pin != "" {
+		m := r.Pool.Get(pin)
+		if m == nil {
+			return nil, c.Err(400, "unknown_worker", "Worker "+pin+" is not configured", "worker_id")
+		}
+		members = []*pool.Member{m}
+	}
+	probes := make([]*worker.Probe, len(members))
+	errs := make([]error, len(members))
+	var wg sync.WaitGroup
+	for i, m := range members {
+		wg.Add(1)
+		go func(i int, m *pool.Member) { defer wg.Done(); probes[i], errs[i] = r.Pool.Probe(m) }(i, m)
+	}
+	wg.Wait()
+	var first error
+	candidates := []any{}
+	primary := -1
+	for i, m := range members {
+		err := errs[i]
+		if err == nil {
+			_, err = r.resolveOn(m, probes[i], request, recipe, model, caller, false)
+		}
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		candidates = append(candidates, jsonv.O("worker_id", m.ID, "protocol", probes[i].Protocol))
+		if primary < 0 {
+			primary = i
+		}
+	}
+	if primary < 0 {
+		return nil, first
+	}
+	resolved, err := r.resolveOn(members[primary], probes[primary], request, recipe, model, caller, true)
 	if err != nil {
 		return nil, err
 	}
-	w := &workerView{info: p.Info, caps: p.Caps, protocol: p.Protocol, minor: c.Minor(p.Protocol)}
+	return resolved.Set("candidates", candidates), nil
+}
+
+// resolveOn resolves a submission against one probed worker; validate also asks the worker to
+// validate every operation's bundle, which hashes it, so only the resolving worker does that.
+func (r *Runtime) resolveOn(m *pool.Member, p *worker.Probe, request, recipe, model *jsonv.Object, caller Caller, validate bool) (*jsonv.Object, error) {
+	w := &workerView{client: m.Client, validate: validate, info: p.Info, caps: p.Caps, protocol: p.Protocol, minor: c.Minor(p.Protocol)}
 	if !truthy(w.info.Get("service_ready")) || !(truthy(w.caps.Get("ready")) || cpuFallbackReady(w.caps, w.protocol, request)) {
 		return nil, c.Err(503, "backend_unavailable", "Worker dependencies or selected device are not ready")
 	}
@@ -254,6 +330,7 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 	inputs := request.Obj("inputs")
 	params := request.Obj("parameters")
 	var plans []*operationPlan
+	var err error
 	if !c.IsLinear(recipe) {
 		if request.Has("models") {
 			return nil, forbidden("models", "models selects later operations of schema-2 recipes")
@@ -325,6 +402,8 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 
 // workerView is the probed worker a submission is resolved against.
 type workerView struct {
+	client     *worker.Client
+	validate   bool
 	info, caps *jsonv.Object
 	protocol   string
 	minor      int
@@ -628,9 +707,11 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 	if len(fallbacks) > 0 {
 		validateBody.Set("authorized_fallbacks", request.Get("authorized_fallbacks"))
 	}
-	validation, err := r.Worker.Obj("/v1/validate", "POST", validateBody)
-	if err != nil {
-		return nil, err
+	validation := jsonv.NewObject()
+	if w.validate {
+		if validation, err = w.client.Obj("/v1/validate", "POST", validateBody); err != nil {
+			return nil, err
+		}
 	}
 	ownership := nullish(caps.Get("ownership"), "reference")
 	backend := jsonv.O(
@@ -802,6 +883,7 @@ func (r *Runtime) Submit(body any, caller Caller, key *string) (*jsonv.Object, e
 			Set("worker_sequence", 0.0).
 			Set("outputs", []any{}).
 			Set("current_operation", 0.0).
+			Set("worker_id", nil).
 			Set("retry_of", jsonv.Maybe(parsed.Get("retry_of")))
 		tx.Insert(job)
 		tx.Event(job, "job_state", jsonv.O("state", "queued"))
@@ -955,29 +1037,33 @@ func annotate(job, op *jsonv.Object, index int, data any) any {
 	return o.Clone().Set("op_id", op.Get("op_id")).Set("operation_index", float64(index)).Set("operation_count", float64(len(Operations(job))))
 }
 
-func (r *Runtime) firstRunning() *jsonv.Object {
-	if running := r.Store.All("running"); len(running) > 0 {
-		return running[0]
+// runningOn is the job running on a worker; each worker runs at most one.
+func (r *Runtime) runningOn(workerID string) *jsonv.Object {
+	for _, job := range r.Store.All("running") {
+		if job.Str("worker_id") == workerID {
+			return job
+		}
 	}
 	return nil
 }
 
-// Tick advances the scheduler by one step; overlapping calls return immediately.
-func (r *Runtime) Tick() {
-	if !r.tickMu.TryLock() {
+// Tick advances one worker's scheduler by one step; overlapping calls return immediately.
+func (r *Runtime) Tick(m *pool.Member) {
+	lane := r.lanes[m.ID]
+	if !lane.TryLock() {
 		return
 	}
-	defer r.tickMu.Unlock()
+	defer lane.Unlock()
 	if r.stopping.Load() {
 		return
 	}
-	err := r.tick()
+	err := r.tick(m)
 	var api *c.ApiError
 	if err == nil || !errors.As(err, &api) {
 		return
 	}
 	// Transient transport errors preserve dispatch identity for reconciliation; never regenerate.
-	if job := r.firstRunning(); job != nil && api.Code != "backend_unavailable" {
+	if job := r.runningOn(m.ID); job != nil && api.Code != "backend_unavailable" {
 		code, message := api.Code, api.Message
 		if api.Status == 404 {
 			code, message = "execution_interrupted", "Worker record is no longer available"
@@ -986,22 +1072,24 @@ func (r *Runtime) Tick() {
 	}
 }
 
-func (r *Runtime) tick() (err error) {
+func (r *Runtime) tick(m *pool.Member) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("scheduler: %v", p)
 		}
 	}()
-	if child := r.Worker.Child(); child != nil && child.Exited() {
-		if interrupted := r.firstRunning(); interrupted != nil {
+	client := m.Client
+	if child := client.Child(); child != nil && child.Exited() {
+		// A lost worker interrupts only its own job.
+		if interrupted := r.runningOn(m.ID); interrupted != nil {
 			r.finish(interrupted, "failed", jsonv.O("code", "execution_interrupted", "message", "Owned worker exited; this job was not regenerated"))
 		}
-		r.Worker.ClearChild()
-		if err := r.Worker.Start(); err != nil {
+		client.ClearChild()
+		if err := client.Start(); err != nil {
 			return err
 		}
 	}
-	p, err := r.Worker.Probe()
+	p, err := r.Pool.Probe(m)
 	if err != nil {
 		return err
 	}
@@ -1009,7 +1097,8 @@ func (r *Runtime) tick() (err error) {
 	session := info.Get("session_id")
 	// Release an operation's worker records only after its durable terminal commit: every
 	// operation of a finished job, and each committed operation of a running linear job. Retry
-	// collection acknowledgements after disconnects.
+	// collection acknowledgements after disconnects. Session IDs are per worker process, so each
+	// worker releases only what it holds.
 	for _, done := range r.Store.All("") {
 		changed := false
 		for _, op := range Operations(done) {
@@ -1019,12 +1108,12 @@ func (r *Runtime) tick() (err error) {
 			}
 			err := func() error {
 				if id := op.Str("execution_id"); id != "" {
-					if _, err := r.Worker.JSON("/v1/executions/"+id, "DELETE", nil, ""); err != nil {
+					if _, err := client.JSON("/v1/executions/"+id, "DELETE", nil, ""); err != nil {
 						return err
 					}
 				}
 				if id := op.Str("worker_input_id"); id != "" {
-					if _, err := r.Worker.JSON("/v1/inputs/"+id, "DELETE", nil, ""); err != nil {
+					if _, err := client.JSON("/v1/inputs/"+id, "DELETE", nil, ""); err != nil {
 						var api *c.ApiError
 						if !errors.As(err, &api) || api.Status != 404 {
 							return err
@@ -1045,26 +1134,30 @@ func (r *Runtime) tick() (err error) {
 			}
 		}
 	}
-	job := r.firstRunning()
+	job := r.runningOn(m.ID)
 	if job == nil {
 		if info.Str("state") != "ready" {
 			return nil
 		}
 		r.mu.Lock()
-		queued := r.Store.All("queued")
-		if len(queued) == 0 || !(truthy(caps.Get("ready")) || cpuFallbackReady(caps, protocol, queued[0].Obj("request"))) {
+		job = r.next(m)
+		if job == nil {
 			r.mu.Unlock()
 			return nil
 		}
-		job = queued[0]
 		err := r.Store.Transaction(func(tx *store.Store) error {
 			job.Set("state", "running")
 			job.Set("stage", nil)
+			attribute(job, m.ID, p)
 			op, _ := current(job)
 			dispatch(op, caps, session)
 			mirror(job)
 			tx.Save(job)
-			tx.Event(job, "job_state", jsonv.O("state", "running"))
+			data := jsonv.O("state", "running", "worker_id", m.ID)
+			if c.Minor(protocol) >= 2 {
+				data.Set("device_identity", jsonv.Maybe(info.Get("device_identity")))
+			}
+			tx.Event(job, "job_state", data)
 			return nil
 		})
 		r.mu.Unlock()
@@ -1086,28 +1179,28 @@ func (r *Runtime) tick() (err error) {
 	}
 	r.refresh(job)
 	grace := time.Duration(r.Config.CancellationGraceMS) * time.Millisecond
-	if truthy(job.Get("cancel_requested")) && r.Worker.Child() != nil {
+	if truthy(job.Get("cancel_requested")) && client.Child() != nil {
 		at, ok := job.Num("cancel_at")
 		if !ok || at == 0 {
 			at = float64(time.Now().UnixMilli())
 		}
 		if time.Since(time.UnixMilli(int64(at))) > grace {
-			r.Worker.Stop()
+			client.Stop()
 			r.finish(job, "failed", jsonv.O("code", "execution_interrupted", "message", "Owned worker was forcibly stopped after the cancellation deadline", "forced_termination", true))
-			return r.Worker.Start()
+			return client.Start()
 		}
 	}
 	backend := op.Obj("backend")
 	if op.Str("dispatch_phase") == "loading" {
 		if opID := op.Str("load_operation_id"); opID != "" {
-			operation, err := r.Worker.Obj("/v1/operations/"+opID, "GET", nil)
+			operation, err := client.Obj("/v1/operations/"+opID, "GET", nil)
 			if err != nil {
 				return err
 			}
 			if operation.Str("state") == "running" {
 				return nil
 			}
-			if _, err := r.Worker.JSON("/v1/operations/"+opID, "DELETE", nil, ""); err != nil {
+			if _, err := client.JSON("/v1/operations/"+opID, "DELETE", nil, ""); err != nil {
 				return err
 			}
 			op.Delete("load_operation_id")
@@ -1139,29 +1232,17 @@ func (r *Runtime) tick() (err error) {
 			return nil
 		}
 		desired := job.Obj("request").Obj("backend_options").Get(backend.Str("backend_id"))
-		identity := []any{}
-		for _, raw := range asArray(op.Get("adapters")) {
-			a := raw.(*jsonv.Object)
-			adapter := a.Obj("adapter")
-			identity = append(identity, jsonv.O("adapter_id", adapter.Get("adapter_id"), "digest", adapter.Get("digest"), "scale", a.Get("scale")))
-		}
 		loaded := info.Obj("loaded_bundle")
-		loadedIdentity := []any{}
-		for _, raw := range asArray(loaded.Get("adapters")) {
-			a, _ := raw.(*jsonv.Object)
-			loadedIdentity = append(loadedIdentity, jsonv.O("adapter_id", jsonv.Maybe(a.Get("adapter_id")), "digest", jsonv.Maybe(a.Get("digest")), "scale", jsonv.Maybe(a.Get("scale"))))
-		}
 		model := op.Obj("model")
-		if loaded == nil || !jsonEqual(loaded.Get("bundle_digest"), model.Obj("bundle").Get("bundle_digest")) ||
-			c.Hash(loaded.Get("options")) != c.Hash(desired) || c.Hash(loadedIdentity) != c.Hash(identity) {
+		if !loadMatches(info, job, op) {
 			body := jsonv.O("protocol", protocol, "bundle", model.Get("bundle"), "options", desired)
-			if len(identity) > 0 {
+			if len(asArray(op.Get("adapters"))) > 0 {
 				body.Set("adapters", op.Get("adapters"))
 			}
 			if fallbacks := job.Obj("request").Arr("authorized_fallbacks"); len(fallbacks) > 0 {
 				body.Set("authorized_fallbacks", fallbacks)
 			}
-			load, err := r.Worker.Obj("/v1/model/load", "POST", body)
+			load, err := client.Obj("/v1/model/load", "POST", body)
 			if err != nil {
 				return err
 			}
@@ -1193,7 +1274,7 @@ func (r *Runtime) tick() (err error) {
 	var snapshot *jsonv.Object
 	if op.Str("execution_id") == "" {
 		// Query the same session before resending an ambiguous acceptance. A retry uses the SAME attempt.
-		snapshot, err = r.Worker.Obj("/v1/executions?attempt_id="+url.QueryEscape(op.Str("attempt_id")), "GET", nil)
+		snapshot, err = client.Obj("/v1/executions?attempt_id="+url.QueryEscape(op.Str("attempt_id")), "GET", nil)
 		if err != nil {
 			var api *c.ApiError
 			if !errors.As(err, &api) || api.Status != 404 {
@@ -1212,7 +1293,7 @@ func (r *Runtime) tick() (err error) {
 					if err != nil {
 						return err
 					}
-					uploaded, err := r.Worker.JSON("/v1/inputs", "POST", bytes, "image/png")
+					uploaded, err := client.JSON("/v1/inputs", "POST", bytes, "image/png")
 					if err != nil {
 						return err
 					}
@@ -1227,7 +1308,7 @@ func (r *Runtime) tick() (err error) {
 				}
 				inputs.Set("image", op.Get("worker_input_id"))
 			}
-			snapshot, err = r.Worker.Obj("/v1/executions", "POST", jsonv.O(
+			snapshot, err = client.Obj("/v1/executions", "POST", jsonv.O(
 				"protocol", protocol,
 				"attempt_id", op.Get("attempt_id"),
 				"bundle_digest", op.Obj("model").Obj("bundle").Get("bundle_digest"),
@@ -1246,12 +1327,12 @@ func (r *Runtime) tick() (err error) {
 		if err := r.save(job, nil); err != nil {
 			return err
 		}
-	} else if snapshot, err = r.Worker.Obj("/v1/executions/"+op.Str("execution_id"), "GET", nil); err != nil {
+	} else if snapshot, err = client.Obj("/v1/executions/"+op.Str("execution_id"), "GET", nil); err != nil {
 		return err
 	}
 	r.refresh(job)
 	if truthy(job.Get("cancel_requested")) && !c.Terminal(snapshot.Str("state")) {
-		if snapshot, err = r.Worker.Obj("/v1/executions/"+op.Str("execution_id")+"/cancel", "POST", jsonv.NewObject()); err != nil {
+		if snapshot, err = client.Obj("/v1/executions/"+op.Str("execution_id")+"/cancel", "POST", jsonv.NewObject()); err != nil {
 			return err
 		}
 	}
@@ -1286,7 +1367,7 @@ func (r *Runtime) tick() (err error) {
 	}
 	switch snapshot.Str("state") {
 	case "succeeded":
-		return r.commitOutputs(job, snapshot)
+		return r.commitOutputs(client, job, snapshot)
 	case "failed":
 		code := snapshot.Obj("error").Str("code")
 		if code == "" {
@@ -1461,7 +1542,7 @@ func isDigits(s string) bool {
 // the next operation is dispatched; after the last operation the manifest and the database are
 // written in that order, success is recorded only after everything is durable, and a partial set
 // is output_unavailable.
-func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
+func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Object) error {
 	directory := r.OutputDirectory(job.Str("job_id"))
 	op, index := current(job)
 	linear := c.IsLinear(job.Obj("recipe"))
@@ -1517,7 +1598,7 @@ func (r *Runtime) commitOutputs(job, snapshot *jsonv.Object) error {
 			if check == nil || limit == 0 || !isInt(output.Get("size")) || size < 1 || size > float64(limit) {
 				return errors.New("invalid output")
 			}
-			res, err := r.Worker.Response("/v1/executions/"+op.Str("execution_id")+"/outputs/"+id, "GET", nil, "")
+			res, err := client.Response("/v1/executions/"+op.Str("execution_id")+"/outputs/"+id, "GET", nil, "")
 			if err != nil {
 				return err
 			}
@@ -1695,6 +1776,7 @@ func (r *Runtime) manifest(job, op, snapshot *jsonv.Object, committed []any, sca
 		"inputs", inputs,
 		"adapters", manifestAdapters(op),
 		"backend", backend,
+		"worker_id", nullish(job.Get("worker_id")),
 		"device_identity", nullish(backend.Get("device_identity")),
 		"resolved_options", nullish(backend.Get("resolved_options"), backend.Get("options")),
 		"resolutions", nullish(backend.Get("resolutions"), []any{}),
@@ -1743,6 +1825,7 @@ func (r *Runtime) linearManifest(job *jsonv.Object) *jsonv.Object {
 			"adapters", manifestAdapters(op),
 			"parameters", op.Get("parameters"),
 			"backend", backend,
+			"worker_id", nullish(op.Get("worker_id"), job.Get("worker_id")),
 			"device_identity", nullish(backend.Get("device_identity")),
 			"resolved_options", nullish(backend.Get("resolved_options"), backend.Get("options")),
 			"resolutions", nullish(backend.Get("resolutions"), []any{}),
@@ -1762,6 +1845,8 @@ func (r *Runtime) linearManifest(job *jsonv.Object) *jsonv.Object {
 		"job_id", job.Get("job_id"),
 		"recipe", job.Get("recipe"),
 		"request", job.Get("request"),
+		"worker_id", nullish(job.Get("worker_id")),
+		"device_identity", nullish(job.Get("device_identity")),
 		"inputs", inputs,
 		"operations", operations,
 		"outputs", job.Get("outputs"),
@@ -1787,19 +1872,21 @@ func exists(path string) bool {
 	return err == nil
 }
 
-// Doctor is the diagnostic report behind `doctor` and GET /v1/runtime.
-func (r *Runtime) Doctor() (*jsonv.Object, error) {
+// workerReport is one worker's section of the diagnostic report.
+func workerReport(view pool.View) *jsonv.Object {
+	m := view.Member
 	var w *jsonv.Object
-	p, err := r.Worker.Probe()
-	if err == nil {
+	if view.Ready() {
+		p := view.Probe
 		info, caps := p.Info, p.Caps
 		w = jsonv.O(
+			"worker_id", m.ID,
 			"protocol", p.Protocol,
 			"supported_protocols", nullish(info.Get("supported_protocols"), []any{info.Get("protocol")}),
 			"worker_version", jsonv.Maybe(info.Get("worker_version")),
 			"backend_id", caps.Get("backend_id"),
 			"ownership", nullish(caps.Get("ownership"), "reference"),
-			"owned_process", len(r.Config.Worker.Command) > 0,
+			"owned_process", len(m.Config.Command) > 0,
 			"session_id", jsonv.Maybe(info.Get("session_id")),
 			"state", jsonv.Maybe(info.Get("state")),
 			"service_ready", jsonv.Maybe(info.Get("service_ready")),
@@ -1822,14 +1909,42 @@ func (r *Runtime) Doctor() (*jsonv.Object, error) {
 			w.Set("fallbacks", nullish(caps.Get("fallbacks"), []any{}))
 			w.Set("applied_fallbacks", nullish(info.Obj("loaded_bundle").Get("applied_fallbacks"), []any{}))
 		}
+		w.Set("ready", truthy(info.Get("service_ready")) && truthy(caps.Get("ready")))
 	} else {
 		code, message := "backend_unavailable", "Worker is unavailable"
 		var api *c.ApiError
-		if errors.As(err, &api) {
+		if errors.As(view.Err, &api) {
 			code, message = api.Code, api.Message
 		}
-		w = jsonv.O("error", code, "message", message)
+		w = jsonv.O("worker_id", m.ID, "error", code, "message", message, "owned_process", len(m.Config.Command) > 0, "ready", false)
+		if view.Conflict != "" {
+			w.Set("duplicate_of", view.Conflict)
+		}
 	}
+	// The operator's statement of intent, beside what the worker reports.
+	w.Set("configured_device", nullish(m.Config.Device))
+	var budget any
+	if m.Config.MemoryBudgetMB > 0 {
+		budget = float64(m.Config.MemoryBudgetMB)
+	}
+	w.Set("configured_memory_budget_mb", budget)
+	return w
+}
+
+// Doctor is the diagnostic report behind `doctor` and GET /v1/runtime: `worker` is the first
+// configured worker (the only one of a legacy configuration) and `workers` lists every one.
+func (r *Runtime) Doctor() (*jsonv.Object, error) {
+	views := r.Pool.ProbeAll()
+	reports := []any{}
+	loadedOn := map[string][]any{}
+	for _, view := range views {
+		report := workerReport(view)
+		reports = append(reports, report)
+		if digest, ok := report.Get("loaded_bundle_digest").(string); ok {
+			loadedOn[digest] = append(loadedOn[digest], view.Member.ID)
+		}
+	}
+	w := reports[0].(*jsonv.Object)
 	available, err := statfs(r.Config.Directory)
 	if err != nil {
 		return nil, err
@@ -1863,7 +1978,8 @@ func (r *Runtime) Doctor() (*jsonv.Object, error) {
 			"bundle_digest", bundle.Get("bundle_digest"),
 			"available", len(missing) == 0,
 			"missing_roles", roles,
-			"loaded", jsonEqual(w.Get("loaded_bundle_digest"), bundle.Get("bundle_digest")) && w.Has("loaded_bundle_digest"),
+			"loaded", len(loadedOn[bundle.Str("bundle_digest")]) > 0,
+			"loaded_on", append([]any{}, loadedOn[bundle.Str("bundle_digest")]...),
 		))
 	}
 	adapters := []any{}
@@ -1911,6 +2027,7 @@ func (r *Runtime) Doctor() (*jsonv.Object, error) {
 		"runtime_version", c.VERSION,
 		"protocols", protocols,
 		"worker", w,
+		"workers", reports,
 		"models", models,
 		"adapters", adapters,
 		"recipes", recipes,
@@ -1918,6 +2035,66 @@ func (r *Runtime) Doctor() (*jsonv.Object, error) {
 		"queue", jsonv.O("capacity", float64(r.Config.QueueCapacity), "queued", float64(queued), "running", float64(running)),
 		"queue_capacity", float64(r.Config.QueueCapacity),
 	), nil
+}
+
+// Workers is GET /v1/workers: every configured worker with its device identity, readiness and
+// loaded identity, whether it is running a job, and that job's ID only when the job belongs to
+// the caller's namespace.
+func (r *Runtime) Workers(namespace string) []any {
+	views := r.Pool.ProbeAll()
+	running := map[string]*jsonv.Object{}
+	for _, job := range r.Store.All("running") {
+		running[job.Str("worker_id")] = job
+	}
+	models := r.Store.RegistryAll("models")
+	list := []any{}
+	for _, view := range views {
+		m := view.Member
+		report := workerReport(view)
+		entry := jsonv.O(
+			"worker_id", m.ID,
+			"ready", report.Get("ready"),
+			"state", nullish(report.Get("state")),
+			"protocol", nullish(report.Get("protocol")),
+			"backend_id", nullish(report.Get("backend_id")),
+			"device", nullish(report.Get("device")),
+			"device_identity", nullish(report.Get("device_identity")),
+			"configured_device", report.Get("configured_device"),
+			"configured_memory_budget_mb", report.Get("configured_memory_budget_mb"),
+			"owned_process", report.Get("owned_process"),
+		)
+		var loaded any
+		if view.Ready() {
+			if bundle := view.Probe.Info.Obj("loaded_bundle"); bundle != nil {
+				ids := []any{}
+				for _, model := range models {
+					if jsonEqual(model.Obj("bundle").Get("bundle_digest"), bundle.Get("bundle_digest")) {
+						ids = append(ids, model.Get("model_id"))
+					}
+				}
+				adapters := []any{}
+				for _, raw := range asArray(bundle.Get("adapters")) {
+					if a, ok := raw.(*jsonv.Object); ok {
+						adapters = append(adapters, jsonv.O("adapter_id", nullish(a.Get("adapter_id")), "digest", nullish(a.Get("digest")), "scale", nullish(a.Get("scale"))))
+					}
+				}
+				loaded = jsonv.O("bundle_digest", nullish(bundle.Get("bundle_digest")), "model_ids", ids, "options", nullish(bundle.Get("options")), "adapters", adapters)
+			}
+		}
+		entry.Set("loaded", loaded)
+		job := running[m.ID]
+		entry.Set("busy", job != nil)
+		var jobID any
+		if job != nil && job.Str("namespace") == namespace {
+			jobID = job.Get("job_id")
+		}
+		entry.Set("running_job_id", jobID)
+		if report.Has("error") {
+			entry.Set("error", report.Get("error")).Set("message", report.Get("message"))
+		}
+		list = append(list, entry)
+	}
+	return list
 }
 
 // Cleanup removes expired outputs, including a linear job's intermediates and the committed

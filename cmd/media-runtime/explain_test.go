@@ -56,3 +56,32 @@ func TestDoctorFlagsUnavailableWorkersAndMissingModels(t *testing.T) {
 		t.Fatal(catalog)
 	}
 }
+
+func TestDoctorPrintsOneSectionPerWorker(t *testing.T) {
+	report := obj(t, `{"runtime_version":"0.7.0","protocols":["media-worker/1.2"],
+		"worker":{"worker_id":"gpu0","backend_id":"diffusers-sdxl","ownership":"reference","worker_version":"0.4.0","protocol":"media-worker/1.2","device":"cuda:0","device_ready":true,"state":"ready","tasks":["text-to-image"],"missing_dependencies":[],"dependencies":{},"precisions":["float16"],"memory_budget_mb":null,"memory_estimate":{}},
+		"workers":[
+		  {"worker_id":"gpu0","backend_id":"diffusers-sdxl","ownership":"reference","worker_version":"0.4.0","protocol":"media-worker/1.2","device":"cuda:0","device_ready":true,"state":"ready","tasks":["text-to-image"],"missing_dependencies":[],"dependencies":{},"precisions":["float16"],"memory_budget_mb":null,"memory_estimate":{},
+		   "device_identity":{"name":"RTX 4090","device":"cuda:0","total_memory_mb":24564,"host_id":"0123456789abcdef","pid":11}},
+		  {"worker_id":"gpu1","error":"backend_unavailable","message":"Workers gpu1 and gpu0 report the same device identity"}],
+		"models":[{"model_id":"studio-sdxl","artifact_handle":"sdxl-base","available":true,"missing_roles":[],"loaded":true,"loaded_on":["gpu0"]}],
+		"recipes":[],"storage":{"writable":true,"available_bytes":1073741824,"output_retention_days":null},"queue":{"capacity":32,"queued":0,"running":0}}`)
+	lines, healthy := ExplainDoctor(report)
+	if healthy {
+		t.Fatal("an unavailable pool worker needs attention")
+	}
+	for _, want := range []string{
+		"Worker gpu0: diffusers-sdxl 0.4.0 (reference stage), negotiated media-worker/1.2, externally managed",
+		"  Device identity: RTX 4090 (cuda:0), 24564 MiB, host 0123456789ab, pid 11",
+		"Worker gpu1: UNAVAILABLE (backend_unavailable) — Workers gpu1 and gpu0 report the same device identity",
+		"  Start Media Engine (or set workers[].command) and check its token and port.",
+		"Model studio-sdxl (sdxl-base): all registered files present; loaded in worker gpu0",
+	} {
+		if !contains(lines, want) {
+			t.Fatalf("missing %q in\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+	if contains(lines, "Worker: ") {
+		t.Fatal("a pool has no single worker section")
+	}
+}

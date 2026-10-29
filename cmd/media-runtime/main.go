@@ -35,8 +35,9 @@ media-runtime adapters register adapter.json | adapters list
 media-runtime inputs upload image.png | inputs list | inputs delete INPUT
 media-runtime run RECIPE --model MODEL [--prompt TEXT] [--image FILE|INPUT] [--strength S] [--adapter ID[:SCALE]]... [--seed N] [--count N]
                    [--tile N] [--tile-overlap N] [--precision P|auto] [--fallback cpu|lower_precision]...
-                   [--model-for OP=MODEL]... [--input NAME=VALUE]... [--wait] [--json]
-media-runtime jobs list | jobs watch JOB | jobs cancel JOB | jobs retry JOB
+                   [--model-for OP=MODEL]... [--input NAME=VALUE]... [--worker ID] [--wait] [--json]
+media-runtime jobs list [--worker ID] | jobs watch JOB | jobs cancel JOB | jobs retry JOB
+media-runtime workers list
 media-runtime outputs export JOB --directory DIR
 media-runtime tui
 
@@ -75,7 +76,7 @@ func parse(args []string) (*options, []string, error) {
 	o := &options{strings: map[string]*string{}, set: map[string]bool{}}
 	fs := flag.NewFlagSet("media-runtime", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	for _, name := range []string{"config", "model", "prompt", "negative-prompt", "image", "strength", "seed", "width", "height", "steps", "guidance", "precision", "backend", "directory", "idempotency-key", "count", "tile", "tile-overlap"} {
+	for _, name := range []string{"config", "model", "prompt", "negative-prompt", "image", "strength", "seed", "width", "height", "steps", "guidance", "precision", "backend", "directory", "idempotency-key", "count", "tile", "tile-overlap", "worker"} {
 		o.strings[name] = fs.String(name, "", "")
 	}
 	fs.Var(&o.adapters, "adapter", "")
@@ -178,7 +179,7 @@ func run(argv []string) error {
 				return err
 			}
 			progress := job.Obj("progress")
-			stamp := string(jsonv.MustMarshal([]any{job.Get("state"), job.Get("stage"), job.Get("cancel_requested"), progress.Get("completed_steps"), progress.Get("completed"), job.Get("applied_fallbacks"), job.Get("current_op_id")}))
+			stamp := string(jsonv.MustMarshal([]any{job.Get("state"), job.Get("stage"), job.Get("cancel_requested"), progress.Get("completed_steps"), progress.Get("completed"), job.Get("applied_fallbacks"), job.Get("current_op_id"), job.Get("worker_id")}))
 			if stamp != prior {
 				print(job)
 				prior = stamp
@@ -309,7 +310,8 @@ func run(argv []string) error {
 	if args[0] == "jobs" {
 		switch {
 		case at(1) == "list":
-			list, err := cl.Jobs(0, 0, false)
+			worker, _ := values.get("worker")
+			list, err := cl.WorkerJobs(0, 0, false, worker)
 			if err != nil {
 				return err
 			}
@@ -337,6 +339,14 @@ func run(argv []string) error {
 			print(accepted)
 			return nil
 		}
+	}
+	if args[0] == "workers" && at(1) == "list" {
+		list, err := cl.Workers()
+		if err != nil {
+			return err
+		}
+		print(list)
+		return nil
 	}
 	if directory, ok := values.get("directory"); args[0] == "outputs" && at(1) == "export" && at(2) != "" && ok && directory != "" {
 		return export(cl, at(2), directory, print)
@@ -469,6 +479,9 @@ func runJob(cl *client.Client, values *options, recipe string, print func(any), 
 			list = append(list, f)
 		}
 		body.Set("authorized_fallbacks", list)
+	}
+	if worker, _ := values.get("worker"); worker != "" {
+		body.Set("worker_id", worker)
 	}
 	key, _ := values.get("idempotency-key")
 	accepted, err := cl.Submit(body, key)

@@ -104,13 +104,39 @@ func decodeObject(text string) *jsonv.Object {
 	return o
 }
 
+// LegacyWorkerID is the worker a job written before 0.7.0 ran on: the single configured worker,
+// which a legacy configuration names "default".
+const LegacyWorkerID = "default"
+
 // migrateJob reads a job written before 0.6.0 as a single-operation job: its top-level task,
 // model, inputs, adapters, parameters, backend, worker identities and outputs become operation
-// zero. Nothing is rewritten until the job is next saved.
+// zero. A job written before 0.7.0 that was dispatched ran on the "default" worker; one that never
+// was has no worker yet. Nothing is rewritten until the job is next saved.
 func migrateJob(job *jsonv.Object) *jsonv.Object {
-	if job == nil || job.Has("operations") {
+	if job == nil {
 		return job
 	}
+	if !job.Has("operations") {
+		operationsOf(job)
+	}
+	if !job.Has("worker_id") {
+		dispatched := job.Str("state") == "running" || job.Has("attempt_id")
+		for _, raw := range job.Arr("operations") {
+			if op, ok := raw.(*jsonv.Object); ok && op.Has("attempt_id") {
+				dispatched = true
+			}
+		}
+		var id any
+		if dispatched {
+			id = LegacyWorkerID
+		}
+		job.Set("worker_id", id)
+	}
+	return job
+}
+
+// operationsOf makes a pre-0.6.0 job's top-level operation fields its operation zero.
+func operationsOf(job *jsonv.Object) *jsonv.Object {
 	state := job.Str("state")
 	switch state {
 	case "queued":
@@ -238,14 +264,19 @@ func (s *Store) Get(jobID, namespace string) *jsonv.Object {
 	return migrateJob(s.row("SELECT data FROM jobs WHERE job_id=?", jobID))
 }
 
-// Page is one page of a namespace's jobs with their ordinals.
-func (s *Store) Page(namespace string, newest bool, after, limit int) ([]*jsonv.Object, []int64) {
+// Page is one page of a namespace's jobs with their ordinals; a worker ID keeps only the jobs
+// dispatched to that worker, read after migration so pre-0.7.0 jobs count as "default".
+func (s *Store) Page(namespace string, newest bool, after, limit int, workerID string) ([]*jsonv.Object, []int64) {
 	var rows *sql.Rows
 	var err error
+	bound := limit
+	if workerID != "" {
+		bound = -1
+	}
 	if newest {
-		rows, err = s.q().Query("SELECT ordinal,data FROM jobs WHERE namespace=? ORDER BY ordinal DESC LIMIT ?", namespace, limit)
+		rows, err = s.q().Query("SELECT ordinal,data FROM jobs WHERE namespace=? ORDER BY ordinal DESC LIMIT ?", namespace, bound)
 	} else {
-		rows, err = s.q().Query("SELECT ordinal,data FROM jobs WHERE namespace=? AND ordinal>? ORDER BY ordinal LIMIT ?", namespace, after, limit)
+		rows, err = s.q().Query("SELECT ordinal,data FROM jobs WHERE namespace=? AND ordinal>? ORDER BY ordinal LIMIT ?", namespace, after, bound)
 	}
 	if err != nil {
 		panic(err)
@@ -258,8 +289,15 @@ func (s *Store) Page(namespace string, newest bool, after, limit int) ([]*jsonv.
 		if err := rows.Scan(&ordinal, &data); err != nil {
 			panic(err)
 		}
-		jobs = append(jobs, migrateJob(decodeObject(data)))
+		job := migrateJob(decodeObject(data))
+		if workerID != "" && job.Str("worker_id") != workerID {
+			continue
+		}
+		jobs = append(jobs, job)
 		ordinals = append(ordinals, ordinal)
+		if len(jobs) == limit {
+			break
+		}
 	}
 	return jobs, ordinals
 }

@@ -13,8 +13,9 @@ state directory, manifests and CLI are unchanged, and a 0.3.0 state directory is
 Release 0.5.0 speaks `media-worker/1.2` and adds multiple outputs per job, upscaling, the
 conversion provenance workflow, and automatic settings with authorized fallbacks. Release 0.6.0
 adds linear typed recipes (schema 2): several operations, each its own worker execution, chained
-through durable intermediate outputs. Multi-GPU pools, remote workers, video, audio and native
-inference are later stages, specified in the same document and sequenced in
+through durable intermediate outputs. Release 0.7.0 drives a pool of workers, one Engine process
+per GPU, with one execution per worker. Remote workers, video, audio and native inference are later
+stages, specified in the same document and sequenced in
 [docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Install and run
@@ -59,7 +60,7 @@ media-runtime tui
 Install the binary anywhere on PATH; it has no runtime dependencies. `run` without `--wait` returns
 immediately; closing a CLI, dashboard or browser never cancels an accepted job. `jobs watch`,
 `jobs cancel`, `jobs retry`, `recipes list`, `recipes inspect`, `recipes register`, `inputs upload`,
-`inputs list` and `inputs delete` use the same public API. `--json` produces machine-readable
+`inputs list`, `inputs delete` and `workers list` use the same public API. `--json` produces machine-readable
 records. Exit codes: 0 success, 2 invalid input (and an incomplete `models inspect`), 3 unavailable
 service (and a `doctor` that found problems), 4 a failed/cancelled job when waiting. Explicit retry
 creates a new linked job.
@@ -197,7 +198,7 @@ fails with the worker's code.
 ## Worker ownership
 
 By default the configured Engine is externally managed: Runtime never kills it. To supervise a
-private worker instead, set `worker.command` to an argument array, for example:
+private worker instead, set `worker.command` (or a pool entry's `command`) to an argument array, for example:
 
 ```json
 ["/absolute/Media-Engine/.venv/bin/media-engine", "--catalog", "/absolute/catalog.json", "--directory", "/absolute/worker-data", "--port", "0", "--device", "cuda:0"]
@@ -216,8 +217,36 @@ with multiple outputs, upscaling, loaders, automatic settings, fallbacks and dev
 Engine 0.2.0 and later give `media-worker/1.1` with image-to-image and (Engine 0.3.0) LoRA adapters;
 Engine 0.1.0 gives `media-worker/1.0` with text-to-image only. Every 1.2 feature is refused with
 `unsupported` naming the field against an older worker. There is one
-active execution and at most 32 queued jobs by default; all operational limits are in the config.
+active execution per worker and at most 32 queued jobs by default; all operational limits are in the config.
 Requested model, backend, seed, dimensions, precision and scheduler are never silently changed.
+
+## Worker pool
+
+To use several GPUs, list one Engine process per device under `workers` instead of `worker`
+([`examples/runtime.pool.config.json`](examples/runtime.pool.config.json)). Each entry has a
+`worker_id`, a loopback `url` and `token_env` or an owned `command`, and optionally the expected
+`backend_id`, `device` and `memory_budget_mb`; `device` and the budget are the operator's
+expectations, shown beside what the worker reports, and a worker whose reported device differs from
+`device` is unavailable. The single `worker` object keeps working as a pool of one named `default`.
+Every worker must serve the same artifact catalog (same handles, same bytes).
+
+Each worker runs one job at a time. The oldest queued job goes to an idle, ready worker that already
+has its model, adapters and options loaded, else to the first idle worker (in configuration order)
+that advertises its tasks, model families and protocol minor; list the preferred device first.
+`run --worker ID` (`worker_id`) pins a job to one worker, and it waits for that worker. FIFO is
+literal: while the oldest job waits (for a pinned or unsuitable worker), no later job jumps ahead
+even if another worker is free; set `"allow_reordering": true` to let later jobs use the free
+workers. A linear recipe runs every operation on the worker its first operation started on. Queue
+capacity is shared by the pool.
+
+Two workers on the same device (the same host, device and index in their 1.2 device identity)
+refuse the start; with `"strict_devices": false` the service starts and marks both unavailable.
+Jobs, the `running` event and manifests record `worker_id` and `device_identity`;
+`media-runtime workers list` (`GET /v1/workers`) shows each worker's device identity, readiness,
+loaded model, whether it is busy and, for your namespace's job, its ID; `jobs list --worker ID`
+(`GET /v1/jobs?worker_id=`) filters by worker; `doctor` prints a section per worker and the
+dashboard a line per worker and a worker column. Each worker reconciles its own job after a
+restart, and a crashed owned worker interrupts only the job it was running.
 
 ## Persistence and recovery
 
@@ -259,9 +288,11 @@ the interpreter, default `python3`) and run `go test ./...`.
 The integration tests in `internal/integration` drive the real worker HTTP server using an explicitly
 identified test backend located only in Engine's tests, covering text-to-image, image-to-image, 1.0
 negotiation, restart reconciliation, owned-worker crashes and forced termination, catalog
-inspection, verification and LoRA adapters, and the 1.2 surface (multiple outputs, upscaling,
+inspection, verification and LoRA adapters, the 1.2 surface (multiple outputs, upscaling,
 conversion provenance, automatic precision, authorized fallbacks and a 1.1-pinned fixture's
-refusals; these skip against an Engine fixture older than 0.4.0). `cmd/media-runtime` tests build the binary and drive
+refusals), linear recipes and worker pools of several fixture processes with distinct device
+indexes (concurrency, pinning, affinity, a crashed worker, duplicate devices); these skip against an
+Engine fixture older than 0.4.0, and the legacy single-worker configuration test runs everywhere. `cmd/media-runtime` tests build the binary and drive
 the CLI end to end, including a state directory written by the TypeScript 0.3.0 service
 (`testdata/state-0.3.0`); `internal/tui` and the doctor tests compare rendered text with the
 0.3.0 output. The fixture is not an inference fallback. GPU image quality and hardware

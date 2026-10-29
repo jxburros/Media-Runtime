@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.7.0 — 2026-10-29
+
+Worker pool for multiple GPUs, phase R3 of the implementation plan (worker protocol unchanged:
+Engine 0.4.0, `media-worker/1.2`). **Configuration**: `workers` lists one entry per Engine process
+and device (`worker_id`, `url`, `token_env`, optional `command`, `backend_id`, `device`,
+`memory_budget_mb`); the single `worker` object is still accepted as a pool of one named
+`default`; duplicate worker IDs, devices and external URLs are refused; `strict_devices` (default
+true) refuses to start when two workers report one device identity (host, device and index), and
+otherwise marks both unavailable; `allow_reordering` (default false) keeps FIFO literal.
+**Scheduling**: each worker runs its own scheduler loop with at most one running job; the FIFO head
+goes to an idle ready worker whose loaded identity matches, else to the first idle worker that
+advertises its tasks, families and minor (ties in configuration order), and a head that cannot run
+holds the queue unless reordering is allowed. A submission may pin `worker_id` (`run --worker ID`)
+and then waits for that worker; an unknown worker is `400 unknown_worker`. Admission checks the
+request against every worker, records the passing ones as `candidates` and resolves the job on the
+first of them; `POST /v1/jobs/validate` returns `candidate_workers`. A linear job runs every
+operation on the worker it started on. **Attribution**: jobs record `worker_id` and
+`device_identity` at dispatch (also on each operation and in the `running` `job_state` event), and
+manifests carry `worker_id` (schemas 3 and 4 unchanged). **Recovery**: reconciliation, child-exit
+handling and forced termination are per worker, so a lost worker interrupts only its own job.
+Jobs written by 0.6.0 and earlier read as `worker_id: "default"` when they were dispatched; a job
+whose worker is no longer configured fails instead of blocking the queue. **API and CLI**: `GET
+/v1/workers` (`workers list`) lists each worker's device identity, readiness, loaded identity,
+whether it is busy and, for the caller's namespace only, the running job ID; `GET /v1/runtime` adds
+`workers` beside `worker`; `GET /v1/jobs?worker_id=` (`jobs list --worker ID`) filters by worker;
+`doctor` prints a section per worker and exits 3 when any is unavailable; the dashboard shows one
+header line per worker and a worker column. A pool of one keeps the 0.6.0 output exactly. The
+gateway client gains worker summaries, `worker_id` on submissions, jobs and operations, and
+`candidates`. Example: `examples/runtime.pool.config.json`. Tested against Engine 0.4.0's and
+0.5.0's fixtures (pools of two fixture processes with distinct device indexes) and, for the 1.1
+path, Engine 0.3.0's ([compatibility record](docs/compatibility.md)). Companion Studio task: import
+`worker_id` and the device identity into output provenance.
+
 ## 0.6.0 — 2026-10-27
 
 Linear typed recipes, phase R2 of the implementation plan (worker protocol unchanged: Engine 0.4.0,

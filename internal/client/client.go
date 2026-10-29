@@ -157,7 +157,15 @@ func (c *Client) Submit(request any, key string) (*jsonv.Object, error) {
 }
 
 func (c *Client) Jobs(limit, after int, newest bool) (*jsonv.Object, error) {
+	return c.WorkerJobs(limit, after, newest, "")
+}
+
+// WorkerJobs lists jobs; a non-empty worker ID keeps those dispatched to that worker.
+func (c *Client) WorkerJobs(limit, after int, newest bool, workerID string) (*jsonv.Object, error) {
 	q := url.Values{}
+	if workerID != "" {
+		q.Set("worker_id", workerID)
+	}
 	if limit > 0 {
 		q.Set("limit", strconv.Itoa(limit))
 	}
@@ -173,6 +181,10 @@ func (c *Client) Jobs(limit, after int, newest bool) (*jsonv.Object, error) {
 	}
 	return c.Obj(path, "GET", nil)
 }
+
+// Workers lists the worker pool.
+func (c *Client) Workers() (any, error) { return c.JSON("/v1/workers", "GET", nil) }
+
 func (c *Client) Status(job string) (*jsonv.Object, error) {
 	return c.Obj("/v1/jobs/"+esc(job), "GET", nil)
 }

@@ -33,3 +33,22 @@ func TestMigrateJobReadsOneOperation(t *testing.T) {
 		t.Fatal("migration is not idempotent")
 	}
 }
+
+// A job written before 0.7.0 ran on the single worker, "default"; one never dispatched has none.
+func TestMigrateJobAssignsTheLegacyWorker(t *testing.T) {
+	for text, want := range map[string]any{
+		`{"job_id":"j","state":"succeeded","recipe":{"recipe_id":"portrait"},"request":{},"attempt_id":"a"}`:                      "default",
+		`{"job_id":"j","state":"queued","recipe":{"recipe_id":"portrait"},"request":{}}`:                                          nil,
+		`{"job_id":"j","state":"running","operations":[{"op_id":"a","attempt_id":"x"},{"op_id":"b"}],"current_operation":1}`:      "default",
+		`{"job_id":"j","state":"cancelled","operations":[{"op_id":"a"}],"current_operation":0}`:                                   nil,
+		`{"job_id":"j","state":"running","operations":[{"op_id":"a","attempt_id":"x"}],"current_operation":0,"worker_id":"gpu1"}`: "gpu1",
+	} {
+		raw, err := jsonv.Parse([]byte(text))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job := migrateJob(raw.(*jsonv.Object)); !job.Has("worker_id") || job.Get("worker_id") != want {
+			t.Fatalf("%s: worker_id %v, want %v", text, job.Get("worker_id"), want)
+		}
+	}
+}
