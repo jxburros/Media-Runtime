@@ -100,71 +100,20 @@ func objOrEmpty(o *jsonv.Object) *jsonv.Object {
 func ExplainDoctor(report *jsonv.Object) ([]string, bool) {
 	lines := []string{}
 	healthy := true
-	w := objOrEmpty(report.Obj("worker"))
 	lines = append(lines, fmt.Sprintf("Media Runtime %s; protocols %s", text(report, "runtime_version"), joinList(report.Get("protocols"), ", ")))
-	if truthy(w.Get("error")) {
+	w := objOrEmpty(report.Obj("worker"))
+	// A pool of one keeps the single worker section; a pool prints one section per worker.
+	workers := report.Arr("workers")
+	pool := len(workers) > 1
+	if pool {
+		for _, raw := range workers {
+			entry := objOrEmpty(raw.(*jsonv.Object))
+			if !explainWorker(&lines, entry, "Worker "+text(entry, "worker_id"), "workers[].command") {
+				healthy = false
+			}
+		}
+	} else if !explainWorker(&lines, w, "Worker", "worker.command") {
 		healthy = false
-		lines = append(lines, fmt.Sprintf("Worker: UNAVAILABLE (%s) — %s", text(w, "error"), or(w, "message", "")))
-		lines = append(lines, "  Start Media Engine (or set worker.command) and check its token and port.")
-	} else {
-		process := "externally managed"
-		if truthy(w.Get("owned_process")) {
-			process = "owned child process"
-		}
-		lines = append(lines, fmt.Sprintf("Worker: %s %s (%s stage), negotiated %s, %s", text(w, "backend_id"), text(w, "worker_version"), text(w, "ownership"), text(w, "protocol"), process))
-		ready := "NOT READY"
-		if truthy(w.Get("device_ready")) {
-			ready = "ready"
-		}
-		lines = append(lines, fmt.Sprintf("  Device %s: %s; service state %s; tasks %s", text(w, "device"), ready, text(w, "state"), joinList(w.Get("tasks"), ", ")))
-		if !truthy(w.Get("device_ready")) {
-			healthy = false
-		}
-		if id := w.Obj("device_identity"); id != nil {
-			memory := "memory unknown"
-			if id.Get("total_memory_mb") != nil {
-				memory = text(id, "total_memory_mb") + " MiB"
-			}
-			host := id.Str("host_id")
-			if len(host) > 12 {
-				host = host[:12]
-			}
-			lines = append(lines, fmt.Sprintf("  Device identity: %s (%s), %s, host %s, pid %s", or(id, "name", "unnamed"), or(id, "device", "?"), memory, host, text(id, "pid")))
-		}
-		if loaders := w.Arr("loaders"); len(loaders) > 0 {
-			parts := []string{}
-			for _, raw := range loaders {
-				l := objOrEmpty(raw.(*jsonv.Object))
-				parts = append(parts, fmt.Sprintf("%s (%s)", joinList(l.Get("families"), "/"), text(l, "format")))
-			}
-			lines = append(lines, "  Loaders: "+strings.Join(parts, ", "))
-		}
-		if w.Has("auto_options") || w.Has("fallbacks") {
-			lines = append(lines, fmt.Sprintf("  Automatic options: %s; authorizable fallbacks: %s", orNone(joinList(w.Get("auto_options"), ", ")), orNone(joinList(w.Get("fallbacks"), ", "))))
-		}
-		if missing := w.Arr("missing_dependencies"); len(missing) > 0 {
-			healthy = false
-			lines = append(lines, fmt.Sprintf("  Missing worker dependencies: %s — install the inference extra in Engine's environment.", joinList(missing, ", ")))
-		}
-		deps := []string{}
-		dependencies := w.Obj("dependencies")
-		for _, k := range dependencies.Keys() {
-			deps = append(deps, k+"="+or(dependencies, k, "missing"))
-		}
-		if len(deps) > 0 {
-			lines = append(lines, "  Dependencies: "+strings.Join(deps, " "))
-		}
-		defaults := "undefined"
-		if w.Has("load_defaults") {
-			defaults = string(jsonv.MustMarshal(w.Get("load_defaults")))
-		}
-		lines = append(lines, fmt.Sprintf("  Load defaults: %s; precisions %s; memory budget %s MiB", defaults, joinList(w.Get("precisions"), "/"), or(w, "memory_budget_mb", "not set")))
-		estimate := w.Obj("memory_estimate")
-		if estimate.Get("value_mb") != nil {
-			lines = append(lines, fmt.Sprintf("  Memory estimate: %s MiB parameters at %s (source: %s; %s)", text(estimate, "value_mb"), text(estimate, "precision"), text(estimate, "source"), text(estimate, "uncertainty")))
-		} else {
-			lines = append(lines, fmt.Sprintf(`  Memory estimate: unknown (%s); run "models show MODEL --verify" for a per-model estimate.`, or(estimate, "uncertainty", "no bundle validated yet")))
-		}
 	}
 	models := report.Arr("models")
 	if len(models) == 0 {
@@ -183,6 +132,9 @@ func ExplainDoctor(report *jsonv.Object) ([]string, bool) {
 		loaded := ""
 		if truthy(m.Get("loaded")) {
 			loaded = "; loaded in the worker"
+			if pool {
+				loaded = "; loaded in worker " + joinList(m.Get("loaded_on"), ", ")
+			}
 		}
 		kind := ""
 		if f := m.Str("family"); f != "" && f != "sdxl-base" {
@@ -242,6 +194,78 @@ func ExplainDoctor(report *jsonv.Object) ([]string, bool) {
 		lines = append(lines, "Result: attention needed (see lines marked NOT/MISSING/UNAVAILABLE).")
 	}
 	return lines, healthy
+}
+
+// explainWorker appends one worker's section under its label and reports whether it is healthy.
+func explainWorker(out *[]string, w *jsonv.Object, label, command string) bool {
+	lines := *out
+	healthy := true
+	if truthy(w.Get("error")) {
+		healthy = false
+		lines = append(lines, fmt.Sprintf("%s: UNAVAILABLE (%s) — %s", label, text(w, "error"), or(w, "message", "")))
+		lines = append(lines, "  Start Media Engine (or set "+command+") and check its token and port.")
+	} else {
+		process := "externally managed"
+		if truthy(w.Get("owned_process")) {
+			process = "owned child process"
+		}
+		lines = append(lines, fmt.Sprintf("%s: %s %s (%s stage), negotiated %s, %s", label, text(w, "backend_id"), text(w, "worker_version"), text(w, "ownership"), text(w, "protocol"), process))
+		ready := "NOT READY"
+		if truthy(w.Get("device_ready")) {
+			ready = "ready"
+		}
+		lines = append(lines, fmt.Sprintf("  Device %s: %s; service state %s; tasks %s", text(w, "device"), ready, text(w, "state"), joinList(w.Get("tasks"), ", ")))
+		if !truthy(w.Get("device_ready")) {
+			healthy = false
+		}
+		if id := w.Obj("device_identity"); id != nil {
+			memory := "memory unknown"
+			if id.Get("total_memory_mb") != nil {
+				memory = text(id, "total_memory_mb") + " MiB"
+			}
+			host := id.Str("host_id")
+			if len(host) > 12 {
+				host = host[:12]
+			}
+			lines = append(lines, fmt.Sprintf("  Device identity: %s (%s), %s, host %s, pid %s", or(id, "name", "unnamed"), or(id, "device", "?"), memory, host, text(id, "pid")))
+		}
+		if loaders := w.Arr("loaders"); len(loaders) > 0 {
+			parts := []string{}
+			for _, raw := range loaders {
+				l := objOrEmpty(raw.(*jsonv.Object))
+				parts = append(parts, fmt.Sprintf("%s (%s)", joinList(l.Get("families"), "/"), text(l, "format")))
+			}
+			lines = append(lines, "  Loaders: "+strings.Join(parts, ", "))
+		}
+		if w.Has("auto_options") || w.Has("fallbacks") {
+			lines = append(lines, fmt.Sprintf("  Automatic options: %s; authorizable fallbacks: %s", orNone(joinList(w.Get("auto_options"), ", ")), orNone(joinList(w.Get("fallbacks"), ", "))))
+		}
+		if missing := w.Arr("missing_dependencies"); len(missing) > 0 {
+			healthy = false
+			lines = append(lines, fmt.Sprintf("  Missing worker dependencies: %s — install the inference extra in Engine's environment.", joinList(missing, ", ")))
+		}
+		deps := []string{}
+		dependencies := w.Obj("dependencies")
+		for _, k := range dependencies.Keys() {
+			deps = append(deps, k+"="+or(dependencies, k, "missing"))
+		}
+		if len(deps) > 0 {
+			lines = append(lines, "  Dependencies: "+strings.Join(deps, " "))
+		}
+		defaults := "undefined"
+		if w.Has("load_defaults") {
+			defaults = string(jsonv.MustMarshal(w.Get("load_defaults")))
+		}
+		lines = append(lines, fmt.Sprintf("  Load defaults: %s; precisions %s; memory budget %s MiB", defaults, joinList(w.Get("precisions"), "/"), or(w, "memory_budget_mb", "not set")))
+		estimate := w.Obj("memory_estimate")
+		if estimate.Get("value_mb") != nil {
+			lines = append(lines, fmt.Sprintf("  Memory estimate: %s MiB parameters at %s (source: %s; %s)", text(estimate, "value_mb"), text(estimate, "precision"), text(estimate, "source"), text(estimate, "uncertainty")))
+		} else {
+			lines = append(lines, fmt.Sprintf(`  Memory estimate: unknown (%s); run "models show MODEL --verify" for a per-model estimate.`, or(estimate, "uncertainty", "no bundle validated yet")))
+		}
+	}
+	*out = lines
+	return healthy
 }
 
 // ExplainCatalog describes catalog inspection entries for the installation workflow.

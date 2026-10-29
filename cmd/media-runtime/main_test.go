@@ -172,6 +172,22 @@ func TestCommandLineAgainstTheEngineFixture(t *testing.T) {
 	if out, _, code := s.cli(t, "jobs", "list", "--json"); code != 0 || len(lastJSON(t, out).Arr("jobs")) != 2 {
 		t.Fatalf("jobs list %d %s", code, out)
 	}
+	// A legacy single-worker configuration is a pool of one named "default".
+	out, _, code = s.cli(t, "workers", "list", "--json")
+	if workers, err := jsonv.Parse([]byte(strings.TrimSpace(out))); code != 0 || err != nil || len(workers.([]any)) != 1 ||
+		workers.([]any)[0].(*jsonv.Object).Str("worker_id") != "default" {
+		t.Fatalf("workers list %d %s", code, out)
+	}
+	out, errText, code = s.cli(t, "run", "portrait", "--model", "fixture", "--prompt", "pinned", "--width", "64", "--height", "64", "--steps", "3", "--worker", "default", "--wait", "--json")
+	if code != 0 || lastJSON(t, out).Str("worker_id") != "default" {
+		t.Fatalf("run --worker %d %s %s", code, out, errText)
+	}
+	if _, errText, code := s.cli(t, "run", "portrait", "--model", "fixture", "--prompt", "x", "--worker", "gpu9"); code != 2 || !strings.Contains(errText, "Worker gpu9 is not configured") {
+		t.Fatalf("an unknown worker exits 2, got %d %s", code, errText)
+	}
+	if out, _, code := s.cli(t, "jobs", "list", "--worker", "default", "--json"); code != 0 || len(lastJSON(t, out).Arr("jobs")) != 3 {
+		t.Fatalf("jobs list --worker %d %s", code, out)
+	}
 	// The state directory belongs to one live service.
 	second := exec.Command(bin, "serve", "--config", filepath.Join(root, "runtime.config.json"))
 	second.Env = append(os.Environ(), "MEDIA_RUNTIME_TOKEN="+token, "MEDIA_TEST_WORKER_TOKEN="+integration.WorkerToken)

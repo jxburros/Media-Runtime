@@ -71,3 +71,21 @@ func TestDashboardMatchesTheTypeScriptLayout(t *testing.T) {
 		t.Fatalf("got\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
 	}
 }
+
+func TestDashboardShowsEachWorkerOfAPool(t *testing.T) {
+	job := parse(t, running).Set("worker_id", "gpu1")
+	rt := parse(t, `{"runtime_version":"0.7.0","worker":{"worker_id":"gpu0"},"workers":[
+		{"worker_id":"gpu0","backend_id":"diffusers-sdxl","ownership":"reference","worker_version":"0.4.0","protocol":"media-worker/1.2","device":"cuda:0","device_ready":true,"state":"ready"},
+		{"worker_id":"gpu1","backend_id":"owned-sdxl","ownership":"owned-pipeline","worker_version":"0.4.0","protocol":"media-worker/1.2","device":"cuda:1","device_ready":true,"state":"busy"}],
+		"queue":{"running":1,"queued":0,"capacity":32},"models":[]}`)
+	lines := Render(State{Runtime: rt, Jobs: []*jsonv.Object{job}}, 132, 12)
+	text := strings.Join(lines, "\n")
+	for _, want := range []string{"worker gpu0: diffusers-sdxl (reference)", "worker gpu1: owned-sdxl (owned-pipeline)", "device cuda:1", "image-to-image gpu1"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in\n%s", want, text)
+		}
+	}
+	if !strings.HasPrefix(lines[5], "job ") || !strings.Contains(lines[5], "worker") {
+		t.Fatalf("no worker column: %q", lines[5])
+	}
+}
