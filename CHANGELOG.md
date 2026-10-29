@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.8.0 — 2026-10-29
+
+Distributed workers and API network mode, phase R4 of the implementation plan (worker protocol
+unchanged: `media-worker/1.2`; network mode needs Engine 0.5.0). **Remote workers**: a worker entry
+may name an `https://` URL with `tls` (`ca_file`, `cert_file`, `key_file`, optional
+`pinned_sha256`) and `remote_timeout_ms`; a remote entry with a `command` is refused at validation,
+as are `tls` and `remote_timeout_ms` on a loopback `http://` entry. Each remote worker has its own
+transport (TLS 1.3, the configured CA as the only root, the runtime's client certificate) that
+checks the server certificate's SHA-256 on every handshake against `pinned_sha256` or, without a
+pin, against the fingerprint recorded on first contact (kept per worker ID in the state directory
+and required on every reconnect); `/v1/info` must also report the certificate presented. A refused
+certificate is `certificate_mismatch` and, like a lost connection, leaves a running job for
+reconciliation; pinning a new fingerprint is the rotation path. A remote worker is never started,
+stopped or signalled: past the cancellation deadline its job waits for the worker, is `cancelled`
+when the worker confirms, and otherwise settles as `execution_interrupted` with `forced_termination:
+false` and nothing committed (or through the session check when the session changes). Job semantics
+are otherwise unchanged. **API network mode**: `bind` (an IP address, default `127.0.0.1`), `tls`
+(`cert_file`, `key_file`) and `allowed_origins` (exact CORS allow-list, default empty, which keeps
+browser origins refused); a non-loopback bind without `tls` is refused at startup, and the startup
+record adds `scheme`, `bind` and `certificate_sha256`. TLS keys must be mode 0600 and certificates
+not group/other writable, as in Engine. **CLI and diagnostics**: `MEDIA_RUNTIME_URL` may be
+`https://` with `MEDIA_RUNTIME_CA` for a private CA, and plain `http://` to a non-loopback host is
+refused; `doctor` prints each worker's transport, certificate fingerprint (pinned or recorded) and
+`/v1/info` latency, and how to re-pin after a mismatch; `GET /v1/runtime` and `GET /v1/workers` add
+`transport`, `remote`, `certificate_sha256` and `latency_ms`. The gateway client gains the worker
+transport fields (a private CA is trusted through `NODE_EXTRA_CA_CERTS`). Example:
+`examples/runtime.remote.config.json`. Test certificates (generated once, ten-year validity) are in
+`testdata/certs`. Standard library `crypto/tls` only; no new dependency and `go.sum` is unchanged.
+Tested against Engine 0.6.0's and 0.5.0's fixtures, including network mode over mutual TLS on
+loopback ([compatibility record](docs/compatibility.md)); no multi-host network or GPU was used.
+Companion Studio task: accept an `https://` runtime URL (and a private CA) in the Media Runtime
+connection settings.
+
 ## 0.7.0 — 2026-10-29
 
 Worker pool for multiple GPUs, phase R3 of the implementation plan (worker protocol unchanged:

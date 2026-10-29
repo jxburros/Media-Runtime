@@ -16,5 +16,9 @@ const runtime = new MediaRuntimeClient("http://127.0.0.1:7810", process.env.MEDI
 const { job_id } = await runtime.submit({ recipe_id: "portrait", model_id: "studio-sdxl", inputs: { prompt: "Soft window light" } });
 ```
 
+A runtime in network mode is reached at its `https://` address; for a certificate issued by a
+private CA, start Node with `NODE_EXTRA_CA_CERTS=/path/ca.pem`. Worker summaries carry each
+worker's `transport` (`http` or `mtls`), `remote`, `certificate_sha256` and `latency_ms`.
+
 The service itself is the Go binary at the repository root. This package is versioned with it and
 gains each release's new request, output, recipe and worker types in the same change.

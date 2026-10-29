@@ -16,6 +16,8 @@ by `tests/serve_fixture.py`; it proves protocol behavior, not GPU inference.
 | 0.7.0   | media-worker/1.0, 1.1, 1.2 | 0.4.0 (fixture, commit 2e18243)  | 1.2, and 1.1 pinned with `--protocol`; pools of two fixtures on distinct `--device-index` | Go 1.24.7 linux/amd64 | `go test -race ./...` | pass   |
 | 0.7.0   | media-worker/1.0, 1.1, 1.2 | 0.5.0 (fixture, commit 33ba9db)  | 1.2, and 1.1 pinned with `--protocol`; pools of two fixtures on distinct `--device-index` | Go 1.24.7 linux/amd64 | `go test -race ./...` | pass   |
 | 0.7.0   | media-worker/1.0, 1.1, 1.2 | 0.3.0 (fixture, commit 7ad6c39)  | 1.1              | Go 1.24.7 linux/amd64 | `go test -race ./...` (1.2, linear and multi-worker pool tests skip; the legacy single-worker test runs) | pass   |
+| 0.8.0   | media-worker/1.0, 1.1, 1.2 | 0.6.0 (fixture, commit bae2917)  | 1.2 (fixture lists 1.3; the runtime negotiates 1.2), and 1.1 pinned with `--protocol`; pools of two fixtures; network mode over mutual TLS on loopback | Go 1.24.7 linux/amd64 | `go test -race ./...` | pass   |
+| 0.8.0   | media-worker/1.0, 1.1, 1.2 | 0.5.0 (fixture, commit 33ba9db)  | 1.2, and 1.1 pinned with `--protocol`; pools of two fixtures; network mode over mutual TLS on loopback | Go 1.24.7 linux/amd64 | `go test -race ./...` | pass   |
 
 0.4.0 also serves a state directory written by Runtime 0.3.0 (`testdata/state-0.3.0`) unchanged:
 listing, export, idempotent replay of a 0.3.0 key and a new job.
@@ -26,5 +28,11 @@ unaffected.
 
 The 0.7.0 pool tests run several fixture processes on one host, each reporting a distinct device
 index; they prove scheduling, attribution and the device rule, not that two real GPUs were used.
+
+The 0.8.0 network-mode tests run Engine's fixture with `--bind 127.0.0.1 --tls-cert --tls-key
+--tls-client-ca --no-parent-watch` and the certificates in `testdata/certs`; the runtime and the
+worker share one host, so they prove mutual TLS, fingerprint pinning, refusals and job semantics,
+not a real multi-host network. Network mode needs Engine 0.5.0; against older fixtures those tests
+skip.
 
 Hardware validation: none of these rows ran on a CUDA device or real weights.
