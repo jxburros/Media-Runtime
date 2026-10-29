@@ -42,7 +42,8 @@ media-runtime workers list
 media-runtime outputs export JOB --directory DIR
 media-runtime tui
 
-Client configuration: MEDIA_RUNTIME_URL, MEDIA_RUNTIME_TOKEN, MEDIA_RUNTIME_NAMESPACE.
+Client configuration: MEDIA_RUNTIME_URL (https:// beyond loopback), MEDIA_RUNTIME_CA (PEM CA for a
+private certificate), MEDIA_RUNTIME_TOKEN, MEDIA_RUNTIME_NAMESPACE.
 Exit codes: 0 success, 2 invalid input, 3 unavailable service, 4 failed/cancelled waited job.
 `
 
@@ -159,6 +160,9 @@ func run(argv []string) error {
 		base = "http://127.0.0.1:7810"
 	}
 	cl := client.New(base, token, os.Getenv("MEDIA_RUNTIME_NAMESPACE"))
+	if err := cl.Secure(os.Getenv("MEDIA_RUNTIME_CA")); err != nil {
+		return err
+	}
 	print := func(v any) {
 		if values.json {
 			fmt.Println(string(jsonv.MustMarshal(v)))

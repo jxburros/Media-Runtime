@@ -200,14 +200,27 @@ func ExplainDoctor(report *jsonv.Object) ([]string, bool) {
 func explainWorker(out *[]string, w *jsonv.Object, label, command string) bool {
 	lines := *out
 	healthy := true
+	remote := truthy(w.Get("remote"))
 	if truthy(w.Get("error")) {
 		healthy = false
 		lines = append(lines, fmt.Sprintf("%s: UNAVAILABLE (%s) — %s", label, text(w, "error"), or(w, "message", "")))
-		lines = append(lines, "  Start Media Engine (or set "+command+") and check its token and port.")
+		if remote {
+			lines = append(lines, "  Check the remote worker's network mode, URL, TLS files and token; the runtime never starts or stops it.")
+			if w.Str("error") == "certificate_mismatch" {
+				lines = append(lines, fmt.Sprintf("  Presented certificate sha256 %s; expected %s (%s).", or(w, "presented_sha256", "unknown"), or(w, "certificate_sha256", "unknown"), certificateSource(w)))
+				lines = append(lines, "  If the worker's certificate was rotated, verify the new fingerprint out of band and set tls.pinned_sha256 to it.")
+			}
+		} else {
+			lines = append(lines, "  Start Media Engine (or set "+command+") and check its token and port.")
+		}
+		explainTransport(&lines, w)
 	} else {
 		process := "externally managed"
 		if truthy(w.Get("owned_process")) {
 			process = "owned child process"
+		}
+		if remote {
+			process = "remote, never owned"
 		}
 		lines = append(lines, fmt.Sprintf("%s: %s %s (%s stage), negotiated %s, %s", label, text(w, "backend_id"), text(w, "worker_version"), text(w, "ownership"), text(w, "protocol"), process))
 		ready := "NOT READY"
@@ -215,6 +228,7 @@ func explainWorker(out *[]string, w *jsonv.Object, label, command string) bool {
 			ready = "ready"
 		}
 		lines = append(lines, fmt.Sprintf("  Device %s: %s; service state %s; tasks %s", text(w, "device"), ready, text(w, "state"), joinList(w.Get("tasks"), ", ")))
+		explainTransport(&lines, w)
 		if !truthy(w.Get("device_ready")) {
 			healthy = false
 		}
@@ -266,6 +280,34 @@ func explainWorker(out *[]string, w *jsonv.Object, label, command string) bool {
 	}
 	*out = lines
 	return healthy
+}
+
+func certificateSource(w *jsonv.Object) string {
+	if w.Str("certificate_source") == "pinned" {
+		return "pinned_sha256"
+	}
+	return "recorded on first contact"
+}
+
+// explainTransport prints how a worker is reached, from 0.8.0 reports: loopback HTTP, or mutual
+// TLS with the certificate fingerprint it is held to, and the last /v1/info round trip.
+func explainTransport(out *[]string, w *jsonv.Object) {
+	if !w.Has("transport") {
+		return
+	}
+	latency := "latency not measured"
+	if w.Get("latency_ms") != nil {
+		latency = "latency " + text(w, "latency_ms") + " ms"
+	}
+	if !truthy(w.Get("remote")) {
+		*out = append(*out, "  Transport: loopback HTTP; "+latency)
+		return
+	}
+	certificate := "no certificate recorded yet"
+	if w.Get("certificate_sha256") != nil {
+		certificate = fmt.Sprintf("certificate sha256 %s (%s)", text(w, "certificate_sha256"), certificateSource(w))
+	}
+	*out = append(*out, fmt.Sprintf("  Transport: mutual TLS; %s; %s", certificate, latency))
 }
 
 // ExplainCatalog describes catalog inspection entries for the installation workflow.

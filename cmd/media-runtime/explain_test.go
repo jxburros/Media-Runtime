@@ -85,3 +85,34 @@ func TestDoctorPrintsOneSectionPerWorker(t *testing.T) {
 		t.Fatal("a pool has no single worker section")
 	}
 }
+
+func TestDoctorReportsTransportPerWorker(t *testing.T) {
+	report := obj(t, `{"runtime_version":"0.8.0","protocols":["media-worker/1.2"],
+		"worker":{"worker_id":"local"},
+		"workers":[
+		  {"worker_id":"local","backend_id":"diffusers-sdxl","ownership":"reference","worker_version":"0.5.0","protocol":"media-worker/1.2","owned_process":true,"device":"cuda:0","device_ready":true,"state":"ready","tasks":["text-to-image"],"missing_dependencies":[],"dependencies":{},"precisions":["float16"],"memory_budget_mb":null,"memory_estimate":{},
+		   "transport":"http","remote":false,"latency_ms":0.84},
+		  {"worker_id":"far","backend_id":"diffusers-sdxl","ownership":"reference","worker_version":"0.5.0","protocol":"media-worker/1.2","owned_process":false,"device":"cuda:0","device_ready":true,"state":"ready","tasks":["text-to-image"],"missing_dependencies":[],"dependencies":{},"precisions":["float16"],"memory_budget_mb":null,"memory_estimate":{},
+		   "transport":"mtls","remote":true,"certificate_sha256":"ab12","certificate_source":"pinned","presented_sha256":"ab12","latency_ms":12.5},
+		  {"worker_id":"moved","error":"certificate_mismatch","message":"Worker moved presented certificate sha256 cd34","owned_process":false,"ready":false,
+		   "transport":"mtls","remote":true,"certificate_sha256":"ab12","certificate_source":"first_contact","presented_sha256":"cd34","latency_ms":null}],
+		"models":[],"recipes":[],"storage":{"writable":true,"available_bytes":1073741824,"output_retention_days":null},"queue":{"capacity":32,"queued":0,"running":0}}`)
+	lines, healthy := ExplainDoctor(report)
+	if healthy {
+		t.Fatal("a refused worker needs attention")
+	}
+	for _, want := range []string{
+		"Worker local: diffusers-sdxl 0.5.0 (reference stage), negotiated media-worker/1.2, owned child process",
+		"  Transport: loopback HTTP; latency 0.84 ms",
+		"Worker far: diffusers-sdxl 0.5.0 (reference stage), negotiated media-worker/1.2, remote, never owned",
+		"  Transport: mutual TLS; certificate sha256 ab12 (pinned_sha256); latency 12.5 ms",
+		"Worker moved: UNAVAILABLE (certificate_mismatch) — Worker moved presented certificate sha256 cd34",
+		"  Check the remote worker's network mode, URL, TLS files and token; the runtime never starts or stops it.",
+		"  Presented certificate sha256 cd34; expected ab12 (recorded on first contact).",
+		"  Transport: mutual TLS; certificate sha256 ab12 (recorded on first contact); latency not measured",
+	} {
+		if !contains(lines, want) {
+			t.Fatalf("missing %q in\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
