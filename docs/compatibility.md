@@ -22,6 +22,7 @@ by `tests/serve_fixture.py`; it proves protocol behavior, not GPU inference.
 | 0.9.0   | media-worker/1.0, 1.1, 1.2, 1.3 | 0.6.0 (fixture, commit 7c8320c) | 1.3, 1.2 and 1.1 pinned with `--protocol`; `svd` two-frame bundle; pools; network mode | Go 1.24.7 linux/amd64 | `go test ./...` | pass   |
 | 0.10.0  | media-worker/1.0, 1.1, 1.2, 1.3 | 0.7.0 (fixture, commit 83d2cc0) | 1.3, 1.2 and 1.1 pinned with `--protocol`; `svd` and `stable-audio-open` bundles; pools; network mode | Go 1.24.7 linux/amd64 | `go test -race ./...` | pass   |
 | 0.10.0  | media-worker/1.0, 1.1, 1.2, 1.3 | 0.6.0 (fixture, commit 7c8320c) | 1.3, 1.2 and 1.1 pinned with `--protocol`; `svd` bundle; pools; network mode | Go 1.24.7 linux/amd64 | `go test ./...` (audio tests skip) | pass   |
+| 0.10.0  | media-worker/1.0, 1.1, 1.2, 1.3 | 0.8.0 and 1.0.0 (fixture, Engine branch `claude/eager-dirac-7oztji`, commits e78e2ba and 8a2c22f; added later as test evidence) | 1.3, and 1.2/1.1 pinned with `--protocol` | Go 1.24.7 linux/amd64 | `go test ./...` (26 integration tests) | pass   |
 
 0.4.0 also serves a state directory written by Runtime 0.3.0 (`testdata/state-0.3.0`) unchanged:
 listing, export, idempotent replay of a 0.3.0 key and a new job.
