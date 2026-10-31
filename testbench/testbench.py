@@ -146,7 +146,7 @@ class Service:
             self.record = None
         if not isinstance(self.record, dict) or "port" not in self.record:
             self.stop()
-            raise Fail(f"{name} did not start.\n{line.strip()}\n{tail(log_path)}".strip())
+            raise Fail("\n".join(part for part in (f"{name} did not start.", line.strip(), tail(log_path)) if part))
         # Keep draining stdout so the child never blocks on a full pipe.
         threading.Thread(target=self.drain, daemon=True).start()
 
