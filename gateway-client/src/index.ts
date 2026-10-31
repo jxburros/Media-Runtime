@@ -82,6 +82,14 @@ export type WorkerSummary = {
   configured_device: string | null;
   configured_memory_budget_mb: number | null;
   owned_process: boolean;
+  /** "http" for a loopback worker, "mtls" for a remote https:// worker (never owned). */
+  transport: "http" | "mtls";
+  remote: boolean;
+  /** Remote workers: the server-certificate SHA-256 every connection must present (pinned or
+   * recorded on first contact); null for loopback workers and before first contact. */
+  certificate_sha256: string | null;
+  /** Round trip of the last /v1/info request in milliseconds, null before the first. */
+  latency_ms: number | null;
   /** The loaded identity: bundle, the registered models with that bundle, options and adapters. */
   loaded: {
     bundle_digest: string | null;
@@ -201,7 +209,11 @@ export type ModelSummary = {
   available: boolean;
 };
 
-/** Gateway client. Credentials belong on the server, never in a browser. */
+/**
+ * Gateway client. Credentials belong on the server, never in a browser. A runtime in network mode
+ * is reached at an https:// URL; for a certificate from a private CA, start Node with
+ * NODE_EXTRA_CA_CERTS naming that CA (fetch has no per-request trust option).
+ */
 export class MediaRuntimeClient {
   constructor(
     public url: string,

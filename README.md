@@ -14,8 +14,9 @@ Release 0.5.0 speaks `media-worker/1.2` and adds multiple outputs per job, upsca
 conversion provenance workflow, and automatic settings with authorized fallbacks. Release 0.6.0
 adds linear typed recipes (schema 2): several operations, each its own worker execution, chained
 through durable intermediate outputs. Release 0.7.0 drives a pool of workers, one Engine process
-per GPU, with one execution per worker. Remote workers, video, audio and native inference are later
-stages, specified in the same document and sequenced in
+per GPU, with one execution per worker. Release 0.8.0 adds remote workers over mutual TLS (Engine
+0.5.0's network mode) and a network mode for the runtime's own API. Video, audio and native
+inference are later stages, specified in the same document and sequenced in
 [docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Install and run
@@ -103,10 +104,13 @@ controls how many of `steps` are actually sampled; the job records `effective_st
 reports the real total and the manifest lists the input's digest. Inputs follow
 `output_retention_days` and cannot be deleted while a job references them.
 
-`MEDIA_RUNTIME_URL` defaults to `http://127.0.0.1:7810`. `MEDIA_RUNTIME_NAMESPACE` supplies a namespace
+`MEDIA_RUNTIME_URL` defaults to `http://127.0.0.1:7810`; it must be `https://` for a runtime beyond
+loopback (see [API network mode](#api-network-mode)), and `MEDIA_RUNTIME_CA` names a PEM CA when the
+runtime's certificate comes from a private CA. `MEDIA_RUNTIME_NAMESPACE` supplies a namespace
 only for a credential with a matching `allowed_namespaces` grant. Never put an integration token
 in a browser. All routes except coarse `/health` require bearer authentication; browser origins
-are refused, and the server binds loopback only.
+are refused unless `allowed_origins` lists them, and the server binds loopback unless configured
+for network mode with TLS.
 
 ## Multiple outputs
 
@@ -224,7 +228,8 @@ Requested model, backend, seed, dimensions, precision and scheduler are never si
 
 To use several GPUs, list one Engine process per device under `workers` instead of `worker`
 ([`examples/runtime.pool.config.json`](examples/runtime.pool.config.json)). Each entry has a
-`worker_id`, a loopback `url` and `token_env` or an owned `command`, and optionally the expected
+`worker_id`, a loopback `url` and `token_env` or an owned `command` (or a [remote](#remote-workers)
+`https://` URL with `tls`), and optionally the expected
 `backend_id`, `device` and `memory_budget_mb`; `device` and the budget are the operator's
 expectations, shown beside what the worker reports, and a worker whose reported device differs from
 `device` is unavailable. The single `worker` object keeps working as a pool of one named `default`.
@@ -248,6 +253,103 @@ loaded model, whether it is busy and, for your namespace's job, its ID; `jobs li
 dashboard a line per worker and a worker column. Each worker reconciles its own job after a
 restart, and a crashed owned worker interrupts only the job it was running.
 
+## Remote workers
+
+A pool entry may name a worker on another host by an `https://` URL; the runtime then speaks mutual
+TLS to Engine's network mode (Engine 0.5.0 or later, started with `--bind`, `--tls-cert`,
+`--tls-key`, `--tls-client-ca` and `--no-parent-watch`; see Engine's README, "Network mode").
+[`examples/runtime.remote.config.json`](examples/runtime.remote.config.json) shows one local and
+one remote worker:
+
+```json
+{
+  "worker_id": "render-host",
+  "url": "https://render-host.internal:7811",
+  "token_env": "MEDIA_RENDER_HOST_TOKEN",
+  "tls": {
+    "ca_file": "/etc/media-runtime/workers-ca.pem",
+    "cert_file": "/etc/media-runtime/supervisor.pem",
+    "key_file": "/etc/media-runtime/supervisor.key",
+    "pinned_sha256": "<64 hex digits, optional>"
+  },
+  "remote_timeout_ms": 60000
+}
+```
+
+A remote entry never has a `command` (configuration validation refuses one), and `tls` and
+`remote_timeout_ms` are refused on a loopback `http://` entry. `remote_timeout_ms` is the request
+timeout for that worker (default `worker_timeout_ms`). Every other field, scheduling rule and job
+semantic is that of a [pool](#worker-pool) entry; a remote worker can be the only worker.
+
+**Trust model.**
+
+- The remote worker's catalog is its own. A registration's artifact handle must resolve on every
+  worker, and the bundle digests a job carries prove the remote bundle is the same bytes; inputs
+  and outputs cross the connection as verified bytes (digest, size, PNG checks), exactly as with a
+  local worker.
+- Identity is proven twice: the worker's certificate must chain to `ca_file` and name the URL's
+  host, and its SHA-256 (of the DER, as Engine reports `certificate_sha256` in `/v1/info`) must
+  equal `pinned_sha256` when set. Without a pin, the fingerprint seen on first contact is recorded
+  in the state directory and every later connection, including each reconnect, must present it;
+  `/v1/info` must also report the certificate actually presented. A different certificate is
+  refused before any request is sent (`certificate_mismatch` in `doctor` and `workers list`),
+  even when the same CA issued it, and a running job waits for reconciliation as after a lost
+  connection.
+- No ownership. The runtime never starts, stops or signals a remote worker; stopping the runtime
+  leaves it running. A cancellation past `cancellation_grace_ms` is not forced: the job stays
+  running until the worker itself reports a terminal state. A confirmed cancellation is
+  `cancelled`; any other terminal state reported after the deadline settles the job as
+  `execution_interrupted` with `forced_termination: false` and commits nothing. A new worker
+  session interrupts the job, as for any worker.
+- The bearer credential (`token_env`) still authorizes every request; the client certificate only
+  authenticates the connection. Deliver the worker's per-launch token over a channel you already
+  trust.
+
+**Certificates.** The operator owns them; the runtime never generates, fetches or rotates any.
+
+- `ca_file`: PEM CA certificate(s) that issued the worker's server certificate; it replaces the
+  system roots for this worker. The worker's certificate must carry the URL's host name or IP
+  address in its subject alternative names and `serverAuth`.
+- `cert_file`, `key_file`: the runtime's client certificate (`clientAuth`, issued by the CA given
+  to the worker as `--tls-client-ca`) and its unencrypted PEM key. The key must not be readable by
+  group or others (`chmod 600`), and certificate and CA files must not be writable by them
+  (`chmod 644`); the runtime refuses to start otherwise. Files are read once at start.
+- Transport is TLS 1.3 (Engine's minimum); revocation lists are not consulted.
+- Rotation: after replacing a worker's certificate, verify the new fingerprint out of band (Engine
+  prints `certificate_sha256` in its startup record; `doctor` shows the presented one beside the
+  expected one) and set `pinned_sha256` to it. The pin replaces the recorded fingerprint, so the
+  pin may be removed again afterwards. Rotating the client certificate needs only a restart.
+
+`doctor` prints a transport line per worker: loopback HTTP, or mutual TLS with the fingerprint and
+whether it is pinned or recorded on first contact, plus the last `/v1/info` round trip.
+`GET /v1/runtime` and `GET /v1/workers` report `transport`, `remote`, `certificate_sha256` and
+`latency_ms` (and, in the runtime report, `certificate_source`, `presented_sha256` and the worker's
+`ownership_available`).
+
+## API network mode
+
+The runtime's own API listens on `127.0.0.1` by default. To serve other hosts, give an IP address
+as `bind` and server TLS material:
+
+```json
+{
+  "bind": "0.0.0.0",
+  "port": 7810,
+  "tls": { "cert_file": "/etc/media-runtime/runtime.pem", "key_file": "/etc/media-runtime/runtime.key" },
+  "allowed_origins": []
+}
+```
+
+A `bind` that is not loopback without `tls` is refused at startup: the runtime never serves plain
+HTTP beyond loopback. TLS on loopback is accepted. The key follows the same mode rules as above;
+the certificate must name every address clients use. `serve` reports `scheme`, `bind` and the
+certificate's `certificate_sha256` in its startup record. Credentials, namespaces and operator
+separation are unchanged, and clients authenticate with the bearer credential (no client
+certificate). Browser origins stay refused unless `allowed_origins` lists them exactly
+(`https://studio.example`, scheme, host and port); a listed origin gets CORS headers and still needs
+a credential. From the CLI, set `MEDIA_RUNTIME_URL=https://host:7810` and, for a private CA,
+`MEDIA_RUNTIME_CA=/path/ca.pem`; the CLI refuses a plain `http://` URL to a non-loopback host.
+
 ## Persistence and recovery
 
 SQLite WAL/FULL synchronization stores normalized requests, recipe/model identities, dispatch
@@ -270,7 +372,7 @@ Prompts remain private job data. Local state uses directory mode 0700 and file m
 ## Studio
 
 The companion Studio integration adds **Media Runtime (local SDXL)** to Settings → Runtimes.
-Connect to `http://127.0.0.1:7810` with the dedicated Studio access key, then select the registered
+Connect to `http://127.0.0.1:7810` (or the runtime's `https://` address in network mode) with the dedicated Studio access key, then select the registered
 model in Create. Its gateway derives `studio:<scope digest>` namespaces from authenticated user
 and project context, preserves model routing, displays actual stage/step status, sends Stop to the
 runtime and imports verified output copies with provenance. Personal and project paths are the same.
@@ -292,7 +394,12 @@ inspection, verification and LoRA adapters, the 1.2 surface (multiple outputs, u
 conversion provenance, automatic precision, authorized fallbacks and a 1.1-pinned fixture's
 refusals), linear recipes and worker pools of several fixture processes with distinct device
 indexes (concurrency, pinning, affinity, a crashed worker, duplicate devices); these skip against an
-Engine fixture older than 0.4.0, and the legacy single-worker configuration test runs everywhere. `cmd/media-runtime` tests build the binary and drive
+Engine fixture older than 0.4.0, and the legacy single-worker configuration test runs everywhere.
+The network-mode tests launch the fixture with `--bind 127.0.0.1 --tls-*` and the test
+certificates in [`testdata/certs`](testdata/certs/README.md) (generated once, never at test time)
+and run a job over mutual TLS, a reconnect, a cancellation past the deadline, fingerprint
+mismatches and re-pinning, and the API over TLS; they skip against an Engine fixture older than
+0.5.0. `cmd/media-runtime` tests build the binary and drive
 the CLI end to end, including a state directory written by the TypeScript 0.3.0 service
 (`testdata/state-0.3.0`); `internal/tui` and the doctor tests compare rendered text with the
 0.3.0 output. The fixture is not an inference fallback. GPU image quality and hardware

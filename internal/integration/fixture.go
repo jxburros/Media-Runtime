@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"encoding/pem"
 	"fmt"
 	"hash/crc32"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 
 	c "github.com/jxburros/media-runtime/internal/contracts"
 	"github.com/jxburros/media-runtime/internal/jsonv"
+	"github.com/jxburros/media-runtime/internal/transport"
 )
 
 const WorkerToken = "worker-test-token-not-a-secret-000000000000"
@@ -109,7 +111,78 @@ func StartFixture(t testing.TB, root string, args ...string) *Fixture {
 		}
 	})
 	port, _ := discovery.Num("port")
-	return &Fixture{URL: fmt.Sprintf("http://127.0.0.1:%d", int(port)), Discovery: discovery, cmd: cmd}
+	scheme := "http"
+	if discovery.Str("scheme") == "https" {
+		scheme = "https"
+	}
+	return &Fixture{URL: fmt.Sprintf("%s://127.0.0.1:%d", scheme, int(port)), Discovery: discovery, cmd: cmd}
+}
+
+// Alive reports whether the fixture process is still running (nothing has terminated it).
+func (f *Fixture) Alive() bool {
+	return f.cmd.ProcessState == nil && f.cmd.Process.Signal(syscall.Signal(0)) == nil
+}
+
+// Certs copies testdata/certs into a private directory with the modes the runtime and the worker
+// require (keys 0600, certificates 0644) and returns it. Git does not keep file modes.
+func Certs(t testing.TB) string {
+	t.Helper()
+	_, here, _, _ := callerFile()
+	source := filepath.Join(filepath.Dir(here), "..", "..", "testdata", "certs")
+	dir := t.TempDir()
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		mode := os.FileMode(0o644)
+		if strings.HasSuffix(name, ".key") {
+			mode = 0o600
+		} else if !strings.HasSuffix(name, ".pem") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(source, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), data, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Join(dir, name), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// NetworkMode is the fixture's network-mode arguments: mutual TLS on loopback with the server
+// certificate <server>.pem from certs, client certificates verified against ca.pem, and no
+// parent watch (a remote worker advertises ownership_available: false). It skips against an
+// Engine fixture before 0.5.0, which has no network mode.
+func NetworkMode(t testing.TB, certs, server string) []string {
+	t.Helper()
+	script, err := os.ReadFile(filepath.Join(EngineRepo(t), "tests", "serve_fixture.py"))
+	if err != nil || !bytes.Contains(script, []byte("add_network_arguments")) {
+		t.Skip("the Engine fixture predates network mode (Engine 0.5.0)")
+	}
+	return []string{"--bind", "127.0.0.1", "--no-parent-watch",
+		"--tls-cert", filepath.Join(certs, server+".pem"), "--tls-key", filepath.Join(certs, server+".key"),
+		"--tls-client-ca", filepath.Join(certs, "ca.pem")}
+}
+
+// CertificateSHA256 is the SHA-256 of the DER of certs/<name>.pem, the form Engine reports.
+func CertificateSHA256(t testing.TB, certs, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(certs, name+".pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		t.Fatalf("%s.pem holds no certificate", name)
+	}
+	return transport.Fingerprint(block.Bytes)
 }
 
 // Highest is the highest protocol minor the fixture and this runtime share.

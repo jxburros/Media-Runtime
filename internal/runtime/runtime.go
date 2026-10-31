@@ -52,6 +52,8 @@ func New(cfg *config.Config) (*Runtime, error) {
 	lanes := map[string]*sync.Mutex{}
 	for _, m := range p.Members {
 		lanes[m.ID] = &sync.Mutex{}
+		// A remote worker's recorded certificate fingerprint lives in the state directory.
+		m.Client.SetTrust(s)
 	}
 	return &Runtime{Config: cfg, Store: s, Pool: p, Worker: p.Members[0].Client, lanes: lanes, quit: make(chan struct{})}, nil
 }
@@ -1063,13 +1065,22 @@ func (r *Runtime) Tick(m *pool.Member) {
 		return
 	}
 	// Transient transport errors preserve dispatch identity for reconciliation; never regenerate.
-	if job := r.runningOn(m.ID); job != nil && api.Code != "backend_unavailable" {
+	// A refused certificate is one: nothing was said to the worker, and the job resumes from its
+	// snapshot once the operator restores the expected certificate or pin.
+	if job := r.runningOn(m.ID); job != nil && !transient(api) {
 		code, message := api.Code, api.Message
 		if api.Status == 404 {
 			code, message = "execution_interrupted", "Worker record is no longer available"
 		}
 		r.finish(job, "failed", jsonv.O("code", code, "message", message))
 	}
+}
+
+// transient is a transport failure that leaves the job's dispatch identity for reconciliation:
+// an unreachable worker, or a remote worker whose certificate was refused before anything was
+// said to it.
+func transient(api *c.ApiError) bool {
+	return api.Code == "backend_unavailable" || api.Code == "certificate_mismatch"
 }
 
 func (r *Runtime) tick(m *pool.Member) (err error) {
@@ -1179,12 +1190,20 @@ func (r *Runtime) tick(m *pool.Member) (err error) {
 	}
 	r.refresh(job)
 	grace := time.Duration(r.Config.CancellationGraceMS) * time.Millisecond
-	if truthy(job.Get("cancel_requested")) && client.Child() != nil {
+	// overdue is a remote worker's cancellation past the deadline. A remote worker is never
+	// owned, so nothing is terminated: the job settles only when the worker itself reports a
+	// terminal state (or its session changes, handled above).
+	overdue := false
+	if truthy(job.Get("cancel_requested")) {
 		at, ok := job.Num("cancel_at")
 		if !ok || at == 0 {
 			at = float64(time.Now().UnixMilli())
 		}
-		if time.Since(time.UnixMilli(int64(at))) > grace {
+		late := time.Since(time.UnixMilli(int64(at))) > grace
+		switch {
+		case late && m.Config.Remote:
+			overdue = true
+		case late && client.Child() != nil:
 			client.Stop()
 			r.finish(job, "failed", jsonv.O("code", "execution_interrupted", "message", "Owned worker was forcibly stopped after the cancellation deadline", "forced_termination", true))
 			return client.Start()
@@ -1364,6 +1383,14 @@ func (r *Runtime) tick(m *pool.Member) (err error) {
 	})
 	if err != nil {
 		return err
+	}
+	if state := snapshot.Str("state"); overdue && (state == "succeeded" || state == "failed") {
+		// The remote worker finished after the cancellation deadline instead of confirming the
+		// cancellation: the job is interrupted, and nothing it produced is committed.
+		r.finish(job, "failed", jsonv.O("code", "execution_interrupted",
+			"message", "Remote worker reported "+state+" after the cancellation deadline; nothing was committed and the worker was not terminated",
+			"forced_termination", false))
+		return nil
 	}
 	switch snapshot.Str("state") {
 	case "succeeded":
@@ -1717,7 +1744,7 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 		var api *c.ApiError
 		job.Set("state", "running")
 		op.Set("state", "running")
-		if errors.As(err, &api) && api.Code == "backend_unavailable" {
+		if errors.As(err, &api) && transient(api) {
 			return err
 		}
 		r.finish(job, "failed", jsonv.O("code", "output_unavailable", "message", "Output could not be verified and committed to durable storage"))
@@ -1921,6 +1948,34 @@ func workerReport(view pool.View) *jsonv.Object {
 			w.Set("duplicate_of", view.Conflict)
 		}
 	}
+	// How the worker is reached: loopback HTTP, or mutual TLS to a remote worker with the
+	// fingerprint it must present (pinned or recorded on first contact) and the one it presented.
+	t := m.Client.Transport()
+	w.Set("transport", map[bool]string{true: "mtls", false: "http"}[t.Remote])
+	w.Set("remote", t.Remote)
+	var expected, presented, latency any
+	if t.Expected != "" {
+		expected = t.Expected
+	}
+	if t.Presented != "" {
+		presented = t.Presented
+	}
+	if t.Latency > 0 {
+		latency = math.Round(float64(t.Latency.Microseconds())/10) / 100
+	}
+	if t.Remote {
+		source := "first_contact"
+		if t.Pinned {
+			source = "pinned"
+		}
+		w.Set("certificate_sha256", expected)
+		w.Set("certificate_source", source)
+		w.Set("presented_sha256", presented)
+		if view.Ready() {
+			w.Set("ownership_available", nullish(view.Probe.Info.Get("ownership_available")))
+		}
+	}
+	w.Set("latency_ms", latency)
 	// The operator's statement of intent, beside what the worker reports.
 	w.Set("configured_device", nullish(m.Config.Device))
 	var budget any
@@ -2062,6 +2117,10 @@ func (r *Runtime) Workers(namespace string) []any {
 			"configured_device", report.Get("configured_device"),
 			"configured_memory_budget_mb", report.Get("configured_memory_budget_mb"),
 			"owned_process", report.Get("owned_process"),
+			"transport", report.Get("transport"),
+			"remote", report.Get("remote"),
+			"certificate_sha256", nullish(report.Get("certificate_sha256")),
+			"latency_ms", report.Get("latency_ms"),
 		)
 		var loaded any
 		if view.Ready() {

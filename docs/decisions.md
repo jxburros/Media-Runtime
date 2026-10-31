@@ -254,3 +254,74 @@ third-party module.
   dashboard layout exactly; a larger pool prints one section and header line per worker and a
   worker column.
 - No new dependency; the ledger is unchanged.
+
+# Implementation decisions — 0.8.0
+
+- Configuration: a worker entry (pool or legacy single `worker`) is remote exactly when its URL is
+  `https://`; any host name or IP is accepted there, while `http://` stays loopback only. A remote
+  entry requires `tls` with `ca_file`, `cert_file` and `key_file` and may give `pinned_sha256` (64
+  hex digits, stored lowercase) and `remote_timeout_ms` (default `worker_timeout_ms`). A remote
+  entry with `command` is refused at validation, as are `tls` or `remote_timeout_ms` on an
+  `http://` entry, so ownership can never be configured for a process on another host. Relative
+  TLS paths resolve against the working directory. The spec's "reconnection settings" need no new
+  field: a lost connection is retried every poll interval and reconciled from the worker snapshot
+  and event sequence, exactly as for a local worker.
+- TLS material format: PEM certificates (leaf first), unencrypted PEM private keys (PKCS#8, PKCS#1
+  or SEC 1), PEM CA bundles. Files are read once at start with Engine's mode rules: a key readable
+  by group or others, or a certificate or CA file writable by them, refuses the start with a
+  message naming the field and the `chmod` to run. Rotation of any file is a restart; nothing is
+  reloaded, generated or fetched, and revocation lists are not consulted.
+- Worker transport: one `http.Transport` per remote entry with a `tls.Config` of TLS 1.3 minimum
+  (Engine's network mode serves nothing lower), `ca_file` as the only root (system roots are not
+  consulted, so a public CA cannot vouch for a worker), the client certificate, ordinary host name
+  verification against the URL, and a `VerifyPeerCertificate` comparing the SHA-256 of the leaf's
+  DER to the pin or the recorded fingerprint. No `ClientSessionCache` is set, so there is no
+  session resumption and the check runs on every handshake. HTTP/2 is not attempted (Engine serves
+  HTTP/1.1). The runtime polls worker snapshots rather than streaming the worker's SSE, so "SSE
+  over the same transport" means that every worker request, including any stream, goes through
+  this one transport; there is no second client.
+- Fingerprint pinning: with `pinned_sha256`, every handshake must present that certificate. Without
+  it, the first successful contact (chain and host verified) records the fingerprint per worker ID
+  in the state directory (`worker_certificates`), together with the URL it was seen at, and every
+  later handshake, including after a restart, must match. The record is keyed by worker ID, not URL:
+  moving a worker to a new address keeps its identity. The probe additionally requires `/v1/info`
+  to report `scheme: https` and a `certificate_sha256` equal to the certificate presented; a worker
+  without these fields (before Engine 0.5.0) is refused as `protocol_mismatch`. A configured pin
+  replaces the recorded fingerprint once it has been seen, which is the rotation path: pin the new
+  fingerprint, and optionally remove the pin afterwards. A refused certificate is
+  `certificate_mismatch` (HTTP 503 class) and is treated like an unreachable worker: a running job
+  keeps its dispatch identity for reconciliation rather than failing, because nothing was said to
+  the worker.
+- Ownership and cancellation: `Start` never launches and `Stop` never signals a remote worker.
+  After `cancellation_grace_ms` a remote job is not forced; the runtime keeps sending cancel and
+  polling. A `cancelled` snapshot settles it as `cancelled`; a `succeeded` or `failed` snapshot
+  reported after the deadline settles it as `failed`, `execution_interrupted`, `forced_termination:
+  false`, and commits nothing, mirroring the owned case where work past the deadline is discarded.
+  Before the deadline a worker that finishes anyway commits as today. A new session interrupts the
+  job through the existing session check. Loopback external workers keep their 0.7.0 behavior.
+- API network mode: `bind` is an IP address (default `127.0.0.1`; host names are refused, as in
+  Engine). A bind that is not loopback requires `tls` (`cert_file`, `key_file`); the check runs at
+  configuration and again in the listener, so no code path opens a plain-HTTP non-loopback socket.
+  The API serves TLS 1.2 or later (browsers and gateways vary) and asks for no client certificate:
+  the bearer credential authorizes every request, and credentials, namespaces and operator
+  separation are unchanged. The startup record adds `scheme`, `bind` and `certificate_sha256`.
+- Origins: `allowed_origins` is an exact allow-list of `scheme://host[:port]` origins, compared
+  lowercase; wildcards, paths and `null` are refused. An allowed origin receives
+  `Access-Control-Allow-Origin` (with `Vary: Origin`), and a preflight `OPTIONS` is answered 204
+  with the methods and headers the API reads; the credential is still required. The default empty
+  list keeps every browser origin refused with 403 as before.
+- CLI and clients: `MEDIA_RUNTIME_URL` may be `https://`; `MEDIA_RUNTIME_CA` is a PEM CA bundle
+  that replaces the system roots. The CLI refuses `http://` to a non-loopback host so the
+  credential never travels in clear text. The gateway client relies on Node's trust store
+  (`NODE_EXTRA_CA_CERTS` for a private CA), since `fetch` has no per-request trust option and a
+  dispatcher library would be a dependency.
+- Diagnostics: each worker report adds `transport` (`http` or `mtls`), `remote`, `latency_ms` (the
+  last `/v1/info` round trip) and, for remote workers, `certificate_sha256` (expected),
+  `certificate_source` (`pinned` or `first_contact`), `presented_sha256` and the worker's
+  `ownership_available`. `doctor` prints a transport line per worker; reports without these fields
+  print as in 0.7.0.
+- Test material: `testdata/certs` holds a test CA (key discarded), worker, rotated-worker, runtime
+  and client certificates, EC P-256, ten years from 2026-10-29, generated once with the commands in
+  its README; tests copy them to private modes and never generate certificates.
+- `crypto/tls`, reserved in the 0.4.0 ledger, is now used for both paths. No new dependency; the
+  ledger and `go.sum` are unchanged.

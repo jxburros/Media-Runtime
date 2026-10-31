@@ -22,6 +22,7 @@ import (
 	c "github.com/jxburros/media-runtime/internal/contracts"
 	"github.com/jxburros/media-runtime/internal/jsonv"
 	"github.com/jxburros/media-runtime/internal/runtime"
+	"github.com/jxburros/media-runtime/internal/transport"
 	"github.com/jxburros/media-runtime/internal/tui"
 )
 
@@ -41,7 +42,8 @@ media-runtime workers list
 media-runtime outputs export JOB --directory DIR
 media-runtime tui
 
-Client configuration: MEDIA_RUNTIME_URL, MEDIA_RUNTIME_TOKEN, MEDIA_RUNTIME_NAMESPACE.
+Client configuration: MEDIA_RUNTIME_URL (https:// beyond loopback), MEDIA_RUNTIME_CA (PEM CA for a
+private certificate), MEDIA_RUNTIME_TOKEN, MEDIA_RUNTIME_NAMESPACE.
 Exit codes: 0 success, 2 invalid input, 3 unavailable service, 4 failed/cancelled waited job.
 `
 
@@ -158,6 +160,9 @@ func run(argv []string) error {
 		base = "http://127.0.0.1:7810"
 	}
 	cl := client.New(base, token, os.Getenv("MEDIA_RUNTIME_NAMESPACE"))
+	if err := cl.Secure(os.Getenv("MEDIA_RUNTIME_CA")); err != nil {
+		return err
+	}
 	print := func(v any) {
 		if values.json {
 			fmt.Println(string(jsonv.MustMarshal(v)))
@@ -554,6 +559,12 @@ func serve(configPath string) error {
 	if err != nil {
 		return err
 	}
+	// Refuse unusable API TLS material before any worker is started.
+	if cfg.TLS != nil {
+		if _, _, err := transport.Server(cfg.TLS.CertFile, cfg.TLS.KeyFile); err != nil {
+			return err
+		}
+	}
 	if err := os.MkdirAll(cfg.Directory, 0o700); err != nil {
 		return err
 	}
@@ -581,11 +592,16 @@ func serve(configPath string) error {
 		shutdown()
 		return err
 	}
-	if err := server.Listen(fmt.Sprintf("127.0.0.1:%d", cfg.Port)); err != nil {
+	if err := server.Serve(cfg.Bind, cfg.Port, cfg.TLS); err != nil {
 		shutdown()
 		return err
 	}
-	fmt.Println(string(jsonv.MustMarshal(jsonv.O("service", "media-runtime", "version", c.VERSION, "port", float64(server.Port())))))
+	var fingerprint any
+	if f := server.Fingerprint(); f != "" {
+		fingerprint = f
+	}
+	fmt.Println(string(jsonv.MustMarshal(jsonv.O("service", "media-runtime", "version", c.VERSION, "port", float64(server.Port()),
+		"scheme", server.Scheme(), "bind", cfg.Bind, "certificate_sha256", fingerprint))))
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	cleanup := time.NewTicker(time.Minute)

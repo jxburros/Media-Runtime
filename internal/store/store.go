@@ -1,4 +1,5 @@
-// Package store is the SQLite state: jobs, events, idempotency keys, registries and inputs.
+// Package store is the SQLite state: jobs, events, idempotency keys, registries, inputs and the
+// certificate fingerprints of remote workers.
 // The schema, pragmas and JSON data columns are those of the TypeScript 0.3.0 release, so an
 // existing state directory opens unchanged.
 package store
@@ -35,7 +36,8 @@ const schema = `PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign
       CREATE TABLE IF NOT EXISTS recipes (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS adapters (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS inputs (input_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, data TEXT NOT NULL);
-      CREATE INDEX IF NOT EXISTS inputs_namespace ON inputs(namespace, input_id);`
+      CREATE INDEX IF NOT EXISTS inputs_namespace ON inputs(namespace, input_id);
+      CREATE TABLE IF NOT EXISTS worker_certificates (worker_id TEXT PRIMARY KEY, data TEXT NOT NULL);`
 
 func Open(directory string) (*Store, error) {
 	if err := os.MkdirAll(directory, 0o700); err != nil {
@@ -367,6 +369,21 @@ func table(kind string) string {
 		return kind
 	}
 	panic("unknown registry " + kind)
+}
+
+// CertificateFingerprint is the recorded server-certificate SHA-256 of a remote worker, or ""
+// when none is recorded (first contact). It is kept per worker ID, whatever its URL: a worker
+// moved to a new address must still present the certificate it presented before.
+func (s *Store) CertificateFingerprint(workerID string) string {
+	return s.row("SELECT data FROM worker_certificates WHERE worker_id=?", workerID).Str("certificate_sha256")
+}
+
+// RecordCertificateFingerprint keeps the fingerprint every later connection to the worker must
+// present, with the URL it was seen at.
+func (s *Store) RecordCertificateFingerprint(workerID, url, sha256 string) error {
+	record := jsonv.O("worker_id", workerID, "url", url, "certificate_sha256", sha256, "recorded_at", c.Now())
+	_, err := s.q().Exec("INSERT INTO worker_certificates VALUES (?,?) ON CONFLICT(worker_id) DO UPDATE SET data=excluded.data", workerID, text(record))
+	return err
 }
 
 // Idempotency returns the digest and job of a stored key.

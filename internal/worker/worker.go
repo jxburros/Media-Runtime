@@ -1,10 +1,13 @@
 // Package worker is the Media Engine client: HTTP calls with the worker credential, protocol
-// negotiation, and supervision of an owned child process.
+// negotiation, supervision of an owned child process, and mutual TLS with certificate pinning
+// for a remote worker.
 package worker
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +23,30 @@ import (
 	"github.com/jxburros/media-runtime/internal/config"
 	c "github.com/jxburros/media-runtime/internal/contracts"
 	"github.com/jxburros/media-runtime/internal/jsonv"
+	"github.com/jxburros/media-runtime/internal/transport"
 )
+
+// Trust is where a remote worker's certificate fingerprint is kept between runs: the one seen on
+// first contact (or the configured pin), recorded so that every later connection must present it.
+type Trust interface {
+	CertificateFingerprint(workerID string) string
+	RecordCertificateFingerprint(workerID, url, sha256 string) error
+}
+
+// Transport describes how the client reaches its worker, for diagnostics.
+type Transport struct {
+	// Scheme is "http" (loopback) or "https" (mutual TLS to a remote worker).
+	Scheme string
+	Remote bool
+	// Pinned is true when the expected fingerprint is the configured pinned_sha256.
+	Pinned bool
+	// Expected is the fingerprint every connection must present ("" before first contact).
+	Expected string
+	// Presented is the fingerprint of the certificate the worker last presented.
+	Presented string
+	// Latency is the round trip of the last /v1/info request (0 before the first).
+	Latency time.Duration
+}
 
 // Probe is one consistent view of the worker: info, capabilities and the negotiated minor.
 type Probe struct {
@@ -63,6 +89,15 @@ type Client struct {
 	child    *Child
 	http     *http.Client
 
+	// Remote workers: a configuration error found at construction (reported by Start), the
+	// configured pin, the recorded fingerprint and the one the worker last presented.
+	setupErr  error
+	trust     Trust
+	pinned    string
+	recorded  string
+	presented string
+	latency   time.Duration
+
 	hookJSON  func(path, method string, body any, result any) (any, error)
 	hookProbe func(p *Probe) (*Probe, error)
 }
@@ -80,22 +115,108 @@ func (w *Client) hooks() (func(string, string, any, any) (any, error), func(*Pro
 	return w.hookJSON, w.hookProbe
 }
 
-// New is the client of one configured worker; the runtime keeps one per pool entry.
+// New is the client of one configured worker; the runtime keeps one per pool entry. A remote
+// entry gets its own transport carrying the client certificate, the CA and the fingerprint check;
+// every request to that worker, polling and streaming alike, goes through it.
 func New(cfg *config.Config, entry config.Worker) *Client {
 	timeout := time.Duration(cfg.WorkerTimeoutMS) * time.Millisecond
-	return &Client{
+	if entry.Remote && entry.RemoteTimeoutMS > 0 {
+		timeout = time.Duration(entry.RemoteTimeoutMS) * time.Millisecond
+	}
+	w := &Client{
 		ID:       entry.WorkerID,
 		cfg:      cfg,
 		entry:    entry,
 		url:      strings.TrimSuffix(entry.URL, "/"),
 		tok:      os.Getenv(entry.TokenEnv),
 		Protocol: c.PROTOCOLS[0],
-		http: &http.Client{
-			Timeout:       timeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirects are refused") },
-			Transport:     &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 4, IdleConnTimeout: 30 * time.Second},
-		},
 	}
+	t := &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 4, IdleConnTimeout: 30 * time.Second}
+	if entry.Remote {
+		config, err := w.tlsConfig()
+		if err != nil {
+			w.setupErr = err
+		}
+		t.TLSClientConfig = config
+		t.ForceAttemptHTTP2 = false
+	}
+	w.http = &http.Client{
+		Timeout:       timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirects are refused") },
+		Transport:     t,
+	}
+	return w
+}
+
+// tlsConfig is the remote worker's client side of mutual TLS: TLS 1.3 (Engine's network mode
+// minimum), the configured CA as the only trust root, the runtime's client certificate, and a
+// fingerprint check on every handshake. Session resumption stays off (no ClientSessionCache),
+// so VerifyPeerCertificate runs on every connection.
+func (w *Client) tlsConfig() (*tls.Config, error) {
+	material := w.entry.TLS
+	if material == nil {
+		return nil, fmt.Errorf("Worker %s: an https:// worker needs tls", w.ID)
+	}
+	w.pinned = material.PinnedSHA256
+	label := "workers." + w.ID + ".tls"
+	roots, err := transport.CertPool(material.CAFile, label+".ca_file")
+	if err != nil {
+		return nil, err
+	}
+	pair, err := transport.KeyPair(material.CertFile, material.KeyFile, label)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		RootCAs:      roots,
+		Certificates: []tls.Certificate{pair},
+		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
+			if len(raw) == 0 {
+				return errors.New("worker presented no certificate")
+			}
+			presented := transport.Fingerprint(raw[0])
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			w.presented = presented
+			if expected := w.expectedLocked(); expected != "" && presented != expected {
+				return &transport.MismatchError{Expected: expected, Presented: presented}
+			}
+			return nil
+		},
+	}, nil
+}
+
+func (w *Client) expectedLocked() string {
+	if w.pinned != "" {
+		return w.pinned
+	}
+	return w.recorded
+}
+
+// SetTrust loads the recorded fingerprint of a remote worker and keeps the store for recording
+// it on first contact.
+func (w *Client) SetTrust(t Trust) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.trust = t
+	if w.entry.Remote && t != nil {
+		w.recorded = t.CertificateFingerprint(w.ID)
+	}
+}
+
+// Transport reports the scheme, the expected and presented fingerprints and the last latency.
+func (w *Client) Transport() Transport {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	t := Transport{Scheme: "http", Remote: w.entry.Remote, Latency: w.latency}
+	if w.entry.Remote {
+		t.Scheme = "https"
+		t.Pinned = w.pinned != ""
+		t.Expected = w.expectedLocked()
+		t.Presented = w.presented
+	}
+	return t
 }
 
 // Entry is the worker's configuration entry.
@@ -122,10 +243,14 @@ func (w *Client) DiscoveredSession() string {
 	return w.disc
 }
 
-// Start launches the configured worker command, or checks the external worker credential.
+// Start launches the configured worker command, or checks the external worker credential (and,
+// for a remote worker, that its TLS material loaded). A remote worker is never launched.
 func (w *Client) Start() error {
+	if w.setupErr != nil {
+		return w.setupErr
+	}
 	command := w.entry.Command
-	if len(command) == 0 {
+	if len(command) == 0 || w.entry.Remote {
 		if len(w.token()) < 32 {
 			return errors.New("Set the configured worker token environment variable")
 		}
@@ -253,7 +378,7 @@ func (w *Client) Response(path, method string, body any, contentType string) (*h
 	}
 	res, err := w.http.Do(req)
 	if err != nil {
-		return nil, c.Err(503, "backend_unavailable", "Worker is unavailable; check its process and configuration")
+		return nil, w.transportError(err)
 	}
 	if res.StatusCode < 200 || res.StatusCode > 299 {
 		defer res.Body.Close()
@@ -269,6 +394,44 @@ func (w *Client) Response(path, method string, body any, contentType string) (*h
 		return nil, c.Err(res.StatusCode, code, "Worker reported "+strings.ReplaceAll(code, "_", " "))
 	}
 	return res, nil
+}
+
+// transportError explains a failed request. A certificate that is not the pinned or recorded one
+// is certificate_mismatch; other TLS failures name the handshake; the rest is unavailability.
+func (w *Client) transportError(err error) error {
+	var mismatch *transport.MismatchError
+	if errors.As(err, &mismatch) {
+		return c.Err(503, "certificate_mismatch", fmt.Sprintf("Worker %s presented certificate sha256 %s, not the %s %s; the connection was refused", w.ID, mismatch.Presented, w.expectedSource(), mismatch.Expected))
+	}
+	if w.entry.Remote {
+		var unknown x509.UnknownAuthorityError
+		var hostname x509.HostnameError
+		var invalid x509.CertificateInvalidError
+		var alert tls.AlertError
+		var record tls.RecordHeaderError
+		switch {
+		case errors.As(err, &unknown):
+			return c.Err(503, "backend_unavailable", "Worker "+w.ID+" certificate does not chain to the configured ca_file")
+		case errors.As(err, &hostname):
+			return c.Err(503, "backend_unavailable", "Worker "+w.ID+" certificate does not name the configured URL's host")
+		case errors.As(err, &invalid):
+			return c.Err(503, "backend_unavailable", "Worker "+w.ID+" certificate is not valid: "+invalid.Error())
+		case errors.As(err, &alert):
+			return c.Err(503, "backend_unavailable", "Worker "+w.ID+" refused the TLS handshake ("+alert.Error()+"); check the client certificate")
+		case errors.As(err, &record):
+			return c.Err(503, "backend_unavailable", "Worker "+w.ID+" did not answer with TLS; check that it runs in network mode")
+		}
+	}
+	return c.Err(503, "backend_unavailable", "Worker is unavailable; check its process and configuration")
+}
+
+func (w *Client) expectedSource() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.pinned != "" {
+		return "pinned_sha256"
+	}
+	return "fingerprint recorded on first contact,"
 }
 
 // JSON performs one request and decodes the JSON response.
@@ -313,7 +476,16 @@ func (w *Client) Probe() (*Probe, error) {
 	var infoErr, capsErr error
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); info, infoErr = w.Obj("/v1/info", "GET", nil) }()
+	go func() {
+		defer wg.Done()
+		started := time.Now()
+		info, infoErr = w.Obj("/v1/info", "GET", nil)
+		if infoErr == nil {
+			w.mu.Lock()
+			w.latency = time.Since(started)
+			w.mu.Unlock()
+		}
+	}()
 	go func() { defer wg.Done(); caps, capsErr = w.Obj("/v1/capabilities", "GET", nil) }()
 	wg.Wait()
 	if infoErr != nil {
@@ -338,6 +510,9 @@ func (w *Client) Probe() (*Probe, error) {
 	if other != protocol {
 		return nil, c.Err(503, "protocol_mismatch", "Worker info and capabilities disagree about the protocol")
 	}
+	if err := w.checkCertificate(info); err != nil {
+		return nil, err
+	}
 	w.mu.Lock()
 	w.Protocol = protocol
 	w.mu.Unlock()
@@ -361,10 +536,45 @@ func (w *Client) Probe() (*Probe, error) {
 	return p, nil
 }
 
+// checkCertificate compares the fingerprint a remote worker reports in /v1/info with the
+// certificate it presented, then records it: the configured pin, or on first contact the
+// fingerprint seen, which every later connection is held to.
+func (w *Client) checkCertificate(info *jsonv.Object) error {
+	if !w.entry.Remote {
+		return nil
+	}
+	reported, _ := info.Get("certificate_sha256").(string)
+	if info.Str("scheme") != "https" || reported == "" {
+		return c.Err(503, "protocol_mismatch", "Remote worker "+w.ID+" does not report its certificate_sha256; network mode needs Engine 0.5.0 or later")
+	}
+	w.mu.Lock()
+	presented, trust, record, recorded := w.presented, w.trust, w.expectedLocked(), w.recorded
+	w.mu.Unlock()
+	if !strings.EqualFold(reported, presented) {
+		return c.Err(503, "certificate_mismatch", "Worker "+w.ID+" reports certificate sha256 "+reported+" but presented "+presented)
+	}
+	if record == "" {
+		record = presented
+	}
+	if trust != nil && recorded != record {
+		if err := trust.RecordCertificateFingerprint(w.ID, w.url, record); err != nil {
+			return err
+		}
+	}
+	w.mu.Lock()
+	w.recorded = record
+	w.mu.Unlock()
+	return nil
+}
+
 func jsonEqual(a, b any) bool { return string(jsonv.MustMarshal(a)) == string(jsonv.MustMarshal(b)) }
 
-// Stop terminates an owned child: SIGTERM, then SIGKILL after six seconds.
+// Stop terminates an owned child: SIGTERM, then SIGKILL after six seconds. A remote worker is
+// never owned and never signalled.
 func (w *Client) Stop() {
+	if w.entry.Remote {
+		return
+	}
 	child := w.Child()
 	if child == nil || child.Exited() {
 		return
