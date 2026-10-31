@@ -458,6 +458,15 @@ Studio's typed entry point is the TypeScript package in [`gateway-client/`](gate
 (`@media-runtime/gateway-client`, no runtime dependencies). It is versioned with the service and
 speaks only the public API.
 
+## Testbench
+
+To check that Runtime and Engine work together on your own local models, run
+[`testbench/testbench.py`](testbench/README.md). It is one standard-library Python file. It starts
+both services, runs one small job per feature (text-to-image, batches, LoRA, image-to-image,
+upscaling, a two-step recipe, video, audio, cancellation) and writes an HTML report with the
+outputs. Features whose model you have not configured, or that the running build does not
+advertise yet, are skipped. `python3 testbench/testbench.py --fixture` runs it without models.
+
 ## Development
 
 Keep Media-Engine beside this checkout (or set `MEDIA_ENGINE_REPO`; `MEDIA_ENGINE_PYTHON` selects

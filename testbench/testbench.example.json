@@ -1,0 +1,15 @@
+{
+  "engine_command": ["/absolute/path/to/Media-Engine/.venv/bin/media-engine"],
+  "device": "cuda:0",
+  "models": {
+    "sdxl": "/absolute/path/to/stable-diffusion-xl-base-1.0",
+    "lora": "/absolute/path/to/a-peft-lora",
+    "upscaler": "/absolute/path/to/realesrgan-x4",
+    "video": "/absolute/path/to/stable-video-diffusion-img2vid-xt",
+    "audio": "/absolute/path/to/stable-audio-open-1.0"
+  },
+  "settings": {
+    "size": 512,
+    "steps": 12
+  }
+}
