@@ -116,3 +116,18 @@ func TestDoctorReportsTransportPerWorker(t *testing.T) {
 		}
 	}
 }
+
+func TestDoctorAndCatalogDescribeVideoModels(t *testing.T) {
+	lines, _ := ExplainDoctor(obj(t, `{"runtime_version":"0.9.0","protocols":["media-worker/1.3"],"worker":{"backend_id":"diffusers-sdxl","protocol":"media-worker/1.3","device_ready":true,"tasks":["text-to-image","image-to-video"]},
+		"models":[{"model_id":"svd-xt","artifact_handle":"svd-xt","family":"svd","video_sizes":[[1024,576],[576,1024]],"default_frames":25,"available":true,"missing_roles":[]}],
+		"recipes":[{"recipe_id":"animate","pipeline":"image-to-video"}],"storage":{"writable":true,"available_bytes":0},"queue":{}}`))
+	for _, want := range []string{"Model svd-xt (svd-xt, svd): all registered files present", "  video sizes 1024×576, 576×1024; default 25 frames", "Recipes: animate (image-to-video)"} {
+		if !contains(lines, want) {
+			t.Fatalf("missing %q in %s", want, strings.Join(lines, "\n"))
+		}
+	}
+	catalog := ExplainCatalog([]any{obj(t, `{"artifact_handle":"svd-xt","family":"svd","complete":true,"present":true,"file_count":10,"total_bytes":0,"problems":[],"registration":{"model_id":"svd-xt","artifact_handle":"svd-xt","family":"svd"}}`)})
+	if catalog[0] != "svd-xt: complete svd image-to-video bundle (10 files, 0.00 GiB)" {
+		t.Fatal(catalog)
+	}
+}

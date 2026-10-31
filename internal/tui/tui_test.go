@@ -89,3 +89,28 @@ func TestDashboardShowsEachWorkerOfAPool(t *testing.T) {
 		t.Fatalf("no worker column: %q", lines[5])
 	}
 }
+
+func TestDashboardShowsVideoFramesAndDuration(t *testing.T) {
+	decoding := parse(t, `{"job_id":"job_44444444-4444-4444-4444-444444444444","state":"running","stage":"decoding","task":"image-to-video","progress":{"stage":"decoding","scope":"stage","unit":"frames","completed_steps":8,"total_steps":25},"model":{"model_id":"svd-xt"},"request":{"parameters":{"seed":7,"width":1024,"height":576,"steps":25,"frames":25,"fps":7}},"created_at":"2026-10-30T10:00:00.000Z","outputs":[]}`)
+	done := decoding.Clone().Set("job_id", "job_55555555-5555-5555-5555-555555555555").Set("state", "succeeded").Set("stage", nil).
+		Set("media", jsonv.O("type", "video", "frames", 14.0, "fps", 7.0, "duration_seconds", 2.0)).
+		Set("outputs", []any{jsonv.O("output_id", "frames", "expires_at", nil), jsonv.O("output_id", "poster", "expires_at", nil)})
+	done.Delete("progress")
+	lines := Render(State{Jobs: []*jsonv.Object{decoding, done}}, 160, 12)
+	text := strings.Join(lines, "\n")
+	if s := DescribeStage(decoding); s != "decoding 8/25 frames" {
+		t.Fatal(s)
+	}
+	for _, want := range []string{"decoding 8/25", "25f 3.57s", "14f 2.00s", "2 outputs ready", "frames 25 at 7 fps"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in\n%s", want, text)
+		}
+	}
+	if !strings.Contains(lines[4], "media") {
+		t.Fatalf("no media column: %q", lines[4])
+	}
+	// Image-only dashboards keep their layout.
+	if image := Render(State{Jobs: []*jsonv.Object{parse(t, running)}}, 160, 12); strings.Contains(image[4], "media") {
+		t.Fatalf("an image job shows a media column: %q", image[4])
+	}
+}
