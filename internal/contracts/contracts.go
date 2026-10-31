@@ -18,21 +18,36 @@ import (
 
 const VERSION = "0.8.0"
 
-var PROTOCOLS = []string{"media-worker/1.0", "media-worker/1.1", "media-worker/1.2"}
+var PROTOCOLS = []string{"media-worker/1.0", "media-worker/1.1", "media-worker/1.2", "media-worker/1.3"}
 var PROTOCOL = PROTOCOLS[len(PROTOCOLS)-1]
 var BACKENDS = []string{"diffusers-sdxl", "owned-sdxl"}
-var TASKS = []string{"text-to-image", "image-to-image", "upscale"}
+var TASKS = []string{"text-to-image", "image-to-image", "upscale", "image-to-video"}
 
 // FAMILIES are the model families a registration may name, with the tasks each serves.
 var FAMILIES = map[string][]string{
 	"sdxl-base": {"text-to-image", "image-to-image"},
 	"esrgan":    {"upscale"},
+	"svd":       {"image-to-video"},
 }
+
+// BundleFacts are the facts a 1.2+ worker reports when it validates a bundle of each family,
+// recorded with the registered model: the upscale factor, the sizes and default frame count an
+// svd bundle serves.
+var BundleFacts = map[string][]string{
+	"esrgan": {"scale"},
+	"svd":    {"video_sizes", "default_frames"},
+}
+
+// FAMILY_NAMES lists the families in the order they were introduced.
+var FAMILY_NAMES = []string{"sdxl-base", "esrgan", "svd"}
 
 // TaskFamily is the family whose bundles serve a task.
 func TaskFamily(task string) string {
-	if task == "upscale" {
+	switch task {
+	case "upscale":
 		return "esrgan"
+	case "image-to-video":
+		return "svd"
 	}
 	return "sdxl-base"
 }
@@ -44,8 +59,31 @@ func TaskMinor(task string) int {
 		return 1
 	case "upscale":
 		return 2
+	case "image-to-video":
+		return 3
 	}
 	return 0
+}
+
+// FamilyMinor is the lowest protocol minor whose bundles may name a family.
+func FamilyMinor(family string) int {
+	switch family {
+	case "esrgan":
+		return 2
+	case "svd":
+		return 3
+	}
+	return 0
+}
+
+// UsesImage reports whether a task takes an uploaded image input.
+func UsesImage(task string) bool {
+	return task == "image-to-image" || task == "upscale" || task == "image-to-video"
+}
+
+// UsesPrompt reports whether a task is conditioned on a text prompt.
+func UsesPrompt(task string) bool {
+	return task != "upscale" && task != "image-to-video"
 }
 
 // Minor is the minor number of a negotiated protocol (media-worker/1.N).
@@ -91,14 +129,31 @@ var tileFields = []Field{
 	{Name: "tile_overlap", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(64)})},
 }
 
+// videoFields are the image-to-video parameters (protocol 1.3) beside width, height, seed and
+// steps. The bounds are the protocol's; the worker's advertised limits are checked at resolution.
+var videoFields = []Field{
+	{Name: "frames", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(64)})},
+	{Name: "fps", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(30)})},
+	{Name: "motion", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(255)})},
+	{Name: "noise_augmentation", Check: Num(NumOpts{Min: F(0), Max: F(1)})},
+	{Name: "decode_chunk", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(16)})},
+}
+
+// VideoParameterNames are the parameters an image-to-video request may carry.
+var VideoParameterNames = []string{"width", "height", "seed", "steps", "frames", "fps", "motion", "noise_augmentation", "decode_chunk"}
+
 // Parameters is the complete, resolved parameter set of a diffusion task.
 var Parameters = StrictObject(parameterFields...)
 
 // UpscaleParameters is the resolved parameter set of an upscale: the input's size and tiling.
 var UpscaleParameters = StrictObject(append(append([]Field{}, parameterFields[:2]...), tileFields...)...)
 
+// VideoParameters is the resolved parameter set of an image-to-video operation: the input's size,
+// the seed, steps (the worker bounds them by limits.video_steps) and every video parameter.
+var VideoParameters = StrictObject(append([]Field{parameterFields[0], parameterFields[1], parameterFields[4], parameterFields[2]}, videoFields...)...)
+
 // PartialParameters is a request's or recipe's parameter overrides for any task.
-var PartialParameters = StrictObject(Partial(append(append([]Field{}, parameterFields...), tileFields...))...)
+var PartialParameters = StrictObject(Partial(append(append(append([]Field{}, parameterFields...), tileFields...), videoFields...))...)
 
 // Prompt is a non-blank prompt; diffusion tasks require one and upscale forbids it.
 var Prompt = Str(StrOpts{Min: 1, Max: 10000, Refine: func(s string) bool { return strings.TrimFunc(s, isJSSpace) != "" }})
@@ -150,7 +205,7 @@ var recipeSchemaV1 = Refine(StrictObject(
 	Field{Name: "recipe_id", Check: ID},
 	Field{Name: "revision", Check: Num(NumOpts{Int: true, GreaterThan: F(0)})},
 	Field{Name: "pipeline", Check: Enum(TASKS...)},
-	Field{Name: "model_family", Check: Enum("sdxl-base", "esrgan")},
+	Field{Name: "model_family", Check: Enum(FAMILY_NAMES...)},
 	Field{Name: "inputs", Check: StrictObject(
 		Field{Name: "prompt", Check: StrictObject(
 			Field{Name: "type", Check: Literal("string")},
@@ -170,10 +225,10 @@ var recipeSchemaV1 = Refine(StrictObject(
 	if r.Str("model_family") != TaskFamily(pipeline) || !defaultsServe(pipeline, defaults, r.Has("adapters")) {
 		return false
 	}
-	switch pipeline {
-	case "image-to-image":
+	switch {
+	case pipeline == "image-to-image":
 		return inputs.Has("prompt") && inputs.Has("image")
-	case "upscale":
+	case !UsesPrompt(pipeline):
 		return inputs.Has("image") && !inputs.Has("prompt")
 	}
 	return inputs.Has("prompt") && !inputs.Has("image")
@@ -202,7 +257,7 @@ var sourceSchema = StrictObject(sourceFields...)
 var Registration = StrictObject(
 	Field{Name: "model_id", Check: ID},
 	Field{Name: "artifact_handle", Check: ID},
-	Field{Name: "family", Check: Enum("sdxl-base", "esrgan"), Optional: true},
+	Field{Name: "family", Check: Enum(FAMILY_NAMES...), Optional: true},
 	Field{Name: "source", Check: StrictObject(append(append([]Field{}, sourceFields...),
 		Field{Name: "conversion", Check: Conversion, Optional: true})...), Default: func() any { return jsonv.NewObject() }},
 )
@@ -218,6 +273,9 @@ func DefaultRecipes() []*jsonv.Object {
 	return []*jsonv.Object{
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"portrait","revision":1,"pipeline":"text-to-image","model_family":"sdxl-base","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"width":1024,"height":1024,"steps":30,"guidance":6}}`),
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"enlarge","revision":1,"pipeline":"upscale","model_family":"esrgan","inputs":{"image":{"type":"image","required":true}},"defaults":{"tile":0,"tile_overlap":16}}`),
+		// steps is the recipe's: the worker has no default for video steps (fps, motion,
+		// noise_augmentation and decode_chunk come from its task_defaults, frames from the bundle).
+		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"animate","revision":1,"pipeline":"image-to-video","model_family":"svd","inputs":{"image":{"type":"image","required":true}},"defaults":{"steps":25}}`),
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"variation","revision":1,"pipeline":"image-to-image","model_family":"sdxl-base","inputs":{"prompt":{"type":"string","required":true},"image":{"type":"image","required":true}},"defaults":{"steps":30,"guidance":6,"strength":0.6}}`),
 	}
 }
@@ -418,14 +476,3 @@ func OutputIDs(taskParameters *jsonv.Object, count int) []string {
 
 // Extensions maps each verifiable output MIME type to its file extension.
 var Extensions = map[string]string{"image/png": "png", "application/zip": "zip", "video/mp4": "mp4", "audio/wav": "wav"}
-
-// Signatures verify an output's bytes against its MIME type and record without decoding
-// media. PNG is checked from 0.5.0; the archive, video and audio checks arrive with their tasks.
-var Signatures = map[string]func(data []byte, record *jsonv.Object) bool{
-	"image/png": func(data []byte, record *jsonv.Object) bool {
-		width, _ := record.Num("width")
-		height, _ := record.Num("height")
-		return len(data) >= 24 && string(data[:8]) == "\x89PNG\r\n\x1a\n" && string(data[12:16]) == "IHDR" &&
-			float64(binary.BigEndian.Uint32(data[16:20])) == width && float64(binary.BigEndian.Uint32(data[20:24])) == height
-	},
-}

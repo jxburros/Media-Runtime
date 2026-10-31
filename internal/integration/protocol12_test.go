@@ -26,10 +26,13 @@ func boot12(t *testing.T, args ...string) *env {
 	}
 	t.Setenv("MEDIA_TEST_WORKER_TOKEN", WorkerToken)
 	catalog := jsonv.NewObject()
-	for _, handle := range []string{"fixture", "fixture-lora", "upscaler", "converted", "checkpoint"} {
+	for _, handle := range []string{"fixture", "fixture-lora", "upscaler", "converted", "checkpoint", "video"} {
 		dir := map[string]string{"fixture": "model", "fixture-lora": "lora"}[handle]
 		if dir == "" {
 			dir = handle
+		}
+		if _, err := os.Stat(filepath.Join(root, dir)); err != nil && handle == "video" {
+			continue // created by Engine 0.6.0 fixtures and later only
 		}
 		catalog.Set(handle, filepath.Join(root, dir))
 	}
@@ -86,7 +89,8 @@ func TestProtocol12MultipleOutputs(t *testing.T) {
 	e := boot12(t)
 	ok := must[*jsonv.Object](t)
 	health := ok(e.client.Health())
-	equal(t, get(health, "worker", "protocol"), "media-worker/1.2")
+	// The highest minor the fixture and the runtime share: 1.2 against Engine 0.4.0–0.5.0, 1.3 from 0.6.0.
+	equal(t, get(health, "worker", "protocol"), e.fixture.Highest())
 	if get(health, "worker", "device_identity", "host_id") == nil {
 		t.Fatal("doctor lacks the worker's device identity")
 	}
@@ -116,7 +120,7 @@ func TestProtocol12MultipleOutputs(t *testing.T) {
 	manifest := must[any](t)(e.client.Manifest(done.Str("job_id"))).(*jsonv.Object)
 	equal(t, manifest.Get("schema_version"), 3.0)
 	equal(t, len(manifest.Arr("outputs")), 3)
-	equal(t, get(manifest, "backend", "protocol"), "media-worker/1.2")
+	equal(t, get(manifest, "backend", "protocol"), e.fixture.Highest())
 	if manifest.Get("device_identity") == nil {
 		t.Fatal("manifest lacks device identity")
 	}

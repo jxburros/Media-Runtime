@@ -355,7 +355,7 @@ func (s *Server) route(q *request) error {
 		for _, model := range rt.Store.RegistryAll("models") {
 			bundle := model.Obj("bundle")
 			_, statErr := os.Stat(cfg.Catalog(model.Str("artifact_handle")))
-			models = append(models, jsonv.O(
+			models = append(models, withFacts(jsonv.O(
 				"model_id", model.Get("model_id"),
 				"family", bundle.Get("family"),
 				"tasks", familyTasks(bundle.Str("family")),
@@ -363,7 +363,7 @@ func (s *Server) route(q *request) error {
 				"bundle_digest", bundle.Get("bundle_digest"),
 				"source", jsonv.Maybe(bundle.Get("source")),
 				"available", statErr == nil && cfg.Catalog(model.Str("artifact_handle")) != "",
-			))
+			), model))
 		}
 		return q.send(200, models)
 	}
@@ -389,7 +389,7 @@ func (s *Server) route(q *request) error {
 			return err
 		}
 		family := model.Str("family")
-		if family != "sdxl-base" && (c.Minor(p.Protocol) < 2 || !workerLoads(p.Caps, family)) {
+		if family != "sdxl-base" && (c.Minor(p.Protocol) < c.FamilyMinor(family) || !workerLoads(p.Caps, family)) {
 			return c.Err(503, "unsupported", "The connected worker does not load the "+family+" family", "family")
 		}
 		validation, err := w.Client.Obj("/v1/validate", "POST", jsonv.O("protocol", p.Protocol, "bundle", model.Get("bundle"), "options", jsonv.Maybe(p.Caps.Get("load_defaults"))))
@@ -400,15 +400,22 @@ func (s *Server) route(q *request) error {
 			// The worker read the network configuration; its factor is the one recorded.
 			model.Set("scale", scale)
 		}
+		// The bundle facts the worker read from the configurations (video sizes and default
+		// frame count for svd) are recorded with the model, as the upscale factor is.
+		for _, k := range c.BundleFacts[family] {
+			if v := validation.Get(k); v != nil {
+				model.Set(k, v)
+			}
+		}
 		rt.Store.Register("models", model.Str("model_id"), model)
-		return q.send(201, jsonv.O(
+		return q.send(201, withFacts(jsonv.O(
 			"model_id", model.Get("model_id"),
 			"family", model.Get("family"),
 			"scale", jsonv.Maybe(model.Get("scale")),
 			"bundle_digest", model.Obj("bundle").Get("bundle_digest"),
 			"conversion", jsonv.Maybe(model.Obj("bundle").Obj("source").Get("conversion")),
 			"memory_estimate", nullish(validation.Get("memory_estimate")),
-		))
+		), model))
 	case path == "/v1/adapters" && method == "GET":
 		list := []any{}
 		for _, a := range rt.Store.RegistryAll("adapters") {
@@ -627,6 +634,7 @@ func (s *Server) modelDetail(q *request, modelID string, verify bool) error {
 		"components", components,
 		"file_count", float64(files.Len()),
 	)
+	withFacts(detail, model)
 	if verify {
 		// Re-verify every byte through the worker and report the load estimate.
 		if err := q.requireOperator(); err != nil {
@@ -785,6 +793,18 @@ func outputLimits(cfg *config.Config) *jsonv.Object {
 		limits.Set(mime, float64(cfg.OutputLimit(mime)))
 	}
 	return limits
+}
+
+// withFacts adds a model's recorded bundle facts (video sizes, default frames, audio facts).
+func withFacts(o, model *jsonv.Object) *jsonv.Object {
+	for _, family := range c.FAMILY_NAMES {
+		for _, k := range c.BundleFacts[family] {
+			if k != "scale" && model.Has(k) {
+				o.Set(k, model.Get(k))
+			}
+		}
+	}
+	return o
 }
 
 func familyTasks(family string) []any {

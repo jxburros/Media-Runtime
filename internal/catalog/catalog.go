@@ -23,6 +23,36 @@ var forbidden = regexp.MustCompile(`\.(py|pkl|pickle|bin|pt|pth)$`)
 var ROLES = []string{"unet", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2", "scheduler"}
 var WEIGHT_ROLES = ROLES[:4]
 
+// diffusersFamily is one Diffusers-format family: its pipeline task, the pipeline class its
+// model_index.json names, its scheduler class and its component roles, weight roles first.
+type diffusersFamily struct {
+	pipeline, class, scheduler string
+	// schedulerName is the scheduler as the inspection problems name it.
+	schedulerName string
+	roles         []string
+	weights       int
+	// unsupported is the refusal when the model index names another pipeline class.
+	unsupported string
+}
+
+var diffusersFamilies = map[string]diffusersFamily{
+	"sdxl-base": {pipeline: "text-to-image", class: "StableDiffusionXLPipeline", scheduler: "EulerDiscreteScheduler", schedulerName: "Euler discrete", roles: ROLES, weights: 4,
+		unsupported: "Only SDXL base Diffusers bundles are supported"},
+	"svd": {pipeline: "image-to-video", class: "StableVideoDiffusionPipeline", scheduler: "EulerDiscreteScheduler", schedulerName: "Euler discrete",
+		roles: []string{"unet", "vae", "image_encoder", "feature_extractor", "scheduler"}, weights: 3,
+		unsupported: "An svd bundle is a Diffusers StableVideoDiffusionPipeline directory"},
+}
+
+// diffusersFamilyOf is the family whose pipeline class a model index names, or sdxl-base.
+func diffusersFamilyOf(index *jsonv.Object) (string, diffusersFamily) {
+	for _, name := range c.FAMILY_NAMES {
+		if f, ok := diffusersFamilies[name]; ok && index != nil && index.Get("_class_name") == f.class {
+			return name, f
+		}
+	}
+	return "sdxl-base", diffusersFamilies["sdxl-base"]
+}
+
 func realpath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -141,15 +171,19 @@ func BuildBundle(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 	if err != nil {
 		return nil, err
 	}
+	spec := diffusersFamilies[family]
+	if family != "sdxl-base" && source.Has("conversion") {
+		return nil, c.Err(400, "invalid_request", "Conversion provenance applies to converted SDXL bundles", "source.conversion")
+	}
 	index, err := readJSON(filepath.Join(root, "model_index.json"))
 	if err != nil {
 		return nil, c.Err(400, "missing_component", "Missing pipeline configuration")
 	}
-	if index.Get("_class_name") != "StableDiffusionXLPipeline" {
-		return nil, c.Err(400, "unsupported", "Only SDXL base Diffusers bundles are supported")
+	if index.Get("_class_name") != spec.class {
+		return nil, c.Err(400, "unsupported", spec.unsupported)
 	}
 	components := []any{}
-	for i, role := range ROLES {
+	for i, role := range spec.roles {
 		entries := jsonv.NewObject()
 		weights := false
 		for _, k := range files.Keys() {
@@ -158,11 +192,11 @@ func BuildBundle(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 				weights = weights || strings.HasSuffix(k, ".safetensors")
 			}
 		}
-		if entries.Len() == 0 || (i < 4 && !weights) {
+		if entries.Len() == 0 || (i < spec.weights && !weights) {
 			return nil, c.Err(400, "missing_component", fmt.Sprintf("Missing %s component", role), role)
 		}
 		format := "json"
-		if i < 4 {
+		if i < spec.weights {
 			format = "safetensors"
 		}
 		components = append(components, jsonv.O("role", role, "artifact_handle", handle, "digest", c.Hash(entries), "tensor_format", format))
@@ -170,16 +204,20 @@ func BuildBundle(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 	bundle := jsonv.O(
 		"schema_version", 1.0,
 		"bundle_id", data.Str("model_id"),
-		"family", "sdxl-base",
-		"pipeline", "text-to-image",
-		"components", components,
-		"configuration", jsonv.O("artifact_handle", handle, "files", files),
-		"source", source,
+		"family", family,
 	)
+	if family != "sdxl-base" {
+		// format is a 1.2 bundle field; an sdxl-base bundle omits it so 1.0/1.1 workers accept it.
+		bundle.Set("format", "diffusers-safetensors")
+	}
+	bundle.Set("pipeline", spec.pipeline).
+		Set("components", components).
+		Set("configuration", jsonv.O("artifact_handle", handle, "files", files)).
+		Set("source", source)
 	return jsonv.O(
 		"model_id", data.Str("model_id"),
 		"artifact_handle", handle,
-		"family", "sdxl-base",
+		"family", family,
 		"bundle", bundle.Clone().Set("bundle_digest", c.Hash(bundle)),
 	), nil
 }
@@ -402,6 +440,15 @@ func Inspect(catalog *jsonv.Object, handle string) []any {
 			continue
 		}
 		present = true
+		// The model index names the Diffusers family; its roles are what completeness means.
+		index, _ := readJSON(filepath.Join(root, "model_index.json"))
+		var spec diffusersFamily
+		family, spec = diffusersFamilyOf(index)
+		roles = jsonv.NewObject()
+		for _, r := range spec.roles {
+			roles.Set(r, jsonv.O("present", false, "safetensors", 0.0, "files", 0.0))
+		}
+		missing = append([]string(nil), spec.roles...)
 		var walk func(relative string) error
 		walk = func(relative string) error {
 			names, err := readdir(filepath.Join(root, relative))
@@ -474,7 +521,7 @@ func Inspect(catalog *jsonv.Object, handle string) []any {
 				continue
 			}
 			if bareCheckpoint(top) {
-				format, missing = "single-file-checkpoint", append([]string(nil), ROLES...)
+				family, format, missing = "sdxl-base", "single-file-checkpoint", append([]string(nil), ROLES...)
 				problems = append(problems, "Single-file checkpoint: convert it with media-engine convert, then catalogue the converted directory")
 				entries = append(entries, entry())
 				continue
@@ -498,21 +545,21 @@ func Inspect(catalog *jsonv.Object, handle string) []any {
 			problems = append(problems, "scheduler/scheduler_config.json is missing or invalid")
 		}
 		missing = nil
-		for i, r := range ROLES {
+		for i, r := range spec.roles {
 			role := roles.Obj(r)
 			s, _ := role.Num("safetensors")
-			if !role.Bool("present") || (i < len(WEIGHT_ROLES) && s == 0) {
+			if !role.Bool("present") || (i < spec.weights && s == 0) {
 				missing = append(missing, r)
 			}
 		}
 		if len(missing) > 0 {
 			problems = append(problems, "Missing or weightless components: "+strings.Join(missing, ", "))
 		}
-		if pipeline != nil && pipeline != "StableDiffusionXLPipeline" {
-			problems = append(problems, "Only SDXL base Diffusers bundles are supported")
+		if pipeline != nil && pipeline != spec.class {
+			problems = append(problems, spec.unsupported)
 		}
-		if scheduler != nil && scheduler != "EulerDiscreteScheduler" {
-			problems = append(problems, "Only the Euler discrete scheduler is supported")
+		if scheduler != nil && scheduler != spec.scheduler {
+			problems = append(problems, "Only the "+spec.schedulerName+" scheduler is supported")
 		}
 		if len(forbiddenFiles) > 0 {
 			problems = append(problems, "Remove Python, pickle and non-safetensors weight files before registering")

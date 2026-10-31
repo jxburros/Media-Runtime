@@ -3,6 +3,8 @@
 package runtime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -557,8 +559,12 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 	if minor >= 2 {
 		taskParameters = caps.Obj("task_parameters").Obj(task)
 	}
-	usesImage := task == "image-to-image" || task == "upscale"
-	if task == "upscale" {
+	usesImage := c.UsesImage(task)
+	if task == "image-to-video" {
+		if err := videoRequest(plan, request, inputs, params, taskParameters); err != nil {
+			return nil, err
+		}
+	} else if task == "upscale" {
 		if inputs.Has("prompt") || inputs.Has("negative_prompt") {
 			field := "inputs.prompt"
 			if !inputs.Has("prompt") {
@@ -634,6 +640,21 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 				return nil, c.Err(400, "unsupported", "tile must be 0 or an advertised tile size", "parameters.tile")
 			}
 		}
+	} else if task == "image-to-video" {
+		// The worker's video defaults (fps, motion, noise_augmentation, decode_chunk), then the
+		// bundle's frame count recorded at registration, then the recipe, the image and the request.
+		merged := jsonv.NewObject().Assign(caps.Obj("task_defaults").Obj(task)).Assign(taskParameters.Obj("defaults"))
+		if frames, ok := model.Num("default_frames"); ok {
+			merged.Set("frames", frames)
+		}
+		merged.Assign(defaults).Assign(imageDefaults).Assign(params)
+		merged.Set("seed", nullish(params.Get("seed"), defaults.Get("seed"), c.Seed()))
+		if effective, err = c.Validate(c.VideoParameters, merged); err != nil {
+			return nil, err
+		}
+		if err := withinLimits(effective, caps.Obj("limits"), videoLimits); err != nil {
+			return nil, err
+		}
 	} else {
 		merged := jsonv.NewObject().Assign(caps.Obj("defaults"))
 		if task == "image-to-image" {
@@ -661,6 +682,17 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 		}
 		if c.EffectiveSteps(effective) < 1 {
 			return nil, c.Err(400, "invalid_request", "steps × strength must denoise for at least one step", "parameters.strength")
+		}
+	}
+	if task == "image-to-video" {
+		// Only a size the bundle serves; the input is never resized or cropped to fit one.
+		sizes := asArray(model.Get("video_sizes"))
+		if len(sizes) == 0 {
+			sizes = asArray(caps.Obj("limits").Get("video_sizes"))
+		}
+		size := []any{effective.Get("width"), effective.Get("height")}
+		if !containsJSON(sizes, size) {
+			return nil, c.Err(400, "invalid_request", "The input's size is not one the model serves ("+sizeList(sizes)+"); nothing is resized", "video_size")
 		}
 	}
 	if task == "upscale" {
@@ -755,6 +787,75 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 		"outputs", []any{},
 	)
 	return &resolvedOperation{operation: operation, uses: uses, backendID: backendID, options: options}, nil
+}
+
+// videoRequest refuses what an image-to-video operation does not take: a prompt, image-generation
+// parameters (guidance, sampler, scheduler, strength, count), tiling and adapters. A video
+// parameter the worker does not advertise is unsupported.
+func videoRequest(plan *operationPlan, request, inputs, params, taskParameters *jsonv.Object) error {
+	for _, k := range []string{"prompt", "negative_prompt"} {
+		if inputs.Has(k) {
+			return forbidden("inputs."+k, "An image-to-video operation is conditioned on its image alone and takes no prompt")
+		}
+	}
+	for _, k := range []string{"guidance", "sampler", "scheduler", "strength", "count", "tile", "tile_overlap"} {
+		if params.Has(k) {
+			return forbidden("parameters."+k, "An image-to-video operation has no "+k)
+		}
+	}
+	if (plan.first && request.Has("adapters")) || plan.op.Has("adapters") {
+		return forbidden("adapters", "Adapters do not apply to image-to-video")
+	}
+	advertised := strList(taskParameters.Get("parameters"))
+	for _, k := range []string{"frames", "fps", "motion", "noise_augmentation", "decode_chunk"} {
+		if (params.Has(k) || plan.op.Obj("defaults").Has(k)) && !c.Contains(advertised, k) {
+			return c.Err(400, "unsupported", "The connected worker does not advertise the video parameter "+k, "parameters."+k)
+		}
+	}
+	return nil
+}
+
+// videoLimits maps each video parameter to the worker limit that bounds it.
+var videoLimits = [][2]string{{"steps", "video_steps"}, {"frames", "frames"}, {"fps", "fps"}, {"motion", "motion"}, {"noise_augmentation", "noise_augmentation"}, {"decode_chunk", "decode_chunk"}}
+
+// withinLimits checks resolved parameters against the worker's advertised [low, high] ranges; a
+// value outside one is refused, never clamped.
+func withinLimits(effective, limits *jsonv.Object, pairs [][2]string) error {
+	for _, pair := range pairs {
+		value, ok := effective.Num(pair[0])
+		bounds := asArray(limits.Get(pair[1]))
+		if !ok || len(bounds) != 2 {
+			continue
+		}
+		low, lok := bounds[0].(float64)
+		high, hok := bounds[1].(float64)
+		if lok && hok && (value < low || value > high) {
+			return c.Err(400, "invalid_request", fmt.Sprintf("%s must be within the worker's range %s–%s", pair[0], jsonv.Number(low), jsonv.Number(high)), "parameters."+pair[0])
+		}
+	}
+	return nil
+}
+
+func containsJSON(list []any, v any) bool {
+	for _, e := range list {
+		if jsonEqual(e, v) {
+			return true
+		}
+	}
+	return false
+}
+
+// sizeList formats [[w, h], …] as "w×h, …".
+func sizeList(sizes []any) string {
+	parts := []string{}
+	for _, raw := range sizes {
+		if pair := asArray(raw); len(pair) == 2 {
+			w, _ := pair[0].(float64)
+			h, _ := pair[1].(float64)
+			parts = append(parts, jsonv.Number(w)+"×"+jsonv.Number(h))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 // loadPlan resolves the job's backend, load options and authorized fallbacks; every operation
@@ -1305,7 +1406,7 @@ func (r *Runtime) tick(m *pool.Member) (err error) {
 				return nil
 			}
 			inputs := op.Obj("inputs").Clone()
-			if task := op.Str("task"); task == "image-to-image" || task == "upscale" {
+			if c.UsesImage(op.Str("task")) {
 				if op.Str("worker_input_id") == "" {
 					// Hand the worker the verified bytes under a session-scoped handle, never a path.
 					bytes, digest, err := r.operationInput(job, op)
@@ -1625,27 +1726,21 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 			if check == nil || limit == 0 || !isInt(output.Get("size")) || size < 1 || size > float64(limit) {
 				return errors.New("invalid output")
 			}
-			res, err := client.Response("/v1/executions/"+op.Str("execution_id")+"/outputs/"+id, "GET", nil, "")
-			if err != nil {
-				return err
-			}
-			bytes, err := io.ReadAll(io.LimitReader(res.Body, int64(limit)+1))
-			res.Body.Close()
-			if err != nil {
-				return err
-			}
-			if len(bytes) > limit {
-				return errors.New("output too large")
-			}
-			if float64(len(bytes)) != size || c.SHA256Hex(bytes) != output.Str("sha256") || !check(bytes, output) {
-				return errors.New("output integrity failure")
-			}
 			if mime == "image/png" {
 				if w, _ := output.Num("width"); w != width {
 					return errors.New("output dimensions changed")
 				}
 				if h, _ := output.Num("height"); h != height {
 					return errors.New("output dimensions changed")
+				}
+			}
+			if mime == "application/zip" {
+				// The archive holds exactly the requested frames at the requested rate and size;
+				// frames are never dropped or re-timed.
+				for _, k := range []string{"width", "height", "frames", "fps"} {
+					if !jsonEqual(output.Get(k), params.Get(k)) {
+						return errors.New("frame archive differs from the request")
+					}
 				}
 			}
 			record := output.Clone()
@@ -1658,7 +1753,7 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 				return err
 			}
 			synced[filepath.Dir(file)] = true
-			if err := atomicFile(file, bytes); err != nil {
+			if err := receive(client, "/v1/executions/"+op.Str("execution_id")+"/outputs/"+id, file, int64(limit), output, check); err != nil {
 				return err
 			}
 			if seeded && task == "text-to-image" {
@@ -1668,6 +1763,10 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 			committed = append(committed, record.Set("expires_at", r.expiry()))
 		}
 		op.Set("outputs", committed)
+		if media := mediaFacts(task, committed); media != nil {
+			op.Set("media", media)
+			job.Set("media", media)
+		}
 		op.Set("worker", jsonv.Maybe(snapshot.Get("implementation")))
 		op.Set("effective_settings", jsonv.Maybe(snapshot.Get("effective_settings")))
 		op.Set("measurements", jsonv.Maybe(snapshot.Get("measurements")))
@@ -1702,7 +1801,12 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 			return err
 		}
 		var manifest *jsonv.Object
-		if linear {
+		if !linear && hasMedia(job) {
+			// Schema 5: the operations layout with media facts, for any job with a video or audio
+			// operation.
+			job.Set("outputs", committed)
+			manifest = r.linearManifest(job, 5)
+		} else if linear {
 			outputs, intermediates := []any{}, []any{}
 			for _, o := range ops {
 				for _, raw := range o.Arr("outputs") {
@@ -1715,7 +1819,11 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 			}
 			job.Set("outputs", outputs)
 			job.Set("intermediate_outputs", intermediates)
-			manifest = r.linearManifest(job)
+			schema := 4.0
+			if hasMedia(job) {
+				schema = 5
+			}
+			manifest = r.linearManifest(job, schema)
 		} else {
 			job.Set("outputs", committed)
 			manifest = r.manifest(job, op, snapshot, committed, scale)
@@ -1750,6 +1858,47 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 		r.finish(job, "failed", jsonv.O("code", "output_unavailable", "message", "Output could not be verified and committed to durable storage"))
 	}
 	return nil
+}
+
+// receive streams one worker output into a temporary file beside its final path, hashing it on
+// the way, so an output is never held in memory whatever its size. The file must be exactly the
+// recorded size (at most limit bytes), carry the recorded SHA-256 and pass its MIME type's
+// signature check; only then is it fsynced and renamed into place.
+func receive(client *worker.Client, path, file string, limit int64, output *jsonv.Object, check c.Signature) error {
+	res, err := client.Response(path, "GET", nil, "")
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	temp := file + ".tmp"
+	f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			f.Close()
+			os.Remove(temp)
+		}
+	}()
+	digest := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, digest), io.LimitReader(res.Body, limit+1))
+	if err != nil {
+		return err
+	}
+	size, _ := output.Num("size")
+	if n > limit {
+		return errors.New("output too large")
+	}
+	if float64(n) != size || hex.EncodeToString(digest.Sum(nil)) != output.Str("sha256") || !check(f, n, output) {
+		return errors.New("output integrity failure")
+	}
+	if err := errors.Join(f.Sync(), f.Close()); err != nil {
+		return err
+	}
+	committed = true
+	return os.Rename(temp, file)
 }
 
 // manifestInput is the provenance of a submitted input, without its owner or expiry.
@@ -1821,9 +1970,55 @@ func (r *Runtime) manifest(job, op, snapshot *jsonv.Object, committed []any, sca
 
 const determinism = "Seed reproducibility depends on hardware, software and dependency versions; matching bytes are not guaranteed."
 
-// linearManifest is the schema-4 manifest of a linear job: every operation with its model,
-// inputs, settings, worker identity and outputs, then the published and intermediate outputs.
-func (r *Runtime) linearManifest(job *jsonv.Object) *jsonv.Object {
+// mediaTasks produce video or audio; a job with one of them writes manifest schema 5.
+var mediaTasks = map[string]bool{"image-to-video": true}
+
+func hasMedia(job *jsonv.Object) bool {
+	for _, op := range Operations(job) {
+		if mediaTasks[op.Str("task")] {
+			return true
+		}
+	}
+	return false
+}
+
+// mediaFacts summarizes a video or audio operation's committed outputs from the worker's
+// verified output records: frame count, rate, duration and size for video (and whether an
+// encoded video was committed).
+func mediaFacts(task string, committed []any) *jsonv.Object {
+	if task != "image-to-video" {
+		return nil
+	}
+	var frames *jsonv.Object
+	encoded := false
+	for _, raw := range committed {
+		o := raw.(*jsonv.Object)
+		switch o.Str("mime_type") {
+		case "application/zip":
+			frames = o
+		case "video/mp4":
+			encoded = true
+		}
+	}
+	if frames == nil {
+		return nil
+	}
+	return jsonv.O(
+		"type", "video",
+		"frames", frames.Get("frames"),
+		"fps", frames.Get("fps"),
+		"duration_seconds", frames.Get("duration_seconds"),
+		"width", frames.Get("width"),
+		"height", frames.Get("height"),
+		"encoded_video", encoded,
+	)
+}
+
+// linearManifest is the operations manifest: every operation with its model, inputs, settings,
+// worker identity and outputs, then the published and intermediate outputs. Schema 4 is a linear
+// job's; schema 5 adds each operation's media facts and is written for every job that runs a
+// video or audio operation, linear or not.
+func (r *Runtime) linearManifest(job *jsonv.Object, schema float64) *jsonv.Object {
 	inputs, operations := []any{}, []any{}
 	seen := map[string]bool{}
 	for _, op := range Operations(job) {
@@ -1840,7 +2035,7 @@ func (r *Runtime) linearManifest(job *jsonv.Object) *jsonv.Object {
 		if op.Str("task") == "upscale" {
 			scale = op.Obj("model").Get("scale")
 		}
-		operations = append(operations, jsonv.O(
+		entry := jsonv.O(
 			"op_id", op.Get("op_id"),
 			"task", op.Get("task"),
 			"family", op.Obj("model").Obj("bundle").Get("family"),
@@ -1864,10 +2059,14 @@ func (r *Runtime) linearManifest(job *jsonv.Object) *jsonv.Object {
 			"session_id", op.Get("session_id"),
 			"execution_id", op.Get("execution_id"),
 			"outputs", op.Get("outputs"),
-		))
+		)
+		if schema >= 5 {
+			entry.Set("media", nullish(op.Get("media")))
+		}
+		operations = append(operations, entry)
 	}
 	return jsonv.O(
-		"schema_version", 4.0,
+		"schema_version", schema,
 		"runtime_version", c.VERSION,
 		"job_id", job.Get("job_id"),
 		"recipe", job.Get("recipe"),
@@ -1877,7 +2076,7 @@ func (r *Runtime) linearManifest(job *jsonv.Object) *jsonv.Object {
 		"inputs", inputs,
 		"operations", operations,
 		"outputs", job.Get("outputs"),
-		"intermediate_outputs", job.Get("intermediate_outputs"),
+		"intermediate_outputs", nullish(job.Get("intermediate_outputs"), []any{}),
 		"determinism", determinism,
 	)
 }
@@ -2029,6 +2228,8 @@ func (r *Runtime) Doctor() (*jsonv.Object, error) {
 			"artifact_handle", model.Get("artifact_handle"),
 			"family", nullish(bundle.Get("family"), "sdxl-base"),
 			"scale", jsonv.Maybe(model.Get("scale")),
+			"video_sizes", jsonv.Maybe(model.Get("video_sizes")),
+			"default_frames", jsonv.Maybe(model.Get("default_frames")),
 			"conversion", jsonv.Maybe(bundle.Obj("source").Get("conversion")),
 			"bundle_digest", bundle.Get("bundle_digest"),
 			"available", len(missing) == 0,

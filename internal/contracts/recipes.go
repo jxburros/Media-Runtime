@@ -30,6 +30,18 @@ var TaskOutputs = map[string][]string{
 	"text-to-image":  {"image"},
 	"image-to-image": {"image"},
 	"upscale":        {"image"},
+	// video is committed only when the worker advertises it (an encoded video/mp4); the runtime
+	// never encodes one itself.
+	"image-to-video": {"frames", "poster", "video"},
+}
+
+// OutputMIME is the media type of each base output ID. Only image/png outputs can feed a later
+// operation's image input.
+var OutputMIME = map[string]string{
+	"image":  "image/png",
+	"poster": "image/png",
+	"frames": "application/zip",
+	"video":  "video/mp4",
 }
 
 // TaskParameterInputs are the parameters a typed number input may bind to, per task.
@@ -37,6 +49,7 @@ var TaskParameterInputs = map[string][]string{
 	"text-to-image":  {"width", "height", "steps", "guidance", "seed", "count"},
 	"image-to-image": {"steps", "guidance", "seed", "strength"},
 	"upscale":        {"tile", "tile_overlap"},
+	"image-to-video": {"seed", "steps", "frames", "fps", "motion", "noise_augmentation", "decode_chunk"},
 }
 
 // declaration is one typed recipe input: a string, an uploaded image or a bounded number.
@@ -92,7 +105,7 @@ var binding = StrictObject(Field{Name: "from", Check: Str(StrOpts{Max: 80, Patte
 var operationSchema = StrictObject(
 	Field{Name: "op_id", Check: OpID},
 	Field{Name: "task", Check: Enum(TASKS...)},
-	Field{Name: "model_family", Check: Enum("sdxl-base", "esrgan")},
+	Field{Name: "model_family", Check: Enum(FAMILY_NAMES...)},
 	Field{Name: "inputs", Check: keyed(inputNamePattern, binding)},
 	Field{Name: "defaults", Check: PartialParameters, Default: func() any { return jsonv.NewObject() }},
 	Field{Name: "adapters", Check: adapterList, Optional: true},
@@ -141,11 +154,11 @@ func Binding(b *jsonv.Object) (kind, name, output string) {
 func taskInputType(task, key string) string {
 	switch key {
 	case "prompt", "negative_prompt":
-		if task != "upscale" {
+		if UsesPrompt(task) {
 			return "string"
 		}
 	case "image":
-		if task != "text-to-image" {
+		if UsesImage(task) {
 			return "image"
 		}
 	default:
@@ -196,7 +209,7 @@ func checkLinear(r *jsonv.Object, path []string) error {
 				used[name] = true
 			case "op":
 				producer, earlier := ops[name]
-				if !earlier || want != "image" || !Contains(TaskOutputs[producer], output) {
+				if !earlier || want != "image" || !Contains(TaskOutputs[producer], output) || OutputMIME[output] != "image/png" {
 					return Invalid(at(at(at(here, "inputs"), key), "from"))
 				}
 			}
@@ -236,7 +249,7 @@ func requiredInputs(task string) []string {
 	switch task {
 	case "image-to-image":
 		return []string{"prompt", "image"}
-	case "upscale":
+	case "upscale", "image-to-video":
 		return []string{"image"}
 	}
 	return []string{"prompt"}
@@ -246,7 +259,7 @@ func requiredInputs(task string) []string {
 func defaultsServe(pipeline string, defaults *jsonv.Object, adapters bool) bool {
 	switch pipeline {
 	case "image-to-image":
-		return !defaults.Has("count") && !hasTile(defaults)
+		return !defaults.Has("count") && !hasTile(defaults) && !hasVideo(defaults)
 	case "upscale":
 		// An upscale takes one image; only tiling has defaults and nothing adapts the network.
 		for _, k := range defaults.Keys() {
@@ -255,8 +268,25 @@ func defaultsServe(pipeline string, defaults *jsonv.Object, adapters bool) bool 
 			}
 		}
 		return !adapters
+	case "image-to-video":
+		// The svd family takes one image and no prompt, guidance or adapters.
+		for _, k := range defaults.Keys() {
+			if !Contains(VideoParameterNames, k) {
+				return false
+			}
+		}
+		return !adapters
 	}
-	return !defaults.Has("strength") && !hasTile(defaults)
+	return !defaults.Has("strength") && !hasTile(defaults) && !hasVideo(defaults)
+}
+
+func hasVideo(defaults *jsonv.Object) bool {
+	for _, f := range videoFields {
+		if defaults.Has(f.Name) {
+			return true
+		}
+	}
+	return false
 }
 
 // NormalizeRecipe returns a recipe as schema 2. A schema-1 recipe becomes one operation named
@@ -281,7 +311,7 @@ func NormalizeRecipe(recipe *jsonv.Object) *jsonv.Object {
 		switch {
 		case recipe.Obj("inputs").Has(name):
 			declared.Set(name, recipe.Obj("inputs").Get(name))
-		case name == "negative_prompt" && task != "upscale":
+		case name == "negative_prompt" && UsesPrompt(task):
 			declared.Set(name, jsonv.O("type", "string", "required", false))
 		default:
 			continue

@@ -12,6 +12,8 @@ export type OutputRecord = {
   op_id?: string;
   operation_output_id?: string;
   published?: boolean;
+  /** image-to-video `frames` archive: frame count and rate from its frames.json, and
+   * duration_seconds = frames / fps. The `poster` is frame 1 as a PNG. */
   frames?: number;
   fps?: number;
   duration_seconds?: number;
@@ -44,6 +46,13 @@ export type Submission = {
     /** upscale only. */
     tile?: number;
     tile_overlap?: number;
+    /** image-to-video only; frames defaults to the model's default_frames, the others to the
+     * worker's task defaults. width/height are the input's and must be one of video_sizes. */
+    frames?: number;
+    fps?: number;
+    motion?: number;
+    noise_augmentation?: number;
+    decode_chunk?: number;
   };
   adapters?: { adapter_id: string; scale?: number }[];
   backend_id?: "diffusers-sdxl" | "owned-sdxl";
@@ -106,7 +115,23 @@ export type WorkerSummary = {
 
 export type JobState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
-export type Task = "text-to-image" | "image-to-image" | "upscale";
+export type Task = "text-to-image" | "image-to-image" | "upscale" | "image-to-video";
+
+export type Family = "sdxl-base" | "esrgan" | "svd";
+
+/** Facts of a job's video operation, from the verified frame archive record. */
+export type VideoFacts = {
+  type: "video";
+  frames: number;
+  fps: number;
+  duration_seconds: number;
+  width: number;
+  height: number;
+  /** Whether the worker also produced the optional encoded `video` (video/mp4) output. */
+  encoded_video: boolean;
+};
+
+export type MediaFacts = VideoFacts;
 
 export type InputDeclaration =
   | { type: "string"; required: boolean; max_length?: number }
@@ -119,7 +144,7 @@ export type Binding = { from: string };
 export type RecipeOperation = {
   op_id: string;
   task: Task;
-  model_family: "sdxl-base" | "esrgan";
+  model_family: Family;
   inputs: Record<string, Binding>;
   defaults: Record<string, number | string>;
   adapters?: { adapter_id: string; scale?: number }[];
@@ -152,6 +177,8 @@ export type JobOperation = {
   /** The worker the operation ran on; a linear job runs every operation on one worker. */
   worker_id?: string;
   outputs: OutputRecord[];
+  /** Video operations: the committed media facts. */
+  media?: MediaFacts;
   error?: { code: string; message: string };
   [key: string]: unknown;
 };
@@ -170,6 +197,8 @@ export type Job = {
   outputs: OutputRecord[];
   /** Linear jobs: committed outputs the recipe does not publish. */
   intermediate_outputs?: OutputRecord[];
+  /** Jobs with a video operation: its facts (the last one's in a linear job). */
+  media?: MediaFacts;
   operations: JobOperation[];
   current_operation: number;
   /** Linear jobs: the operation running now, or the last one run. */
@@ -190,10 +219,13 @@ export type Job = {
 
 export type ModelSummary = {
   model_id: string;
-  family: "sdxl-base" | "esrgan";
+  family: Family;
   tasks: string[];
   /** Upscale factor of an esrgan model. */
   scale?: number;
+  /** svd models: the [width, height] sizes the bundle serves and its default frame count. */
+  video_sizes?: [number, number][];
+  default_frames?: number;
   bundle_digest: string;
   source?: {
     repository?: string;
