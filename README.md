@@ -15,8 +15,10 @@ conversion provenance workflow, and automatic settings with authorized fallbacks
 adds linear typed recipes (schema 2): several operations, each its own worker execution, chained
 through durable intermediate outputs. Release 0.7.0 drives a pool of workers, one Engine process
 per GPU, with one execution per worker. Release 0.8.0 adds remote workers over mutual TLS (Engine
-0.5.0's network mode) and a network mode for the runtime's own API. Video, audio and native
-inference are later stages, specified in the same document and sequenced in
+0.5.0's network mode) and a network mode for the runtime's own API. Release 0.9.0 speaks
+`media-worker/1.3` (Engine 0.6.0) and adds [video](#video): image-to-video on the `svd` family,
+committed as a lossless frame archive and a poster image. Audio and native inference are later
+stages, specified in the same document and sequenced in
 [docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Install and run
@@ -53,6 +55,8 @@ media-runtime run portrait --model studio-sdxl --prompt "Soft window light" --se
 media-runtime run variation --model studio-sdxl --prompt "Softer light" --image ./source.png --strength 0.5 --wait
 media-runtime adapters register examples/adapter.json
 media-runtime run portrait --model studio-sdxl --prompt "Soft window light" --adapter studio-style:0.8 --wait
+media-runtime models register examples/model.svd.json        # an svd bundle, Engine 0.6.0 or later
+media-runtime run animate --model svd-xt --image ./frame.png --frames 25 --fps 7 --wait
 media-runtime jobs list
 media-runtime outputs export JOB_ID --directory ./exports
 media-runtime tui
@@ -134,6 +138,40 @@ the input's and cannot be overridden; prompts, seeds, steps, guidance, `count` a
 refused, no seed is resolved or recorded, and a result larger than the worker's `output_side` limit
 is refused before admission. Progress reports tiles. Real-ESRGAN `.pth` releases must be converted to
 safetensors by the operator first; Runtime never converts weights.
+
+## Video
+
+The `animate` recipe (pipeline `image-to-video`, family `svd`, protocol 1.3; Engine 0.6.0 or later)
+animates an uploaded PNG. Register a Diffusers `StableVideoDiffusionPipeline` directory naming its
+family (`models register examples/model.svd.json`); the worker reads the sizes the bundle serves
+(from its optional `video.json`, else 1024×576 and 576×1024) and its default frame count (the
+unet's `num_frames`), and both are recorded with the model (`models show`, `doctor`). Then:
+
+```sh
+media-runtime run animate --model svd-xt --image ./frame.png --frames 25 --fps 7 --wait
+media-runtime outputs export JOB_ID --directory ./exports   # JOB_ID-frames.zip, -poster.png, -manifest.json
+```
+
+- Width and height are the input's and must be one of the model's sizes; the input is never resized
+  or cropped, and another size is refused before admission (field `video_size`).
+- `frames` defaults to the model's, `fps`, `motion`, `noise_augmentation` and `decode_chunk` to the
+  worker's task defaults, and `steps` to the recipe's (25); every value and the seed are resolved
+  and recorded before dispatch. Values outside the worker's advertised limits are refused, never
+  clamped. A prompt, `guidance`, `sampler`, `scheduler`, `strength`, `count`, tiling and adapters
+  are refused by name. Workers before 1.3 refuse the recipe and the family.
+- The job commits `frames` (`application/zip`: `frames.json` plus one lossless PNG per frame) and
+  `poster` (`image/png`, frame 1). The archive is checked by size, SHA-256, its ZIP structure and a
+  `frames.json` that must match the worker's record and the request (frame count, rate, size; one
+  PNG per frame), so frames are never dropped or re-timed. When a worker advertises an encoded
+  `video` output (`video/mp4`) it is required and committed too and exported as `.mp4`; the runtime
+  never encodes video, and Engine 0.6.0 and 0.7.0 do not produce one.
+- The job, each operation and the manifest record the frame count, rate and duration
+  (`frames / fps`) from the verified record (`media`); jobs with a video operation write manifest
+  schema 5. The per-MIME `max_output_bytes` limit for the archive defaults to 256 MiB, and outputs
+  stream to disk rather than through memory. Progress reports decoding in frames; the dashboard
+  shows frames and duration. Frames and videos open in external tools.
+- In a [linear recipe](#linear-recipes) a video operation may take its image from an earlier
+  operation; the poster (a PNG) can feed a later image input, the archive cannot.
 
 ## Linear recipes
 
@@ -359,8 +397,10 @@ is atomic, and excess jobs receive 429 plus Retry-After.
 
 A surviving worker is reconciled by session and attempt before any ambiguous dispatch is retried.
 A replacement session fails interrupted work without regenerating it. An unreachable worker leaves
-work pending reconciliation; queued jobs stay durable. Successful output bytes are checked against
-size, SHA-256 and PNG dimensions, then fsynced with the manifest before the database records success.
+work pending reconciliation; queued jobs stay durable. Successful output bytes are streamed to a
+temporary file and checked against size, SHA-256 and their MIME type's signature (PNG dimensions;
+for a frame archive its ZIP structure and `frames.json`), then fsynced with the manifest before the
+database records success.
 The worker's copy is discarded only after that commit. This is not an exactly-once guarantee across
 process crashes. Keep one Runtime per state directory; the CLI uses an exclusive process lock.
 
@@ -399,7 +439,10 @@ The network-mode tests launch the fixture with `--bind 127.0.0.1 --tls-*` and th
 certificates in [`testdata/certs`](testdata/certs/README.md) (generated once, never at test time)
 and run a job over mutual TLS, a reconnect, a cancellation past the deadline, fingerprint
 mismatches and re-pinning, and the API over TLS; they skip against an Engine fixture older than
-0.5.0. `cmd/media-runtime` tests build the binary and drive
+0.5.0. The video tests run the fixture's two-frame `svd` bundle end to end (archive and poster
+verification, refusals, a forged archive, the size limit, an injected optional video, a linear
+generate-then-animate recipe and a 1.2-pinned fixture's refusals); they skip against an Engine
+fixture older than 0.6.0. `cmd/media-runtime` tests build the binary and drive
 the CLI end to end, including a state directory written by the TypeScript 0.3.0 service
 (`testdata/state-0.3.0`); `internal/tui` and the doctor tests compare rendered text with the
 0.3.0 output. The fixture is not an inference fallback. GPU image quality and hardware

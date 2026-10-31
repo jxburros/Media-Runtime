@@ -325,3 +325,77 @@ third-party module.
   its README; tests copy them to private modes and never generate certificates.
 - `crypto/tls`, reserved in the 0.4.0 ledger, is now used for both paths. No new dependency; the
   ledger and `go.sum` are unchanged.
+
+# Implementation decisions — 0.9.0
+
+- Protocol: `media-worker/1.3` is negotiated when the worker lists it; 1.0–1.2 remain. The task
+  needs minor 3 (`TaskMinor`) and the family minor 3 (`FamilyMinor`), so against a 1.2 worker the
+  recipe is `unsupported`, field `recipe_id`, and registration `unsupported`, field `family`. The
+  `tasks` list, not the minor, decides what a worker serves: a 1.3 worker that does not list
+  `image-to-video` (Engine's owned backend) refuses it the same way.
+- Reference bundle: `stabilityai/stable-video-diffusion-img2vid-xt` (25 frames, 1024×576), with
+  `stable-video-diffusion-img2vid` (14 frames) as the smaller alternative, in Diffusers format
+  with safetensors weights, as Engine 0.6.0 records. Stability AI licenses them separately from
+  this project (the Stability AI Community License for current revisions); the operator checks
+  the model card of the installed revision and supplies the weights. Nothing here downloads them.
+  `examples/model.svd.json` names the reference repository; no real weights were used.
+- Bundle facts: the sizes an svd bundle serves and its default frame count are the worker's
+  answer when it validates the bundle at registration (`video_sizes`, `default_frames`, read from
+  `video.json` and the unet configuration), recorded on the model like an upscaler's `scale`.
+  Admission uses the recorded facts on every candidate worker; `limits.video_sizes` is consulted
+  only for a model without them, because it describes the loaded bundle, not the requested one.
+- Resolution order for image-to-video: worker `task_defaults` and task `defaults` (fps 7, motion
+  127, noise_augmentation 0.02, decode_chunk 8), the model's `default_frames`, recipe defaults,
+  the image's size, then the request; the seed is resolved as for diffusion tasks. The worker has
+  no steps default for video, so `animate` carries `steps: 25` (the reference pipeline's
+  default) and a recipe without one requires `parameters.steps`. `capabilities.defaults` is never
+  merged into a video operation (it would add guidance, sampler and scheduler). Every value is
+  explicit in the stored request, so a retry and the manifest describe exactly what ran.
+- Refusals: parameters that do not exist for the task (`guidance`, `sampler`, `scheduler`,
+  `strength`, `count`, `tile`, `tile_overlap`), a prompt and adapters are `invalid_request` with
+  the field; a video parameter the worker does not list in `task_parameters.image-to-video
+  .parameters` is `unsupported`; a value outside the worker's advertised range (`video_steps`,
+  `frames`, `fps`, `motion`, `noise_augmentation`, `decode_chunk`) is `invalid_request` naming
+  the parameter, mirroring the worker's own code; a size the model does not serve is
+  `invalid_request`, field `video_size`, the worker's field name. Nothing is clamped or resized.
+- Output set: the worker's `task_parameters.image-to-video.outputs` with their advertised types,
+  exactly as for images. `video` (`video/mp4`) is therefore required when, and only when, the
+  worker advertises it, and the runtime never encodes or requires a video itself. Engine 0.6.0 and
+  0.7.0 ship no encoder (Engine 0.6.0 decided against its optional MP4 extra), so no fixture
+  produces one; the optional path is tested with bytes injected through a test-only response hook
+  on the worker client (`SetResponseHook`), and the MP4 check is unit-tested.
+- Archive verification (owned code on `archive/zip`): `PK\x03\x04` at offset 0; the central
+  directory must parse; member names are unique; `frames.json` (at most 4 KiB) is an object of
+  exactly `fps`, `width`, `height` and `frames`, positive integers, equal to the output record;
+  the members are exactly `frames.json` and `000001.png` … one per frame, each starting with a PNG
+  signature and IHDR of the declared size (only the first 24 bytes of each member are read); the
+  record's `duration_seconds` equals `frames / fps` exactly (Engine's value is the same IEEE
+  division). The record's `width`, `height`, `frames` and `fps` must also equal the request, so a
+  worker can never drop or re-time frames unnoticed. Storage method is not required to be
+  `stored`: compression is the worker's business. MP4: an `ftyp` box at offset 4 whose 32-bit (or
+  64-bit large) size is at least 8 and fits the file; the runtime does not parse further.
+- Streaming commit: every output is now copied from the worker into `<file>.tmp` through a
+  SHA-256 writer with a limit of the MIME's `max_output_bytes` plus one byte, verified from the
+  file (size, digest, signature), fsynced, closed and renamed; a failed check removes the
+  temporary file and fails the job `output_unavailable`. The fsync order (bytes, directories,
+  manifest, database) is unchanged. `outputs export` streams likewise.
+- Output limits: the 0.5.0 defaults stand — `application/zip` and `video/mp4` 256 MiB (the
+  specification's archive default), `image/png` 32 MiB, `audio/wav` 64 MiB — and remain
+  unmeasured guesses: by estimate (about 1–2 MiB per lossless 1024×576 PNG) the reference 25
+  frames are tens of MiB and the protocol's 64 frames stay under the limit, but no real archive
+  was measured here. Operators raise the map entry; the runtime never shrinks an output to fit.
+- Manifest schema 5: the schema-4 operations layout (every operation with its model, inputs,
+  settings, worker identity and outputs; published and intermediate outputs) plus `media` on each
+  operation, written for every job that runs a video (from 0.10.0 also an audio) operation,
+  single-operation or linear, so one consumer handles every media job. Image-only jobs keep schema
+  3 (one operation) and 4 (linear) byte for byte; no older manifest is rewritten. Jobs and
+  operations carry the same `media` object (`type`, `frames`, `fps`, `duration_seconds`, `width`,
+  `height`, `encoded_video`); a linear job's top-level `media` is its last media operation's.
+- Linear recipes: output types are declared per base output ID (`image`, `poster` PNG; `frames`
+  ZIP; `video` MP4); only a PNG output may be bound to an image input, checked at registration.
+  `TaskParameterInputs` lets number inputs bind to `seed`, `steps` and the video parameters.
+- Dashboard: progress carrying a `unit` renders as `<stage> c/t <unit>` (also upscale tiles). The
+  media column is shown only when a listed job has video facts, as the worker column is shown only
+  for a pool, so the image dashboards keep the 0.3.0 layout pinned by the tests.
+- No new dependency; the ledger and `go.sum` are unchanged (`archive/zip` was already listed for
+  the frame archive checks in 0.4.0).

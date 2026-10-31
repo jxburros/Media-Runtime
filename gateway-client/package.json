@@ -1,6 +1,6 @@
 {
   "name": "@media-runtime/gateway-client",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Typed client for the Media Runtime HTTP API, for server-side gateways such as Studio's",
   "license": "MIT",
   "type": "module",

@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.9.0 — 2026-10-31
+
+Video, phase R5 of the implementation plan (worker protocol `media-worker/1.3`, Engine 0.6.0;
+1.0–1.2 are still negotiated). **Image-to-video**: the `image-to-video` pipeline on the `svd`
+family and the default `animate` recipe (`inputs.image` required, `defaults: {steps: 25}`).
+Registration (`family: svd`) validates the Diffusers `StableVideoDiffusionPipeline` bundle through
+a worker that loads the family on 1.3 and records the `video_sizes` and `default_frames` the worker
+read from the bundle; `models inspect` recognizes the layout, and `models list`/`show` and `doctor`
+print the facts. Width and height are the input's and must be one of the model's sizes (field
+`video_size` otherwise; nothing is resized); `frames` defaults to the bundle's, `fps`, `motion`,
+`noise_augmentation` and `decode_chunk` to the worker's `task_defaults` and `steps` to the recipe,
+all recorded with the seed before dispatch; values outside the worker's `limits` are refused, and a
+prompt, `guidance`, `sampler`, `scheduler`, `strength`, `count`, tiling and adapters are refused by
+name. A 1.2 worker refuses the recipe (`unsupported`, `recipe_id`) and the family (`unsupported`,
+`family`). **Outputs**: `frames` (`application/zip`) and `poster` (`image/png`), plus `video`
+(`video/mp4`) only when the worker advertises it; the runtime never encodes video. Each output is
+streamed to a temporary file while hashed (no longer buffered in memory), then checked by size,
+SHA-256 and an owned signature check on the standard library: for the archive the ZIP local header,
+the central directory, a strict `frames.json` equal to the worker's record and to the request, one
+PNG per frame of the declared size and `duration_seconds = frames / fps`; for MP4 an `ftyp` box at
+offset 4 that fits the file. Per-MIME `max_output_bytes` applies (archive and MP4 256 MiB by
+default). Jobs and operations record `media` (frames, fps, duration, size, `encoded_video`); every
+job with a video operation writes **manifest schema 5** (the schema-4 operations layout plus each
+operation's `media`); other jobs keep schemas 3 and 4. Linear recipes may include video operations;
+only PNG outputs (`image`, `poster`) can be bound to an image input. **CLI and dashboard**: `run
+--frames --fps --motion --noise-augmentation --decode-chunk`; `outputs export` writes `.zip`, `.png`
+and `.mp4` when present and now streams each file (a partial file is removed on failure); the
+dashboard shows stage progress in the worker's unit (`decoding 8/25 frames`, which also makes
+upscale progress read `upscaling 1/4 tiles`), a media column with frames and duration that appears
+only when a listed job has video facts, and the selected job's frames and rate. The gateway client
+gains the video parameters, `Family`, `MediaFacts` and model facts. Examples:
+`examples/recipe.animate.json`, `examples/model.svd.json`. No new dependency; `go.sum` is
+unchanged. **Validated**: protocol behavior against Engine 0.7.0's and 0.6.0's fixtures, whose
+`svd` bundle has random stand-in weights and produces flat-colour frames
+([compatibility record](docs/compatibility.md)). **Not validated**: real Stable Video Diffusion
+inference, GPU memory and the default output limits on real archives (no GPU or weights here), and a
+worker-produced `video/mp4`: Engine 0.6.0 and 0.7.0 ship no encoder and never advertise one, so the
+optional output path is tested only with bytes injected by a test hook. Companion Studio task:
+import the frame archive (and the video when present) as Studio-owned files with provenance and use
+the poster as the preview.
+
 ## 0.8.0 — 2026-10-29
 
 Distributed workers and API network mode, phase R4 of the implementation plan (worker protocol
