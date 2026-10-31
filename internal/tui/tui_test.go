@@ -114,3 +114,20 @@ func TestDashboardShowsVideoFramesAndDuration(t *testing.T) {
 		t.Fatalf("an image job shows a media column: %q", image[4])
 	}
 }
+
+func TestDashboardShowsAudioDuration(t *testing.T) {
+	queued := parse(t, `{"job_id":"job_66666666-6666-6666-6666-666666666666","state":"queued","task":"text-to-audio","model":{"model_id":"stable-audio"},"request":{"parameters":{"seed":3,"steps":100,"guidance":7,"duration_seconds":10}},"created_at":"2026-10-31T10:00:00.000Z","outputs":[]}`)
+	done := queued.Clone().Set("job_id", "job_77777777-7777-7777-7777-777777777777").Set("state", "succeeded").
+		Set("media", jsonv.O("type", "audio", "sample_rate", 44100.0, "channels", 2.0, "samples", 442368.0, "duration_seconds", 10.031020408163265)).
+		Set("outputs", []any{jsonv.O("output_id", "audio", "expires_at", nil)})
+	lines := Render(State{Jobs: []*jsonv.Object{queued, done}}, 160, 12)
+	text := strings.Join(lines, "\n")
+	for _, want := range []string{"10.00s", "10.03s", "text-to-audio", "output ready", "10s steps 100"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "undefined×undefined") {
+		t.Fatalf("an audio job shows an image size:\n%s", text)
+	}
+}

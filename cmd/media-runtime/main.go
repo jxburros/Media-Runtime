@@ -37,7 +37,7 @@ media-runtime adapters register adapter.json | adapters list
 media-runtime inputs upload image.png | inputs list | inputs delete INPUT
 media-runtime run RECIPE --model MODEL [--prompt TEXT] [--image FILE|INPUT] [--strength S] [--adapter ID[:SCALE]]... [--seed N] [--count N]
                    [--tile N] [--tile-overlap N] [--frames N] [--fps N] [--motion N] [--noise-augmentation X]
-                   [--decode-chunk N] [--precision P|auto] [--fallback cpu|lower_precision]...
+                   [--decode-chunk N] [--duration SECONDS] [--precision P|auto] [--fallback cpu|lower_precision]...
                    [--model-for OP=MODEL]... [--input NAME=VALUE]... [--worker ID] [--wait] [--json]
 media-runtime jobs list [--worker ID] | jobs watch JOB | jobs cancel JOB | jobs retry JOB
 media-runtime workers list
@@ -80,7 +80,7 @@ func parse(args []string) (*options, []string, error) {
 	o := &options{strings: map[string]*string{}, set: map[string]bool{}}
 	fs := flag.NewFlagSet("media-runtime", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	for _, name := range []string{"config", "model", "prompt", "negative-prompt", "image", "strength", "seed", "width", "height", "steps", "guidance", "precision", "backend", "directory", "idempotency-key", "count", "tile", "tile-overlap", "worker", "frames", "fps", "motion", "noise-augmentation", "decode-chunk"} {
+	for _, name := range []string{"config", "model", "prompt", "negative-prompt", "image", "strength", "seed", "width", "height", "steps", "guidance", "precision", "backend", "directory", "idempotency-key", "count", "tile", "tile-overlap", "worker", "frames", "fps", "motion", "noise-augmentation", "decode-chunk", "duration"} {
 		o.strings[name] = fs.String(name, "", "")
 	}
 	fs.Var(&o.adapters, "adapter", "")
@@ -382,6 +382,10 @@ func runJob(cl *client.Client, values *options, recipe string, print func(any), 
 		if v, ok := values.get(field); ok {
 			parameters.Set(strings.ReplaceAll(field, "-", "_"), number(v))
 		}
+	}
+	if v, ok := values.get("duration"); ok {
+		// --duration is the requested clip length of an audio recipe, in seconds.
+		parameters.Set("duration_seconds", number(v))
 	}
 	// A local file is uploaded first; the service never receives a client path.
 	upload := func(image string) (string, error) {

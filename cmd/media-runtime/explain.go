@@ -147,6 +147,9 @@ func ExplainDoctor(report *jsonv.Object) ([]string, bool) {
 		if sizes := m.Arr("video_sizes"); len(sizes) > 0 {
 			lines = append(lines, fmt.Sprintf("  video sizes %s; default %s frames", sizeList(sizes), or(m, "default_frames", "unknown")))
 		}
+		if span := m.Arr("duration_range"); len(span) == 2 {
+			lines = append(lines, fmt.Sprintf("  audio %s Hz, %s channels; durations %s–%s s", or(m, "sample_rate", "unknown"), or(m, "channels", "unknown"), jsText(span[0]), jsText(span[1])))
+		}
 		if conversion := m.Obj("conversion"); conversion != nil {
 			lines = append(lines, fmt.Sprintf("  converted from source sha256 %s (reference %s)", short(conversion.Str("source_sha256")), short(conversion.Str("reference_bundle_digest"))))
 		}
@@ -337,6 +340,8 @@ func ExplainCatalog(entries []any) []string {
 				state = "complete esrgan upscaler ×" + text(e, "scale")
 			case "svd":
 				state = "complete svd image-to-video bundle"
+			case "stable-audio-open":
+				state = "complete stable-audio-open text-to-audio bundle"
 			}
 		}
 		size := ""

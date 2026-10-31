@@ -42,9 +42,9 @@ func start(t *testing.T, bin, root, directory string, fixture *integration.Fixtu
 	t.Helper()
 	config := filepath.Join(root, "runtime.config.json")
 	entries := jsonv.O("fixture", filepath.Join(root, "model"))
-	// Only fixtures from Engine 0.4.0 create the upscaler and from 0.6.0 the video bundle;
-	// an absent handle fails inspection.
-	for _, handle := range []string{"upscaler", "video"} {
+	// Only fixtures from Engine 0.4.0 create the upscaler, from 0.6.0 the video bundle and from
+	// 0.7.0 the audio bundle; an absent handle fails inspection.
+	for _, handle := range []string{"upscaler", "video", "audio"} {
 		if _, err := os.Stat(filepath.Join(root, handle)); err == nil {
 			entries.Set(handle, filepath.Join(root, handle))
 		}
@@ -410,5 +410,60 @@ func TestCommandLineVideo(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(exports); len(entries) != 3 {
 		t.Fatalf("export writes the archive, the poster and the manifest, got %d files", len(entries))
+	}
+}
+
+func TestCommandLineAudio(t *testing.T) {
+	bin := binary(t)
+	root := t.TempDir()
+	fixture := integration.StartFixture(t, root)
+	if _, err := os.Stat(filepath.Join(root, "audio")); err != nil {
+		t.Skip("the Engine fixture predates text-to-audio (Engine 0.7.0)")
+	}
+	s := start(t, bin, root, filepath.Join(root, "state"), fixture)
+	if out, _, code := s.cli(t, "models", "inspect", "audio"); code != 0 || !strings.Contains(out, "audio: complete stable-audio-open text-to-audio bundle") {
+		t.Fatalf("inspect audio %d %s", code, out)
+	}
+	// The shipped example, pointed at the fixture's handle.
+	example, err := os.ReadFile(filepath.Join("..", "..", "examples", "model.audio.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := strings.Replace(string(example), `"artifact_handle": "stable-audio-open"`, `"artifact_handle": "audio"`, 1)
+	path := filepath.Join(root, "audio.json")
+	_ = os.WriteFile(path, []byte(doc), 0o600)
+	if out, errText, code := s.cli(t, "models", "register", path); code != 0 || !strings.Contains(out, `"sample_rate": 8000`) {
+		t.Fatalf("register audio %d %s %s", code, out, errText)
+	}
+	_ = os.WriteFile(filepath.Join(root, "model.json"), []byte(`{"model_id":"fixture","artifact_handle":"fixture"}`), 0o600)
+	if _, errText, code := s.cli(t, "models", "register", filepath.Join(root, "model.json")); code != 0 {
+		t.Fatalf("register fixture %d %s", code, errText)
+	}
+	if out, _, code := s.cli(t, "doctor"); code != 0 || !strings.Contains(out, "Model stable-audio (audio, stable-audio-open)") || !strings.Contains(out, "audio 8000 Hz, 2 channels; durations 1–47 s") {
+		t.Fatalf("doctor %d %s", code, out)
+	}
+	// The plan's example command; --steps keeps the fixture quick.
+	out, errText, code := s.cli(t, "run", "soundscape", "--model", "stable-audio", "--prompt", "rain on a tin roof", "--duration", "10", "--steps", "2", "--wait", "--json")
+	if code != 0 {
+		t.Fatalf("run soundscape %d %s %s", code, out, errText)
+	}
+	job := lastJSON(t, out)
+	// 10 s at 8 kHz in 256-sample latent frames: 313 frames, 80,128 samples, 10.016 s.
+	if media := job.Obj("media"); media.Get("duration_seconds") != 10.016 || media.Get("sample_rate") != 8000.0 {
+		t.Fatalf("soundscape %s", out)
+	}
+	if _, errText, code := s.cli(t, "run", "soundscape", "--model", "stable-audio", "--prompt", "x", "--duration", "60"); code != 2 || !strings.Contains(errText, "never trimmed") {
+		t.Fatalf("a duration beyond the model's range must be refused: %d %s", code, errText)
+	}
+	exports := filepath.Join(root, "exports")
+	if _, errText, code := s.cli(t, "outputs", "export", job.Str("job_id"), "--directory", exports); code != 0 {
+		t.Fatalf("export %d %s", code, errText)
+	}
+	clip, err := os.ReadFile(filepath.Join(exports, job.Str("job_id")+"-audio.wav"))
+	if err != nil || string(clip[:4]) != "RIFF" {
+		t.Fatal("export lacks the WAV")
+	}
+	if entries, _ := os.ReadDir(exports); len(entries) != 2 {
+		t.Fatalf("export writes the clip and the manifest, got %d files", len(entries))
 	}
 }

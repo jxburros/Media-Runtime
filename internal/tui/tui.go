@@ -128,10 +128,15 @@ func describeStage(job *jsonv.Object) string {
 	return js(job, "state")
 }
 
-// MediaFacts is the media column: a video job's frame count and duration, from its committed
-// output record once it succeeded and from its resolved request before. Image jobs have none.
+// MediaFacts is the media column: a video job's frame count and duration, or an audio job's
+// duration, from its committed output record once it succeeded and from its resolved request
+// before (an audio clip may then still be rounded up to the model's granularity). Image jobs have
+// none.
 func MediaFacts(job *jsonv.Object) string {
 	media := job.Obj("media")
+	if d, ok := job.Obj("request").Obj("parameters").Num("duration_seconds"); media == nil && ok && job.Str("task") == "text-to-audio" {
+		media = jsonv.O("type", "audio", "duration_seconds", d)
+	}
 	if media == nil {
 		p := job.Obj("request").Obj("parameters")
 		frames, fok := p.Num("frames")
@@ -396,7 +401,12 @@ func Render(state State, columns, rows int) []string {
 		if p.Has("frames") {
 			strength += " frames " + js(p, "frames") + " at " + js(p, "fps") + " fps"
 		}
-		detail = fmt.Sprintf("%s  %s  %s×%s steps %s%s  %s", js(selected, "job_id"), backend, js(p, "width"), js(p, "height"), js(p, "steps"), strength, where)
+		if p.Has("duration_seconds") {
+			// An audio job has no image size.
+			detail = fmt.Sprintf("%s  %s  %ss steps %s  %s", js(selected, "job_id"), backend, js(p, "duration_seconds"), js(p, "steps"), where)
+		} else {
+			detail = fmt.Sprintf("%s  %s  %s×%s steps %s%s  %s", js(selected, "job_id"), backend, js(p, "width"), js(p, "height"), js(p, "steps"), strength, where)
+		}
 	}
 	lines = append(lines, pad(detail, columns))
 	footer := state.Message
