@@ -26,13 +26,13 @@ func boot12(t *testing.T, args ...string) *env {
 	}
 	t.Setenv("MEDIA_TEST_WORKER_TOKEN", WorkerToken)
 	catalog := jsonv.NewObject()
-	for _, handle := range []string{"fixture", "fixture-lora", "upscaler", "converted", "checkpoint", "video"} {
+	for _, handle := range []string{"fixture", "fixture-lora", "upscaler", "converted", "checkpoint", "video", "audio"} {
 		dir := map[string]string{"fixture": "model", "fixture-lora": "lora"}[handle]
 		if dir == "" {
 			dir = handle
 		}
-		if _, err := os.Stat(filepath.Join(root, dir)); err != nil && handle == "video" {
-			continue // created by Engine 0.6.0 fixtures and later only
+		if _, err := os.Stat(filepath.Join(root, dir)); err != nil && (handle == "video" || handle == "audio") {
+			continue // created by Engine 0.6.0 (video) and 0.7.0 (audio) fixtures and later only
 		}
 		catalog.Set(handle, filepath.Join(root, dir))
 	}

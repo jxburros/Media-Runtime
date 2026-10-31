@@ -560,8 +560,22 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 		taskParameters = caps.Obj("task_parameters").Obj(task)
 	}
 	usesImage := c.UsesImage(task)
+	// A video or audio parameter on a task that does not take it is refused by name, as are image
+	// steps beyond the diffusion range (the request schema admits the wider audio range).
+	for _, k := range params.Keys() {
+		if c.MediaParameter(k) && !c.Contains(c.TaskParameterNames[task], k) {
+			return nil, forbidden("parameters."+k, "A "+task+" operation has no "+k)
+		}
+	}
+	if steps, ok := params.Num("steps"); ok && task != "text-to-audio" && steps > c.MaxDiffusionSteps {
+		return nil, c.Invalid([]string{"parameters", "steps"})
+	}
 	if task == "image-to-video" {
 		if err := videoRequest(plan, request, inputs, params, taskParameters); err != nil {
+			return nil, err
+		}
+	} else if task == "text-to-audio" {
+		if err := audioRequest(plan, request, inputs, params, taskParameters); err != nil {
 			return nil, err
 		}
 	} else if task == "upscale" {
@@ -654,6 +668,31 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 		}
 		if err := withinLimits(effective, caps.Obj("limits"), videoLimits); err != nil {
 			return nil, err
+		}
+	} else if task == "text-to-audio" {
+		// The worker's audio defaults (guidance), then the recipe and the request; steps and the
+		// duration have no worker default, so a recipe or the request must give them.
+		merged := jsonv.NewObject().Assign(caps.Obj("task_defaults").Obj(task)).Assign(taskParameters.Obj("defaults"))
+		merged.Assign(defaults).Assign(params)
+		merged.Set("seed", nullish(params.Get("seed"), defaults.Get("seed"), c.Seed()))
+		if effective, err = c.Validate(c.AudioParameters, merged); err != nil {
+			return nil, err
+		}
+		if err := withinLimits(effective, caps.Obj("limits"), audioLimits); err != nil {
+			return nil, err
+		}
+		// Only a duration the bundle serves; a longer clip is refused, never trimmed.
+		span := asArray(model.Get("duration_range"))
+		if len(span) != 2 {
+			span = asArray(caps.Obj("limits").Get("duration_seconds"))
+		}
+		duration, _ := effective.Num("duration_seconds")
+		if len(span) == 2 {
+			low, _ := span[0].(float64)
+			high, _ := span[1].(float64)
+			if duration < low || duration > high {
+				return nil, c.Err(400, "invalid_request", fmt.Sprintf("duration_seconds must be within the model's range %s–%s s; a clip is never trimmed", jsonv.Number(low), jsonv.Number(high)), "parameters.duration_seconds")
+			}
 		}
 	} else {
 		merged := jsonv.NewObject().Assign(caps.Obj("defaults"))
@@ -814,6 +853,36 @@ func videoRequest(plan *operationPlan, request, inputs, params, taskParameters *
 	}
 	return nil
 }
+
+// audioRequest refuses what a text-to-audio operation does not take: an image, image-generation
+// parameters (width, height, sampler, scheduler, strength, count), tiling and adapters, and
+// requires a prompt. An audio parameter the worker does not advertise is unsupported.
+func audioRequest(plan *operationPlan, request, inputs, params, taskParameters *jsonv.Object) error {
+	if inputs.Has("image") {
+		return forbidden("inputs.image", "A text-to-audio operation is conditioned on text alone and takes no image")
+	}
+	if !inputs.Has("prompt") {
+		return c.Invalid([]string{"inputs", "prompt"})
+	}
+	for _, k := range []string{"width", "height", "sampler", "scheduler", "strength", "count", "tile", "tile_overlap"} {
+		if params.Has(k) {
+			return forbidden("parameters."+k, "A text-to-audio operation has no "+k)
+		}
+	}
+	if (plan.first && request.Has("adapters")) || plan.op.Has("adapters") {
+		return forbidden("adapters", "Adapters do not apply to text-to-audio")
+	}
+	advertised := strList(taskParameters.Get("parameters"))
+	for _, k := range []string{"guidance", "duration_seconds"} {
+		if (params.Has(k) || plan.op.Obj("defaults").Has(k)) && !c.Contains(advertised, k) {
+			return c.Err(400, "unsupported", "The connected worker does not advertise the audio parameter "+k, "parameters."+k)
+		}
+	}
+	return nil
+}
+
+// audioLimits maps each audio parameter to the worker limit that bounds it.
+var audioLimits = [][2]string{{"steps", "audio_steps"}, {"guidance", "guidance"}}
 
 // videoLimits maps each video parameter to the worker limit that bounds it.
 var videoLimits = [][2]string{{"steps", "video_steps"}, {"frames", "frames"}, {"fps", "fps"}, {"motion", "motion"}, {"noise_augmentation", "noise_augmentation"}, {"decode_chunk", "decode_chunk"}}
@@ -1734,6 +1803,13 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 					return errors.New("output dimensions changed")
 				}
 			}
+			if mime == "audio/wav" {
+				// The clip is the bundle's format and covers the request, rounded up by less than
+				// one latent frame; it is never shorter than asked.
+				if err := audioMatches(output, params, op.Obj("model")); err != nil {
+					return err
+				}
+			}
 			if mime == "application/zip" {
 				// The archive holds exactly the requested frames at the requested rate and size;
 				// frames are never dropped or re-timed.
@@ -1970,8 +2046,31 @@ func (r *Runtime) manifest(job, op, snapshot *jsonv.Object, committed []any, sca
 
 const determinism = "Seed reproducibility depends on hardware, software and dependency versions; matching bytes are not guaranteed."
 
+// audioMatches checks a WAV output record against the request and the model's recorded facts:
+// the bundle's sample rate and channels, and a duration at least the requested one and short of
+// it by less than one latent frame (hop_length samples) when the hop is known.
+func audioMatches(output, params, model *jsonv.Object) error {
+	for _, k := range []string{"sample_rate", "channels"} {
+		if model.Has(k) && !jsonEqual(output.Get(k), model.Get(k)) {
+			return errors.New("audio format differs from the model")
+		}
+	}
+	requested, _ := params.Num("duration_seconds")
+	duration, _ := output.Num("duration_seconds")
+	const epsilon = 1e-9
+	if duration+epsilon < requested {
+		return errors.New("audio is shorter than requested")
+	}
+	hop, hok := model.Num("hop_length")
+	rate, rok := output.Num("sample_rate")
+	if hok && rok && rate > 0 && duration > requested+hop/rate+epsilon {
+		return errors.New("audio is longer than the latent granularity allows")
+	}
+	return nil
+}
+
 // mediaTasks produce video or audio; a job with one of them writes manifest schema 5.
-var mediaTasks = map[string]bool{"image-to-video": true}
+var mediaTasks = map[string]bool{"image-to-video": true, "text-to-audio": true}
 
 func hasMedia(job *jsonv.Object) bool {
 	for _, op := range Operations(job) {
@@ -1984,8 +2083,22 @@ func hasMedia(job *jsonv.Object) bool {
 
 // mediaFacts summarizes a video or audio operation's committed outputs from the worker's
 // verified output records: frame count, rate, duration and size for video (and whether an
-// encoded video was committed).
+// encoded video was committed); sample rate, channels, samples and duration for audio.
 func mediaFacts(task string, committed []any) *jsonv.Object {
+	if task == "text-to-audio" {
+		for _, raw := range committed {
+			if o := raw.(*jsonv.Object); o.Str("mime_type") == "audio/wav" {
+				return jsonv.O(
+					"type", "audio",
+					"sample_rate", o.Get("sample_rate"),
+					"channels", o.Get("channels"),
+					"samples", o.Get("samples"),
+					"duration_seconds", o.Get("duration_seconds"),
+				)
+			}
+		}
+		return nil
+	}
 	if task != "image-to-video" {
 		return nil
 	}
@@ -2230,6 +2343,9 @@ func (r *Runtime) Doctor() (*jsonv.Object, error) {
 			"scale", jsonv.Maybe(model.Get("scale")),
 			"video_sizes", jsonv.Maybe(model.Get("video_sizes")),
 			"default_frames", jsonv.Maybe(model.Get("default_frames")),
+			"sample_rate", jsonv.Maybe(model.Get("sample_rate")),
+			"channels", jsonv.Maybe(model.Get("channels")),
+			"duration_range", jsonv.Maybe(model.Get("duration_range")),
 			"conversion", jsonv.Maybe(bundle.Obj("source").Get("conversion")),
 			"bundle_digest", bundle.Get("bundle_digest"),
 			"available", len(missing) == 0,

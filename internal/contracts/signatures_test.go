@@ -3,6 +3,7 @@ package contracts
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"testing"
 
@@ -139,5 +140,100 @@ func TestVideoRecipesAndBindings(t *testing.T) {
 	}
 	if err := parse(fmt.Sprintf(linear, "frames")); err == nil || err.(*ApiError).Field != "operations.1.inputs.image.from" {
 		t.Fatalf("an archive bound to an image input: %v", err)
+	}
+}
+
+// wav16 is a canonical 16-bit PCM WAV of silence.
+func wav16(rate, channels, samples int) []byte {
+	data := samples * channels * 2
+	h := make([]byte, 44)
+	copy(h, "RIFF")
+	binary.LittleEndian.PutUint32(h[4:], uint32(36+data))
+	copy(h[8:], "WAVEfmt ")
+	binary.LittleEndian.PutUint32(h[16:], 16)
+	binary.LittleEndian.PutUint16(h[20:], 1)
+	binary.LittleEndian.PutUint16(h[22:], uint16(channels))
+	binary.LittleEndian.PutUint32(h[24:], uint32(rate))
+	binary.LittleEndian.PutUint32(h[28:], uint32(rate*channels*2))
+	binary.LittleEndian.PutUint16(h[32:], uint16(channels*2))
+	binary.LittleEndian.PutUint16(h[34:], 16)
+	copy(h[36:], "data")
+	binary.LittleEndian.PutUint32(h[40:], uint32(data))
+	return append(h, make([]byte, data)...)
+}
+
+func TestWAVSignature(t *testing.T) {
+	record := func() *jsonv.Object {
+		return jsonv.O("output_id", "audio", "sample_rate", 8000.0, "channels", 2.0, "samples", 8192.0, "duration_seconds", 1.024)
+	}
+	good := wav16(8000, 2, 8192)
+	if !check("audio/wav", good, record()) {
+		t.Fatal("a canonical WAV was refused")
+	}
+	mutate := func(at int, put func(b []byte)) []byte {
+		b := append([]byte(nil), good...)
+		put(b[at:])
+		return b
+	}
+	cases := map[string][]byte{
+		"truncated":      good[:len(good)-2],
+		"trailing bytes": append(append([]byte(nil), good...), 0, 0, 0, 0),
+		"not RIFF":       mutate(0, func(b []byte) { copy(b, "RIFX") }),
+		"not PCM":        mutate(20, func(b []byte) { binary.LittleEndian.PutUint16(b, 3) }),
+		"24-bit":         mutate(34, func(b []byte) { binary.LittleEndian.PutUint16(b, 24) }),
+		"bad byte rate":  mutate(28, func(b []byte) { binary.LittleEndian.PutUint32(b, 1) }),
+		"no data chunk":  mutate(36, func(b []byte) { copy(b, "LIST") }),
+		"empty":          wav16(8000, 2, 0),
+		"short header":   good[:40],
+	}
+	for name, data := range cases {
+		if check("audio/wav", data, record()) {
+			t.Fatalf("%s was accepted", name)
+		}
+	}
+	for field, value := range map[string]float64{"sample_rate": 16000, "channels": 1, "samples": 8191, "duration_seconds": 1} {
+		if check("audio/wav", good, record().Set(field, value)) {
+			t.Fatalf("a record with %s %v was accepted", field, value)
+		}
+	}
+}
+
+func TestAudioRecipes(t *testing.T) {
+	parse := func(text string) error {
+		raw, err := jsonv.Parse([]byte(text))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = Validate(RecipeSchema, raw)
+		return err
+	}
+	found := false
+	for _, r := range DefaultRecipes() {
+		if r.Str("recipe_id") == "soundscape" {
+			found = r.Str("pipeline") == "text-to-audio" && r.Str("model_family") == "stable-audio-open"
+		}
+	}
+	if !found {
+		t.Fatal("no soundscape recipe")
+	}
+	for body, ok := range map[string]bool{
+		`{"schema_version":1,"recipe_id":"a","revision":1,"pipeline":"text-to-audio","model_family":"stable-audio-open","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"steps":200,"duration_seconds":30,"guidance":5}}`: true,
+		`{"schema_version":1,"recipe_id":"a","revision":1,"pipeline":"text-to-audio","model_family":"stable-audio-open","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"width":64}}`:                                     false,
+		`{"schema_version":1,"recipe_id":"a","revision":1,"pipeline":"text-to-audio","model_family":"stable-audio-open","inputs":{"prompt":{"type":"string","required":true},"image":{"type":"image","required":true}},"defaults":{}}`:      false,
+		`{"schema_version":1,"recipe_id":"a","revision":1,"pipeline":"text-to-audio","model_family":"stable-audio-open","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"steps":201}}`:                                    false,
+		// The wider audio step range does not widen the image tasks'.
+		`{"schema_version":1,"recipe_id":"a","revision":1,"pipeline":"text-to-image","model_family":"sdxl-base","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"steps":175}}`:          false,
+		`{"schema_version":1,"recipe_id":"a","revision":1,"pipeline":"text-to-image","model_family":"sdxl-base","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"duration_seconds":5}}`: false,
+	} {
+		if err := parse(body); (err == nil) != ok {
+			t.Fatalf("%s: %v", body, err)
+		}
+	}
+	// An audio output can be published but never bound to an image input.
+	linear := `{"schema_version":2,"recipe_id":"l","revision":1,"inputs":{"prompt":{"type":"string"}},"operations":[
+	  {"op_id":"sound","task":"text-to-audio","model_family":"stable-audio-open","inputs":{"prompt":{"from":"input:prompt"}},"defaults":{"steps":4,"duration_seconds":2}},
+	  {"op_id":"enlarge","task":"upscale","model_family":"esrgan","inputs":{"image":{"from":"op:sound/audio"}}}]}`
+	if err := parse(linear); err == nil {
+		t.Fatal("an audio output was bound to an image input")
 	}
 }

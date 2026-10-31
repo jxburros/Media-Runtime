@@ -1,0 +1,6 @@
+{
+  "model_id": "stable-audio",
+  "artifact_handle": "stable-audio-open",
+  "family": "stable-audio-open",
+  "source": {"repository": "stabilityai/stable-audio-open-1.0", "license": "Stability AI Community License (check the installed revision's model card)"}
+}

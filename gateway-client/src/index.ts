@@ -17,8 +17,11 @@ export type OutputRecord = {
   frames?: number;
   fps?: number;
   duration_seconds?: number;
+  /** text-to-audio `audio` (16-bit PCM WAV): read back from its header; duration_seconds =
+   * samples / sample_rate, the request rounded up to whole latent frames. */
   sample_rate?: number;
   channels?: number;
+  samples?: number;
   expires_at: string | null;
 };
 
@@ -53,6 +56,8 @@ export type Submission = {
     motion?: number;
     noise_augmentation?: number;
     decode_chunk?: number;
+    /** text-to-audio only; must lie within the model's duration_range (never trimmed). */
+    duration_seconds?: number;
   };
   adapters?: { adapter_id: string; scale?: number }[];
   backend_id?: "diffusers-sdxl" | "owned-sdxl";
@@ -115,9 +120,9 @@ export type WorkerSummary = {
 
 export type JobState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
-export type Task = "text-to-image" | "image-to-image" | "upscale" | "image-to-video";
+export type Task = "text-to-image" | "image-to-image" | "upscale" | "image-to-video" | "text-to-audio";
 
-export type Family = "sdxl-base" | "esrgan" | "svd";
+export type Family = "sdxl-base" | "esrgan" | "svd" | "stable-audio-open";
 
 /** Facts of a job's video operation, from the verified frame archive record. */
 export type VideoFacts = {
@@ -131,7 +136,16 @@ export type VideoFacts = {
   encoded_video: boolean;
 };
 
-export type MediaFacts = VideoFacts;
+/** Facts of a job's audio operation, from the verified WAV record. */
+export type AudioFacts = {
+  type: "audio";
+  sample_rate: number;
+  channels: number;
+  samples: number;
+  duration_seconds: number;
+};
+
+export type MediaFacts = VideoFacts | AudioFacts;
 
 export type InputDeclaration =
   | { type: "string"; required: boolean; max_length?: number }
@@ -177,7 +191,7 @@ export type JobOperation = {
   /** The worker the operation ran on; a linear job runs every operation on one worker. */
   worker_id?: string;
   outputs: OutputRecord[];
-  /** Video operations: the committed media facts. */
+  /** Video and audio operations: the committed media facts. */
   media?: MediaFacts;
   error?: { code: string; message: string };
   [key: string]: unknown;
@@ -197,7 +211,7 @@ export type Job = {
   outputs: OutputRecord[];
   /** Linear jobs: committed outputs the recipe does not publish. */
   intermediate_outputs?: OutputRecord[];
-  /** Jobs with a video operation: its facts (the last one's in a linear job). */
+  /** Jobs with a video or audio operation: its facts (the last one's in a linear job). */
   media?: MediaFacts;
   operations: JobOperation[];
   current_operation: number;
@@ -226,6 +240,12 @@ export type ModelSummary = {
   /** svd models: the [width, height] sizes the bundle serves and its default frame count. */
   video_sizes?: [number, number][];
   default_frames?: number;
+  /** stable-audio-open models: the bundle's audio format, latent granularity (samples per
+   * latent frame) and the [low, high] seconds it serves. */
+  sample_rate?: number;
+  channels?: number;
+  hop_length?: number;
+  duration_range?: [number, number];
   bundle_digest: string;
   source?: {
     repository?: string;

@@ -24,23 +24,32 @@ var ROLES = []string{"unet", "vae", "text_encoder", "text_encoder_2", "tokenizer
 var WEIGHT_ROLES = ROLES[:4]
 
 // diffusersFamily is one Diffusers-format family: its pipeline task, the pipeline class its
-// model_index.json names, its scheduler class and its component roles, weight roles first.
+// model_index.json names, its scheduler class, its component roles in Engine's order (which the
+// bundle digest covers) and those that carry safetensors weights.
 type diffusersFamily struct {
 	pipeline, class, scheduler string
 	// schedulerName is the scheduler as the inspection problems name it.
 	schedulerName string
 	roles         []string
-	weights       int
+	weightRoles   []string
+	// required lists configuration files the family needs beyond its role folders.
+	required []string
 	// unsupported is the refusal when the model index names another pipeline class.
 	unsupported string
 }
 
 var diffusersFamilies = map[string]diffusersFamily{
-	"sdxl-base": {pipeline: "text-to-image", class: "StableDiffusionXLPipeline", scheduler: "EulerDiscreteScheduler", schedulerName: "Euler discrete", roles: ROLES, weights: 4,
+	"sdxl-base": {pipeline: "text-to-image", class: "StableDiffusionXLPipeline", scheduler: "EulerDiscreteScheduler", schedulerName: "Euler discrete", roles: ROLES, weightRoles: WEIGHT_ROLES,
 		unsupported: "Only SDXL base Diffusers bundles are supported"},
 	"svd": {pipeline: "image-to-video", class: "StableVideoDiffusionPipeline", scheduler: "EulerDiscreteScheduler", schedulerName: "Euler discrete",
-		roles: []string{"unet", "vae", "image_encoder", "feature_extractor", "scheduler"}, weights: 3,
+		roles: []string{"unet", "vae", "image_encoder", "feature_extractor", "scheduler"}, weightRoles: []string{"unet", "vae", "image_encoder"},
 		unsupported: "An svd bundle is a Diffusers StableVideoDiffusionPipeline directory"},
+	"stable-audio-open": {pipeline: "text-to-audio", class: "StableAudioPipeline", scheduler: "CosineDPMSolverMultistepScheduler", schedulerName: "CosineDPMSolverMultistep",
+		roles:       []string{"transformer", "vae", "text_encoder", "tokenizer", "projection_model", "scheduler"},
+		weightRoles: []string{"transformer", "vae", "text_encoder", "projection_model"},
+		// The fast T5 tokenizer must load without sentencepiece.
+		required:    []string{"tokenizer/tokenizer.json"},
+		unsupported: "A stable-audio-open bundle is a Diffusers StableAudioPipeline directory"},
 }
 
 // diffusersFamilyOf is the family whose pipeline class a model index names, or sdxl-base.
@@ -183,7 +192,12 @@ func BuildBundle(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 		return nil, c.Err(400, "unsupported", spec.unsupported)
 	}
 	components := []any{}
-	for i, role := range spec.roles {
+	for _, need := range spec.required {
+		if !files.Has(need) {
+			return nil, c.Err(400, "missing_component", "Missing "+need, strings.Split(need, "/")[0])
+		}
+	}
+	for _, role := range spec.roles {
 		entries := jsonv.NewObject()
 		weights := false
 		for _, k := range files.Keys() {
@@ -192,11 +206,12 @@ func BuildBundle(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 				weights = weights || strings.HasSuffix(k, ".safetensors")
 			}
 		}
-		if entries.Len() == 0 || (i < spec.weights && !weights) {
+		weightRole := c.Contains(spec.weightRoles, role)
+		if entries.Len() == 0 || (weightRole && !weights) {
 			return nil, c.Err(400, "missing_component", fmt.Sprintf("Missing %s component", role), role)
 		}
 		format := "json"
-		if i < spec.weights {
+		if weightRole {
 			format = "safetensors"
 		}
 		components = append(components, jsonv.O("role", role, "artifact_handle", handle, "digest", c.Hash(entries), "tensor_format", format))
@@ -545,15 +560,20 @@ func Inspect(catalog *jsonv.Object, handle string) []any {
 			problems = append(problems, "scheduler/scheduler_config.json is missing or invalid")
 		}
 		missing = nil
-		for i, r := range spec.roles {
+		for _, r := range spec.roles {
 			role := roles.Obj(r)
 			s, _ := role.Num("safetensors")
-			if !role.Bool("present") || (i < spec.weights && s == 0) {
+			if !role.Bool("present") || (c.Contains(spec.weightRoles, r) && s == 0) {
 				missing = append(missing, r)
 			}
 		}
 		if len(missing) > 0 {
 			problems = append(problems, "Missing or weightless components: "+strings.Join(missing, ", "))
+		}
+		for _, need := range spec.required {
+			if !exists(filepath.Join(root, need)) {
+				problems = append(problems, need+" is missing")
+			}
 		}
 		if pipeline != nil && pipeline != spec.class {
 			problems = append(problems, spec.unsupported)
@@ -570,6 +590,11 @@ func Inspect(catalog *jsonv.Object, handle string) []any {
 		entries = append(entries, entry())
 	}
 	return entries
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func strs(list []string) []any {

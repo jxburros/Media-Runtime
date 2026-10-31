@@ -21,25 +21,28 @@ const VERSION = "0.9.0"
 var PROTOCOLS = []string{"media-worker/1.0", "media-worker/1.1", "media-worker/1.2", "media-worker/1.3"}
 var PROTOCOL = PROTOCOLS[len(PROTOCOLS)-1]
 var BACKENDS = []string{"diffusers-sdxl", "owned-sdxl"}
-var TASKS = []string{"text-to-image", "image-to-image", "upscale", "image-to-video"}
+var TASKS = []string{"text-to-image", "image-to-image", "upscale", "image-to-video", "text-to-audio"}
 
 // FAMILIES are the model families a registration may name, with the tasks each serves.
 var FAMILIES = map[string][]string{
-	"sdxl-base": {"text-to-image", "image-to-image"},
-	"esrgan":    {"upscale"},
-	"svd":       {"image-to-video"},
+	"sdxl-base":         {"text-to-image", "image-to-image"},
+	"esrgan":            {"upscale"},
+	"svd":               {"image-to-video"},
+	"stable-audio-open": {"text-to-audio"},
 }
 
 // BundleFacts are the facts a 1.2+ worker reports when it validates a bundle of each family,
 // recorded with the registered model: the upscale factor, the sizes and default frame count an
-// svd bundle serves.
+// svd bundle serves, and a stable-audio-open bundle's sample rate, channels, latent granularity
+// (hop_length samples per latent frame) and the duration range it serves.
 var BundleFacts = map[string][]string{
-	"esrgan": {"scale"},
-	"svd":    {"video_sizes", "default_frames"},
+	"esrgan":            {"scale"},
+	"svd":               {"video_sizes", "default_frames"},
+	"stable-audio-open": {"sample_rate", "channels", "hop_length", "duration_range"},
 }
 
 // FAMILY_NAMES lists the families in the order they were introduced.
-var FAMILY_NAMES = []string{"sdxl-base", "esrgan", "svd"}
+var FAMILY_NAMES = []string{"sdxl-base", "esrgan", "svd", "stable-audio-open"}
 
 // TaskFamily is the family whose bundles serve a task.
 func TaskFamily(task string) string {
@@ -48,6 +51,8 @@ func TaskFamily(task string) string {
 		return "esrgan"
 	case "image-to-video":
 		return "svd"
+	case "text-to-audio":
+		return "stable-audio-open"
 	}
 	return "sdxl-base"
 }
@@ -59,7 +64,7 @@ func TaskMinor(task string) int {
 		return 1
 	case "upscale":
 		return 2
-	case "image-to-video":
+	case "image-to-video", "text-to-audio":
 		return 3
 	}
 	return 0
@@ -70,7 +75,7 @@ func FamilyMinor(family string) int {
 	switch family {
 	case "esrgan":
 		return 2
-	case "svd":
+	case "svd", "stable-audio-open":
 		return 3
 	}
 	return 0
@@ -142,6 +147,44 @@ var videoFields = []Field{
 // VideoParameterNames are the parameters an image-to-video request may carry.
 var VideoParameterNames = []string{"width", "height", "seed", "steps", "frames", "fps", "motion", "noise_augmentation", "decode_chunk"}
 
+// MaxDiffusionSteps bounds steps on the image tasks; MaxAudioSteps on text-to-audio, whose
+// protocol range is wider. The worker's advertised limits apply within both.
+const (
+	MaxDiffusionSteps = 150
+	MaxAudioSteps     = 200
+)
+
+// audioFields are the text-to-audio parameters (protocol 1.3, Engine 0.7.0) beside seed, steps
+// and guidance: the requested clip length in seconds, a positive number bounded by the protocol
+// before a bundle's own range applies.
+var audioFields = []Field{
+	{Name: "duration_seconds", Check: Num(NumOpts{GreaterThan: F(0), Max: F(600)})},
+}
+
+var audioSteps = Field{Name: "steps", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(MaxAudioSteps)})}
+
+// AudioParameterNames are the parameters a text-to-audio request may carry.
+var AudioParameterNames = []string{"seed", "steps", "guidance", "duration_seconds"}
+
+// TaskParameterNames are the parameters each task takes; any other parameter is refused by name.
+var TaskParameterNames = map[string][]string{
+	"text-to-image":  {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "count"},
+	"image-to-image": {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "strength"},
+	"upscale":        {"width", "height", "tile", "tile_overlap"},
+	"image-to-video": VideoParameterNames,
+	"text-to-audio":  AudioParameterNames,
+}
+
+// MediaParameter reports whether a parameter belongs only to the video or audio tasks.
+func MediaParameter(name string) bool {
+	for _, f := range append(append([]Field{}, videoFields...), audioFields...) {
+		if f.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // Parameters is the complete, resolved parameter set of a diffusion task.
 var Parameters = StrictObject(parameterFields...)
 
@@ -152,8 +195,14 @@ var UpscaleParameters = StrictObject(append(append([]Field{}, parameterFields[:2
 // the seed, steps (the worker bounds them by limits.video_steps) and every video parameter.
 var VideoParameters = StrictObject(append([]Field{parameterFields[0], parameterFields[1], parameterFields[4], parameterFields[2]}, videoFields...)...)
 
-// PartialParameters is a request's or recipe's parameter overrides for any task.
-var PartialParameters = StrictObject(Partial(append(append(append([]Field{}, parameterFields...), tileFields...), videoFields...))...)
+// AudioParameters is the resolved parameter set of a text-to-audio operation: seed, steps (up to
+// the audio range), guidance and the requested duration. It has no image size.
+var AudioParameters = StrictObject(parameterFields[4], audioSteps, parameterFields[3], audioFields[0])
+
+// PartialParameters is a request's or recipe's parameter overrides for any task. Its steps
+// bound is the widest task's (audio); the image tasks' 150 is checked at resolution.
+var PartialParameters = StrictObject(Partial(append(append(append(append([]Field{}, parameterFields[:2]...), audioSteps), parameterFields[3:]...),
+	append(append(append([]Field{}, tileFields...), videoFields...), audioFields...)...))...)
 
 // Prompt is a non-blank prompt; diffusion tasks require one and upscale forbids it.
 var Prompt = Str(StrOpts{Min: 1, Max: 10000, Refine: func(s string) bool { return strings.TrimFunc(s, isJSSpace) != "" }})
@@ -276,6 +325,10 @@ func DefaultRecipes() []*jsonv.Object {
 		// steps is the recipe's: the worker has no default for video steps (fps, motion,
 		// noise_augmentation and decode_chunk come from its task_defaults, frames from the bundle).
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"animate","revision":1,"pipeline":"image-to-video","model_family":"svd","inputs":{"image":{"type":"image","required":true}},"defaults":{"steps":25}}`),
+		// steps and duration_seconds are the recipe's: the worker requires both and defaults only
+		// guidance; the clip length is the operator's choice, refused rather than trimmed when a
+		// bundle's range does not include it.
+		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"soundscape","revision":1,"pipeline":"text-to-audio","model_family":"stable-audio-open","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"steps":100,"duration_seconds":10}}`),
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"variation","revision":1,"pipeline":"image-to-image","model_family":"sdxl-base","inputs":{"prompt":{"type":"string","required":true},"image":{"type":"image","required":true}},"defaults":{"steps":30,"guidance":6,"strength":0.6}}`),
 	}
 }

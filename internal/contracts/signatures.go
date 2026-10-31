@@ -15,11 +15,12 @@ import (
 type Signature func(data io.ReaderAt, size int64, record *jsonv.Object) bool
 
 // Signatures are the owned format checks, one per verifiable MIME type. PNG is checked from
-// 0.5.0; the frame archive and the optional encoded video from 0.9.0.
+// 0.5.0, the frame archive and the optional encoded video from 0.9.0, WAV from 0.10.0.
 var Signatures = map[string]Signature{
 	"image/png":       pngSignature,
 	"application/zip": frameArchiveSignature,
 	"video/mp4":       mp4Signature,
+	"audio/wav":       wavSignature,
 }
 
 func readAt(data io.ReaderAt, offset, n int64) ([]byte, bool) {
@@ -148,4 +149,38 @@ func mp4Signature(data io.ReaderAt, size int64, record *jsonv.Object) bool {
 		box = binary.BigEndian.Uint64(head[8:16])
 	}
 	return box >= 8 && box <= uint64(size)
+}
+
+// wavSignature checks the canonical WAV the protocol specifies: a 44-byte RIFF/WAVE header whose
+// RIFF size is the file size less eight, a 16-byte "fmt " chunk of 16-bit PCM with a consistent
+// block alignment and byte rate, then one "data" chunk holding a whole, non-zero number of
+// sample frames up to the end of the file. The record's sample rate, channels, samples and
+// duration (samples / sample_rate) must be the header's.
+func wavSignature(data io.ReaderAt, size int64, record *jsonv.Object) bool {
+	head, ok := readAt(data, 0, 44)
+	if !ok {
+		return false
+	}
+	le16 := func(i int) uint64 { return uint64(binary.LittleEndian.Uint16(head[i:])) }
+	le32 := func(i int) uint64 { return uint64(binary.LittleEndian.Uint32(head[i:])) }
+	if string(head[0:4]) != "RIFF" || string(head[8:12]) != "WAVE" || string(head[12:16]) != "fmt " || string(head[36:40]) != "data" {
+		return false
+	}
+	format, channels, rate, byteRate, align, bits := le16(20), le16(22), le32(24), le32(28), le16(32), le16(34)
+	dataSize := le32(40)
+	if le32(16) != 16 || format != 1 || bits != 16 || channels < 1 || rate < 1 || align != channels*2 || byteRate != rate*align {
+		return false
+	}
+	if le32(4) != uint64(size)-8 || dataSize == 0 || dataSize%align != 0 || uint64(size) != 44+dataSize {
+		return false
+	}
+	samples := dataSize / align
+	facts := map[string]float64{"sample_rate": float64(rate), "channels": float64(channels), "samples": float64(samples)}
+	for k, want := range facts {
+		if v, ok := record.Num(k); !ok || v != want {
+			return false
+		}
+	}
+	d, ok := record.Num("duration_seconds")
+	return ok && d == float64(samples)/float64(rate)
 }
