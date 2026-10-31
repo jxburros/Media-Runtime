@@ -17,8 +17,9 @@ through durable intermediate outputs. Release 0.7.0 drives a pool of workers, on
 per GPU, with one execution per worker. Release 0.8.0 adds remote workers over mutual TLS (Engine
 0.5.0's network mode) and a network mode for the runtime's own API. Release 0.9.0 speaks
 `media-worker/1.3` (Engine 0.6.0) and adds [video](#video): image-to-video on the `svd` family,
-committed as a lossless frame archive and a poster image. Audio and native inference are later
-stages, specified in the same document and sequenced in
+committed as a lossless frame archive and a poster image. Release 0.10.0 adds [audio](#audio):
+text-to-audio on the `stable-audio-open` family (Engine 0.7.0), committed as a WAV clip. Native
+inference is a later stage, specified in the same document and sequenced in
 [docs/implementation-plan.md](docs/implementation-plan.md).
 
 ## Install and run
@@ -57,6 +58,8 @@ media-runtime adapters register examples/adapter.json
 media-runtime run portrait --model studio-sdxl --prompt "Soft window light" --adapter studio-style:0.8 --wait
 media-runtime models register examples/model.svd.json        # an svd bundle, Engine 0.6.0 or later
 media-runtime run animate --model svd-xt --image ./frame.png --frames 25 --fps 7 --wait
+media-runtime models register examples/model.audio.json      # a stable-audio-open bundle, Engine 0.7.0 or later
+media-runtime run soundscape --model stable-audio --prompt "rain on a tin roof" --duration 10 --wait
 media-runtime jobs list
 media-runtime outputs export JOB_ID --directory ./exports
 media-runtime tui
@@ -172,6 +175,38 @@ media-runtime outputs export JOB_ID --directory ./exports   # JOB_ID-frames.zip,
   shows frames and duration. Frames and videos open in external tools.
 - In a [linear recipe](#linear-recipes) a video operation may take its image from an earlier
   operation; the poster (a PNG) can feed a later image input, the archive cannot.
+
+## Audio
+
+The `soundscape` recipe (pipeline `text-to-audio`, family `stable-audio-open`, protocol 1.3;
+Engine 0.7.0 or later, on a reference backend with its audio extra) generates one clip from a
+prompt and an optional negative prompt. Register a Diffusers `StableAudioPipeline` directory
+naming its family (`models register examples/model.audio.json`); the worker reads the bundle's
+sample rate, channels, latent granularity (`hop_length`, samples per latent frame) and the
+duration range it serves (an optional `audio.json`, else 1 s to the whole seconds its latent length
+allows: 1–47 s for the reference bundle), and they are recorded with the model (`models show`,
+`doctor`). Then:
+
+```sh
+media-runtime run soundscape --model stable-audio --prompt "rain on a tin roof" --duration 10 --wait
+media-runtime outputs export JOB_ID --directory ./exports   # JOB_ID-audio.wav, -manifest.json
+```
+
+- `--duration` is `parameters.duration_seconds` (recipe default 10); `steps` defaults to the
+  recipe's 100 within the worker's audio range (up to 200), `guidance` to the worker's 7, and the
+  seed is resolved; all are recorded before dispatch. A duration outside the model's range is
+  refused before admission, never trimmed. An image, `width`, `height`, `sampler`, `scheduler`,
+  `strength`, `count`, tiling, video parameters and adapters are refused by name. Workers before
+  1.3, or a 1.3 worker that does not list the task, refuse the recipe and the family.
+- The clip is honored up to the model's granularity: the worker produces the smallest whole number
+  of latent frames that covers the request, so a 10 s request on the reference bundle is 10.031 s.
+  The job commits `audio` (`audio/wav`, 16-bit PCM) after checking its size, SHA-256 and canonical
+  RIFF/WAVE header against the worker's record (sample rate, channels, samples, duration), the
+  model's format, and that it is no shorter than requested and longer by less than one latent
+  frame.
+- The job, its operation and the manifest (schema 5) record the sample rate, channels, samples and
+  actual duration (`media`). The `audio/wav` output limit defaults to 64 MiB. The dashboard shows
+  the duration; playback happens in an external player.
 
 ## Linear recipes
 
@@ -442,7 +477,10 @@ mismatches and re-pinning, and the API over TLS; they skip against an Engine fix
 0.5.0. The video tests run the fixture's two-frame `svd` bundle end to end (archive and poster
 verification, refusals, a forged archive, the size limit, an injected optional video, a linear
 generate-then-animate recipe and a 1.2-pinned fixture's refusals); they skip against an Engine
-fixture older than 0.6.0. `cmd/media-runtime` tests build the binary and drive
+fixture older than 0.6.0. The audio tests run the fixture's 8 kHz stereo `stable-audio-open`
+bundle end to end (duration rounding, WAV verification, refusals, a forged clip, the size limit,
+1.2 and audio-less 1.3 workers); they skip against an Engine fixture older than 0.7.0.
+`cmd/media-runtime` tests build the binary and drive
 the CLI end to end, including a state directory written by the TypeScript 0.3.0 service
 (`testdata/state-0.3.0`); `internal/tui` and the doctor tests compare rendered text with the
 0.3.0 output. The fixture is not an inference fallback. GPU image quality and hardware

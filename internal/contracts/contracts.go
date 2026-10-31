@@ -16,7 +16,7 @@ import (
 	"github.com/jxburros/media-runtime/internal/jsonv"
 )
 
-const VERSION = "0.9.0"
+const VERSION = "0.10.0"
 
 var PROTOCOLS = []string{"media-worker/1.0", "media-worker/1.1", "media-worker/1.2", "media-worker/1.3"}
 var PROTOCOL = PROTOCOLS[len(PROTOCOLS)-1]

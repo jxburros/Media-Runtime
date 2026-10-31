@@ -26,5 +26,10 @@ From 0.9.0 submissions may carry the image-to-video parameters (`frames`, `fps`,
 worker produces one, `video` (`video/mp4`), and the job carries `media` facts. Models of the `svd`
 family report `video_sizes` and `default_frames`.
 
+From 0.10.0 submissions may carry `duration_seconds` for text-to-audio; an audio job's output is
+`audio` (`audio/wav`, with `sample_rate`, `channels`, `samples` and `duration_seconds` on its
+record) and its `media` facts are `AudioFacts`. Models of the `stable-audio-open` family report
+`sample_rate`, `channels`, `hop_length` and `duration_range`.
+
 The service itself is the Go binary at the repository root. This package is versioned with it and
 gains each release's new request, output, recipe and worker types in the same change.

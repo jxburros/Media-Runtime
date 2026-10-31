@@ -399,3 +399,60 @@ third-party module.
   for a pool, so the image dashboards keep the 0.3.0 layout pinned by the tests.
 - No new dependency; the ledger and `go.sum` are unchanged (`archive/zip` was already listed for
   the frame archive checks in 0.4.0).
+
+# Implementation decisions — 0.10.0
+
+- Protocol: unchanged (`media-worker/1.3`); Engine 0.7.0 added text-to-audio within the minor,
+  so availability follows the worker's `tasks` and `loaders`, not the minor: Engine 0.6.0 and a
+  reference backend without the `inference-audio` extra negotiate 1.3 and still refuse the recipe
+  (`unsupported`, `recipe_id`) and registration (`unsupported`, `family`). The runtime does not
+  read `missing_task_dependencies`; the worker's own refusal, and `doctor`'s task list, say what
+  is served.
+- Reference bundle: `stabilityai/stable-audio-open-1.0` (44.1 kHz stereo, up to 47.55 s; the
+  default range 1–47 s) in Diffusers format with safetensors weights, as Engine 0.7.0 records.
+  Stability AI licenses it under the Stability AI Community License, separately from this project;
+  its T5 encoder derives from `google-t5/t5-base` (Apache-2.0). The operator checks the installed
+  revision's model card (the repository is gated) and supplies the weights; nothing here downloads
+  them. `examples/model.audio.json` names the reference repository; no real weights were used.
+- Bundle facts: the worker's validation at registration reports `sample_rate`, `channels`,
+  `hop_length` and `duration_range`; they are recorded on the model, like the svd facts, and
+  admission uses them on every candidate. `limits.duration_seconds` describes the loaded bundle and
+  is consulted only for a model without a recorded range.
+- Resolution order: worker `task_defaults` and task `defaults` (guidance 7), recipe defaults, then
+  the request; the seed is resolved. The worker requires `steps` and `duration_seconds` and
+  defaults neither, so `soundscape` carries `steps: 100` (the library pipeline's default) and
+  `duration_seconds: 10` (the plan's example); `capabilities.defaults` is never merged into an
+  audio operation.
+- Steps: the request schema's steps bound is now the widest task's, 200 (the protocol's audio
+  range); the image tasks keep 150, checked at resolution and at recipe registration with the
+  field they always had (`parameters.steps`, or the recipe's `inputs` refinement), so no existing
+  request changes outcome or error field. The worker's `audio_steps` and `guidance` limits apply.
+- Duration: a request outside the model's `duration_range` is `invalid_request`, field
+  `parameters.duration_seconds`; the clip is never trimmed or padded by the runtime. The worker
+  rounds up to whole latent frames, so the committed clip may be longer than requested by less
+  than `hop_length / sample_rate` seconds; the commit check refuses a clip shorter than the request
+  or longer than that bound (a 1e-9 s tolerance absorbs binary rounding of Engine's own division).
+  The job records the requested duration in its request and the actual one in `media` and the
+  output record.
+- WAV verification (owned code on `encoding/binary`): exactly the protocol's canonical layout —
+  `RIFF` with size = file size − 8, `WAVE`, a 16-byte `fmt ` chunk of PCM (format 1), 16 bits,
+  channels ≥ 1, block alignment = channels × 2 and byte rate = rate × alignment, then `data` at
+  offset 36 holding a non-zero whole number of frames and ending at the end of the file. Other
+  chunk layouts (`LIST`, extensible format, padding) are refused because Engine never writes them;
+  a worker that does would need a recorded decision here. The record's `sample_rate`, `channels`,
+  `samples` and `duration_seconds` (= samples / sample_rate exactly) must be the header's, and the
+  rate and channels the model's.
+- Output limit: `audio/wav` keeps the 0.5.0 default of 64 MiB, an unmeasured guess: by arithmetic
+  a 47 s 44.1 kHz stereo 16-bit clip is about 8 MiB (the protocol's 600 s ceiling would be about
+  101 MiB and needs a larger limit), and the fixture's clips are a few hundred KiB.
+- Manifest schema 5 also covers audio jobs (operations layout with `media`), with no shape change
+  from 0.9.0; audio `media` is `{type: audio, sample_rate, channels, samples, duration_seconds}`.
+- Parameters across tasks: `TaskParameterNames` lists what each task takes. A video or audio
+  parameter on a task that does not take it is refused by name before resolution; 0.9.0 let such
+  a parameter reach the strict resolved-parameter schema, which refused it without a field.
+- Catalog: stable-audio-open roles are listed in Engine's order (transformer, vae, text_encoder,
+  tokenizer, projection_model, scheduler) with transformer, vae, text_encoder and projection_model
+  as the weight roles, so a registration the runtime builds has the digest Engine's own fixture
+  computes for the same directory; `tokenizer/tokenizer.json` is required, as the worker requires
+  it, and the scheduler class is `CosineDPMSolverMultistepScheduler`.
+- No new dependency; the ledger and `go.sum` are unchanged.
