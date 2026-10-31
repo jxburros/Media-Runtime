@@ -144,6 +144,12 @@ func ExplainDoctor(report *jsonv.Object) ([]string, bool) {
 			}
 		}
 		lines = append(lines, fmt.Sprintf("Model %s (%s%s): %s%s", text(m, "model_id"), text(m, "artifact_handle"), kind, state, loaded))
+		if sizes := m.Arr("video_sizes"); len(sizes) > 0 {
+			lines = append(lines, fmt.Sprintf("  video sizes %s; default %s frames", sizeList(sizes), or(m, "default_frames", "unknown")))
+		}
+		if span := m.Arr("duration_range"); len(span) == 2 {
+			lines = append(lines, fmt.Sprintf("  audio %s Hz, %s channels; durations %s–%s s", or(m, "sample_rate", "unknown"), or(m, "channels", "unknown"), jsText(span[0]), jsText(span[1])))
+		}
 		if conversion := m.Obj("conversion"); conversion != nil {
 			lines = append(lines, fmt.Sprintf("  converted from source sha256 %s (reference %s)", short(conversion.Str("source_sha256")), short(conversion.Str("reference_bundle_digest"))))
 		}
@@ -282,6 +288,17 @@ func explainWorker(out *[]string, w *jsonv.Object, label, command string) bool {
 	return healthy
 }
 
+// sizeList formats [[w, h], …] as "w×h, …".
+func sizeList(sizes []any) string {
+	parts := []string{}
+	for _, raw := range sizes {
+		if pair, ok := raw.([]any); ok && len(pair) == 2 {
+			parts = append(parts, jsText(pair[0])+"×"+jsText(pair[1]))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
 func certificateSource(w *jsonv.Object) string {
 	if w.Str("certificate_source") == "pinned" {
 		return "pinned_sha256"
@@ -318,8 +335,13 @@ func ExplainCatalog(entries []any) []string {
 		state := "NOT READY"
 		if truthy(e.Get("complete")) {
 			state = "complete SDXL base bundle"
-			if e.Str("family") == "esrgan" {
+			switch e.Str("family") {
+			case "esrgan":
 				state = "complete esrgan upscaler ×" + text(e, "scale")
+			case "svd":
+				state = "complete svd image-to-video bundle"
+			case "stable-audio-open":
+				state = "complete stable-audio-open text-to-audio bundle"
 			}
 		}
 		size := ""

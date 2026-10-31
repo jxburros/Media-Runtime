@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.10.0 — 2026-10-31
+
+Audio, phase R6 of the implementation plan (worker protocol unchanged: `media-worker/1.3`;
+text-to-audio needs Engine 0.7.0). **Text-to-audio**: the `text-to-audio` pipeline on the
+`stable-audio-open` family and the default `soundscape` recipe (`prompt` required,
+`negative_prompt` optional, `defaults: {steps: 100, duration_seconds: 10}`). Registration (`family:
+stable-audio-open`) validates the Diffusers `StableAudioPipeline` bundle (roles transformer, vae,
+text_encoder, tokenizer with `tokenizer.json`, projection_model, scheduler) through a worker that
+loads the family on 1.3 and records the `sample_rate`, `channels`, `hop_length` and
+`duration_range` the worker read from the bundle; `models inspect`, `models list`/`show` and
+`doctor` show them. `guidance` defaults to the worker's task default (7) and the seed is resolved;
+every value is recorded before dispatch. A duration outside the model's range is refused (field
+`parameters.duration_seconds`), never trimmed; `steps` may go to 200 for audio (the worker's
+`audio_steps` applies) while the image tasks keep 150 with the same error field as before; an
+image, `width`, `height`, `sampler`, `scheduler`, `strength`, `count`, tiling, video parameters and
+adapters are refused by name. A 1.2 worker, or a 1.3 worker that does not list the task (Engine
+0.6.0, or a reference backend without its audio extra), refuses it. **Output**: `audio`
+(`audio/wav`) is streamed, then checked by size, SHA-256 and an owned canonical WAV check (44-byte
+RIFF/WAVE header, 16-bit PCM `fmt `, consistent alignment and byte rate, one `data` chunk of whole
+frames to the end of the file) against the worker's record (`sample_rate`, `channels`, `samples`,
+`duration_seconds = samples / sample_rate`), against the model's rate and channels, and against
+the request: never shorter, and longer by less than one latent frame. Jobs and operations record
+audio `media` facts and audio jobs write manifest schema 5 (additive, as specified for 0.9.0).
+**CLI and dashboard**: `run --duration SECONDS`; `outputs export` writes `.wav`; the dashboard's
+media column shows the duration (requested before commit, actual after) and the detail line the
+duration and steps instead of an image size. **Fix**: a video or audio parameter on a task that
+does not take it (for example `frames` on `portrait`) is refused with its field named; 0.9.0
+refused it as `invalid_request` without a field. The gateway client gains `duration_seconds`, the
+`stable-audio-open` family, `samples`, `AudioFacts` and the audio model facts. Examples:
+`examples/recipe.soundscape.json`, `examples/model.audio.json`. No new dependency; `go.sum` is
+unchanged. **Validated**: protocol behavior against Engine 0.7.0's fixture, whose
+`stable-audio-open` bundle has random stand-in weights and produces a seeded sine tone, and the
+unchanged image and video paths against Engine 0.6.0's fixture (where the audio tests skip)
+([compatibility record](docs/compatibility.md)). **Not validated**: real Stable Audio Open
+inference, sound quality, GPU memory and the 64 MiB default WAV limit on real clips (no GPU or
+weights here); a real 44.1 kHz stereo bundle was never registered, so its facts are as Engine
+documents them. Companion Studio task: import the clip as a Studio-owned file with provenance
+(sample rate, channels, duration).
+
+## 0.9.0 — 2026-10-31
+
+Video, phase R5 of the implementation plan (worker protocol `media-worker/1.3`, Engine 0.6.0;
+1.0–1.2 are still negotiated). **Image-to-video**: the `image-to-video` pipeline on the `svd`
+family and the default `animate` recipe (`inputs.image` required, `defaults: {steps: 25}`).
+Registration (`family: svd`) validates the Diffusers `StableVideoDiffusionPipeline` bundle through
+a worker that loads the family on 1.3 and records the `video_sizes` and `default_frames` the worker
+read from the bundle; `models inspect` recognizes the layout, and `models list`/`show` and `doctor`
+print the facts. Width and height are the input's and must be one of the model's sizes (field
+`video_size` otherwise; nothing is resized); `frames` defaults to the bundle's, `fps`, `motion`,
+`noise_augmentation` and `decode_chunk` to the worker's `task_defaults` and `steps` to the recipe,
+all recorded with the seed before dispatch; values outside the worker's `limits` are refused, and a
+prompt, `guidance`, `sampler`, `scheduler`, `strength`, `count`, tiling and adapters are refused by
+name. A 1.2 worker refuses the recipe (`unsupported`, `recipe_id`) and the family (`unsupported`,
+`family`). **Outputs**: `frames` (`application/zip`) and `poster` (`image/png`), plus `video`
+(`video/mp4`) only when the worker advertises it; the runtime never encodes video. Each output is
+streamed to a temporary file while hashed (no longer buffered in memory), then checked by size,
+SHA-256 and an owned signature check on the standard library: for the archive the ZIP local header,
+the central directory, a strict `frames.json` equal to the worker's record and to the request, one
+PNG per frame of the declared size and `duration_seconds = frames / fps`; for MP4 an `ftyp` box at
+offset 4 that fits the file. Per-MIME `max_output_bytes` applies (archive and MP4 256 MiB by
+default). Jobs and operations record `media` (frames, fps, duration, size, `encoded_video`); every
+job with a video operation writes **manifest schema 5** (the schema-4 operations layout plus each
+operation's `media`); other jobs keep schemas 3 and 4. Linear recipes may include video operations;
+only PNG outputs (`image`, `poster`) can be bound to an image input. **CLI and dashboard**: `run
+--frames --fps --motion --noise-augmentation --decode-chunk`; `outputs export` writes `.zip`, `.png`
+and `.mp4` when present and now streams each file (a partial file is removed on failure); the
+dashboard shows stage progress in the worker's unit (`decoding 8/25 frames`, which also makes
+upscale progress read `upscaling 1/4 tiles`), a media column with frames and duration that appears
+only when a listed job has video facts, and the selected job's frames and rate. The gateway client
+gains the video parameters, `Family`, `MediaFacts` and model facts. Examples:
+`examples/recipe.animate.json`, `examples/model.svd.json`. No new dependency; `go.sum` is
+unchanged. **Validated**: protocol behavior against Engine 0.7.0's and 0.6.0's fixtures, whose
+`svd` bundle has random stand-in weights and produces flat-colour frames
+([compatibility record](docs/compatibility.md)). **Not validated**: real Stable Video Diffusion
+inference, GPU memory and the default output limits on real archives (no GPU or weights here), and a
+worker-produced `video/mp4`: Engine 0.6.0 and 0.7.0 ship no encoder and never advertise one, so the
+optional output path is tested only with bytes injected by a test hook. Companion Studio task:
+import the frame archive (and the video when present) as Studio-owned files with provenance and use
+the poster as the preview.
+
 ## 0.8.0 — 2026-10-29
 
 Distributed workers and API network mode, phase R4 of the implementation plan (worker protocol

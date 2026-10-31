@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "recipe_id": "soundscape",
+  "revision": 1,
+  "pipeline": "text-to-audio",
+  "model_family": "stable-audio-open",
+  "inputs": {
+    "prompt": {
+      "type": "string",
+      "required": true
+    }
+  },
+  "defaults": {
+    "steps": 100,
+    "duration_seconds": 10
+  }
+}

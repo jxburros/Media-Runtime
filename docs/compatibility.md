@@ -18,6 +18,11 @@ by `tests/serve_fixture.py`; it proves protocol behavior, not GPU inference.
 | 0.7.0   | media-worker/1.0, 1.1, 1.2 | 0.3.0 (fixture, commit 7ad6c39)  | 1.1              | Go 1.24.7 linux/amd64 | `go test -race ./...` (1.2, linear and multi-worker pool tests skip; the legacy single-worker test runs) | pass   |
 | 0.8.0   | media-worker/1.0, 1.1, 1.2 | 0.6.0 (fixture, commit bae2917)  | 1.2 (fixture lists 1.3; the runtime negotiates 1.2), and 1.1 pinned with `--protocol`; pools of two fixtures; network mode over mutual TLS on loopback | Go 1.24.7 linux/amd64 | `go test -race ./...` | pass   |
 | 0.8.0   | media-worker/1.0, 1.1, 1.2 | 0.5.0 (fixture, commit 33ba9db)  | 1.2, and 1.1 pinned with `--protocol`; pools of two fixtures; network mode over mutual TLS on loopback | Go 1.24.7 linux/amd64 | `go test -race ./...` | pass   |
+| 0.9.0   | media-worker/1.0, 1.1, 1.2, 1.3 | 0.7.0 (fixture, commit 83d2cc0) | 1.3, 1.2 and 1.1 pinned with `--protocol`; `svd` two-frame bundle; pools; network mode | Go 1.24.7 linux/amd64 | `go test -race ./...` | pass   |
+| 0.9.0   | media-worker/1.0, 1.1, 1.2, 1.3 | 0.6.0 (fixture, commit 7c8320c) | 1.3, 1.2 and 1.1 pinned with `--protocol`; `svd` two-frame bundle; pools; network mode | Go 1.24.7 linux/amd64 | `go test ./...` | pass   |
+| 0.10.0  | media-worker/1.0, 1.1, 1.2, 1.3 | 0.7.0 (fixture, commit 83d2cc0) | 1.3, 1.2 and 1.1 pinned with `--protocol`; `svd` and `stable-audio-open` bundles; pools; network mode | Go 1.24.7 linux/amd64 | `go test -race ./...` | pass   |
+| 0.10.0  | media-worker/1.0, 1.1, 1.2, 1.3 | 0.6.0 (fixture, commit 7c8320c) | 1.3, 1.2 and 1.1 pinned with `--protocol`; `svd` bundle; pools; network mode | Go 1.24.7 linux/amd64 | `go test ./...` (audio tests skip) | pass   |
+| 0.10.0  | media-worker/1.0, 1.1, 1.2, 1.3 | 0.8.0 and 1.0.0 (fixture, Engine branch `claude/eager-dirac-7oztji`, commits e78e2ba and 8a2c22f; added later as test evidence) | 1.3, and 1.2/1.1 pinned with `--protocol` | Go 1.24.7 linux/amd64 | `go test ./...` (26 integration tests) | pass   |
 
 0.4.0 also serves a state directory written by Runtime 0.3.0 (`testdata/state-0.3.0`) unchanged:
 listing, export, idempotent replay of a 0.3.0 key and a new job.
@@ -34,5 +39,18 @@ The 0.8.0 network-mode tests run Engine's fixture with `--bind 127.0.0.1 --tls-c
 worker share one host, so they prove mutual TLS, fingerprint pinning, refusals and job semantics,
 not a real multi-host network. Network mode needs Engine 0.5.0; against older fixtures those tests
 skip.
+
+The 0.9.0 video tests use the fixture's `svd` bundle (random stand-in weights, `num_frames` 2,
+sizes 64×64, 1024×576 and 576×1024), whose frames are flat colours, not inference. They prove
+negotiation, resolution, refusals, the frame archive and poster checks and manifest schema 5. No
+Engine release produces the optional `video/mp4` output (Engine ships no encoder), so that path
+is tested only with bytes injected by a test hook; it has never been exercised against a worker.
+
+The 0.10.0 audio tests use the fixture's `stable-audio-open` bundle (random stand-in weights,
+8 kHz stereo, 256-sample latent frames, 1–47 s), whose clips are seeded sine tones, not
+inference. They prove negotiation, resolution, duration rounding, refusals, the WAV checks and
+manifest schema 5. Against Engine 0.6.0, which negotiates 1.3 without text-to-audio, the audio
+tests skip because its fixture has no audio bundle; refusal by a 1.3 worker that does not list the
+task is tested against Engine 0.7.0's fixture with its task list narrowed by a test hook.
 
 Hardware validation: none of these rows ran on a CUDA device or real weights.

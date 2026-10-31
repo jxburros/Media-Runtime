@@ -41,11 +41,15 @@ type service struct {
 func start(t *testing.T, bin, root, directory string, fixture *integration.Fixture) *service {
 	t.Helper()
 	config := filepath.Join(root, "runtime.config.json")
-	catalog := fmt.Sprintf(`{"fixture":%q}`, filepath.Join(root, "model"))
-	if _, err := os.Stat(filepath.Join(root, "upscaler")); err == nil {
-		// Only fixtures from Engine 0.4.0 create the upscaler; an absent handle fails inspection.
-		catalog = fmt.Sprintf(`{"fixture":%q,"upscaler":%q}`, filepath.Join(root, "model"), filepath.Join(root, "upscaler"))
+	entries := jsonv.O("fixture", filepath.Join(root, "model"))
+	// Only fixtures from Engine 0.4.0 create the upscaler, from 0.6.0 the video bundle and from
+	// 0.7.0 the audio bundle; an absent handle fails inspection.
+	for _, handle := range []string{"upscaler", "video", "audio"} {
+		if _, err := os.Stat(filepath.Join(root, handle)); err == nil {
+			entries.Set(handle, filepath.Join(root, handle))
+		}
 	}
+	catalog := string(jsonv.MustMarshal(entries))
 	doc := fmt.Sprintf(`{"port":0,"directory":%q,"poll_interval_ms":20,"credentials":[{"token_env":"MEDIA_RUNTIME_TOKEN","namespace":"owner","operator":true}],"artifact_catalog":%s,"worker":{"url":%q,"token_env":"MEDIA_TEST_WORKER_TOKEN"}}`,
 		directory, catalog, fixture.URL)
 	if err := os.WriteFile(config, []byte(doc), 0o600); err != nil {
@@ -350,5 +354,116 @@ func TestCommandLineMultipleOutputsAndUpscale(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(linearExports); len(entries) != 2 {
 		t.Fatalf("export writes the published image and the manifest, got %d files", len(entries))
+	}
+}
+
+func TestCommandLineVideo(t *testing.T) {
+	bin := binary(t)
+	root := t.TempDir()
+	fixture := integration.StartFixture(t, root)
+	if _, err := os.Stat(filepath.Join(root, "video")); err != nil {
+		t.Skip("the Engine fixture predates image-to-video (Engine 0.6.0)")
+	}
+	s := start(t, bin, root, filepath.Join(root, "state"), fixture)
+	if out, _, code := s.cli(t, "models", "inspect", "video"); code != 0 || !strings.Contains(out, "video: complete svd image-to-video bundle") || !strings.Contains(out, `"family":"svd"`) {
+		t.Fatalf("inspect video %d %s", code, out)
+	}
+	// The shipped example, pointed at the fixture's handle.
+	example, err := os.ReadFile(filepath.Join("..", "..", "examples", "model.svd.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := strings.Replace(strings.Replace(string(example), `"artifact_handle": "svd-xt"`, `"artifact_handle": "video"`, 1), `"model_id": "svd-xt"`, `"model_id": "svd"`, 1)
+	path := filepath.Join(root, "svd.json")
+	_ = os.WriteFile(path, []byte(doc), 0o600)
+	if out, errText, code := s.cli(t, "models", "register", path); code != 0 || !strings.Contains(out, `"default_frames": 2`) {
+		t.Fatalf("register svd %d %s %s", code, out, errText)
+	}
+	_ = os.WriteFile(filepath.Join(root, "model.json"), []byte(`{"model_id":"fixture","artifact_handle":"fixture"}`), 0o600)
+	if _, errText, code := s.cli(t, "models", "register", filepath.Join(root, "model.json")); code != 0 {
+		t.Fatalf("register fixture %d %s", code, errText)
+	}
+	if out, _, code := s.cli(t, "doctor"); code != 0 || !strings.Contains(out, "Model svd (video, svd)") || !strings.Contains(out, "video sizes 64×64, 1024×576, 576×1024; default 2 frames") || !strings.Contains(out, "image-to-video") {
+		t.Fatalf("doctor %d %s", code, out)
+	}
+	png := filepath.Join(root, "frame.png")
+	_ = os.WriteFile(png, integration.MakePNG(64, 64), 0o600)
+	out, errText, code := s.cli(t, "run", "animate", "--model", "svd", "--image", png, "--frames", "3", "--fps", "6", "--steps", "2", "--wait", "--json")
+	if code != 0 {
+		t.Fatalf("run animate %d %s %s", code, out, errText)
+	}
+	job := lastJSON(t, out)
+	if media := job.Obj("media"); media.Get("frames") != 3.0 || media.Get("fps") != 6.0 || media.Get("duration_seconds") != 0.5 {
+		t.Fatalf("animate %s", out)
+	}
+	if _, errText, code := s.cli(t, "run", "animate", "--model", "svd", "--image", png, "--prompt", "x"); code != 2 || !strings.Contains(errText, "no prompt") {
+		t.Fatalf("animate --prompt must be refused: %d %s", code, errText)
+	}
+	exports := filepath.Join(root, "exports")
+	if _, errText, code := s.cli(t, "outputs", "export", job.Str("job_id"), "--directory", exports); code != 0 {
+		t.Fatalf("export %d %s", code, errText)
+	}
+	for _, name := range []string{"frames.zip", "poster.png", "manifest.json"} {
+		if _, err := os.Stat(filepath.Join(exports, job.Str("job_id")+"-"+name)); err != nil {
+			t.Fatalf("export lacks %s", name)
+		}
+	}
+	if entries, _ := os.ReadDir(exports); len(entries) != 3 {
+		t.Fatalf("export writes the archive, the poster and the manifest, got %d files", len(entries))
+	}
+}
+
+func TestCommandLineAudio(t *testing.T) {
+	bin := binary(t)
+	root := t.TempDir()
+	fixture := integration.StartFixture(t, root)
+	if _, err := os.Stat(filepath.Join(root, "audio")); err != nil {
+		t.Skip("the Engine fixture predates text-to-audio (Engine 0.7.0)")
+	}
+	s := start(t, bin, root, filepath.Join(root, "state"), fixture)
+	if out, _, code := s.cli(t, "models", "inspect", "audio"); code != 0 || !strings.Contains(out, "audio: complete stable-audio-open text-to-audio bundle") {
+		t.Fatalf("inspect audio %d %s", code, out)
+	}
+	// The shipped example, pointed at the fixture's handle.
+	example, err := os.ReadFile(filepath.Join("..", "..", "examples", "model.audio.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := strings.Replace(string(example), `"artifact_handle": "stable-audio-open"`, `"artifact_handle": "audio"`, 1)
+	path := filepath.Join(root, "audio.json")
+	_ = os.WriteFile(path, []byte(doc), 0o600)
+	if out, errText, code := s.cli(t, "models", "register", path); code != 0 || !strings.Contains(out, `"sample_rate": 8000`) {
+		t.Fatalf("register audio %d %s %s", code, out, errText)
+	}
+	_ = os.WriteFile(filepath.Join(root, "model.json"), []byte(`{"model_id":"fixture","artifact_handle":"fixture"}`), 0o600)
+	if _, errText, code := s.cli(t, "models", "register", filepath.Join(root, "model.json")); code != 0 {
+		t.Fatalf("register fixture %d %s", code, errText)
+	}
+	if out, _, code := s.cli(t, "doctor"); code != 0 || !strings.Contains(out, "Model stable-audio (audio, stable-audio-open)") || !strings.Contains(out, "audio 8000 Hz, 2 channels; durations 1–47 s") {
+		t.Fatalf("doctor %d %s", code, out)
+	}
+	// The plan's example command; --steps keeps the fixture quick.
+	out, errText, code := s.cli(t, "run", "soundscape", "--model", "stable-audio", "--prompt", "rain on a tin roof", "--duration", "10", "--steps", "2", "--wait", "--json")
+	if code != 0 {
+		t.Fatalf("run soundscape %d %s %s", code, out, errText)
+	}
+	job := lastJSON(t, out)
+	// 10 s at 8 kHz in 256-sample latent frames: 313 frames, 80,128 samples, 10.016 s.
+	if media := job.Obj("media"); media.Get("duration_seconds") != 10.016 || media.Get("sample_rate") != 8000.0 {
+		t.Fatalf("soundscape %s", out)
+	}
+	if _, errText, code := s.cli(t, "run", "soundscape", "--model", "stable-audio", "--prompt", "x", "--duration", "60"); code != 2 || !strings.Contains(errText, "never trimmed") {
+		t.Fatalf("a duration beyond the model's range must be refused: %d %s", code, errText)
+	}
+	exports := filepath.Join(root, "exports")
+	if _, errText, code := s.cli(t, "outputs", "export", job.Str("job_id"), "--directory", exports); code != 0 {
+		t.Fatalf("export %d %s", code, errText)
+	}
+	clip, err := os.ReadFile(filepath.Join(exports, job.Str("job_id")+"-audio.wav"))
+	if err != nil || string(clip[:4]) != "RIFF" {
+		t.Fatal("export lacks the WAV")
+	}
+	if entries, _ := os.ReadDir(exports); len(entries) != 2 {
+		t.Fatalf("export writes the clip and the manifest, got %d files", len(entries))
 	}
 }

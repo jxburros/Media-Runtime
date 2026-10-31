@@ -1,0 +1,6 @@
+{
+  "model_id": "svd-xt",
+  "artifact_handle": "svd-xt",
+  "family": "svd",
+  "source": {"repository": "stabilityai/stable-video-diffusion-img2vid-xt", "license": "Stability AI Community License (check the installed revision's model card)"}
+}

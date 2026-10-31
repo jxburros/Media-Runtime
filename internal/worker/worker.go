@@ -98,8 +98,17 @@ type Client struct {
 	presented string
 	latency   time.Duration
 
-	hookJSON  func(path, method string, body any, result any) (any, error)
-	hookProbe func(p *Probe) (*Probe, error)
+	hookJSON     func(path, method string, body any, result any) (any, error)
+	hookProbe    func(p *Probe) (*Probe, error)
+	hookResponse func(path, method string) *http.Response
+}
+
+// SetResponseHook lets tests answer a raw request in process (for bytes no fixture produces);
+// a nil result from the hook, or a nil hook, sends the request to the worker.
+func (w *Client) SetResponseHook(hook func(path, method string) *http.Response) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.hookResponse = hook
 }
 
 // SetHooks lets tests observe or alter worker responses in process; nil clears a hook.
@@ -357,6 +366,14 @@ var codePattern = regexp.MustCompile(`^[a-z_]{1,60}$`)
 
 // Response performs one request. body is nil for none, []byte for raw bytes, or a JSON value.
 func (w *Client) Response(path, method string, body any, contentType string) (*http.Response, error) {
+	w.mu.Lock()
+	hook := w.hookResponse
+	w.mu.Unlock()
+	if hook != nil {
+		if res := hook(path, method); res != nil {
+			return res, nil
+		}
+	}
 	var reader io.Reader
 	if body != nil {
 		if raw, ok := body.([]byte); ok {

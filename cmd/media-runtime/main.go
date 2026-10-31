@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -35,7 +36,8 @@ media-runtime recipes register recipe.json | recipes list | recipes inspect port
 media-runtime adapters register adapter.json | adapters list
 media-runtime inputs upload image.png | inputs list | inputs delete INPUT
 media-runtime run RECIPE --model MODEL [--prompt TEXT] [--image FILE|INPUT] [--strength S] [--adapter ID[:SCALE]]... [--seed N] [--count N]
-                   [--tile N] [--tile-overlap N] [--precision P|auto] [--fallback cpu|lower_precision]...
+                   [--tile N] [--tile-overlap N] [--frames N] [--fps N] [--motion N] [--noise-augmentation X]
+                   [--decode-chunk N] [--duration SECONDS] [--precision P|auto] [--fallback cpu|lower_precision]...
                    [--model-for OP=MODEL]... [--input NAME=VALUE]... [--worker ID] [--wait] [--json]
 media-runtime jobs list [--worker ID] | jobs watch JOB | jobs cancel JOB | jobs retry JOB
 media-runtime workers list
@@ -78,7 +80,7 @@ func parse(args []string) (*options, []string, error) {
 	o := &options{strings: map[string]*string{}, set: map[string]bool{}}
 	fs := flag.NewFlagSet("media-runtime", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	for _, name := range []string{"config", "model", "prompt", "negative-prompt", "image", "strength", "seed", "width", "height", "steps", "guidance", "precision", "backend", "directory", "idempotency-key", "count", "tile", "tile-overlap", "worker"} {
+	for _, name := range []string{"config", "model", "prompt", "negative-prompt", "image", "strength", "seed", "width", "height", "steps", "guidance", "precision", "backend", "directory", "idempotency-key", "count", "tile", "tile-overlap", "worker", "frames", "fps", "motion", "noise-augmentation", "decode-chunk", "duration"} {
 		o.strings[name] = fs.String(name, "", "")
 	}
 	fs.Var(&o.adapters, "adapter", "")
@@ -376,10 +378,14 @@ func number(text string) float64 {
 
 func runJob(cl *client.Client, values *options, recipe string, print func(any), watch func(string) error) error {
 	parameters := jsonv.NewObject()
-	for _, field := range []string{"seed", "width", "height", "steps", "guidance", "strength", "count", "tile", "tile-overlap"} {
+	for _, field := range []string{"seed", "width", "height", "steps", "guidance", "strength", "count", "tile", "tile-overlap", "frames", "fps", "motion", "noise-augmentation", "decode-chunk"} {
 		if v, ok := values.get(field); ok {
 			parameters.Set(strings.ReplaceAll(field, "-", "_"), number(v))
 		}
+	}
+	if v, ok := values.get("duration"); ok {
+		// --duration is the requested clip length of an audio recipe, in seconds.
+		parameters.Set("duration_seconds", number(v))
 	}
 	// A local file is uploaded first; the service never receives a client path.
 	upload := func(image string) (string, error) {
@@ -515,13 +521,20 @@ func export(cl *client.Client, jobID, target string, print func(any)) error {
 	if job.Str("state") != "succeeded" {
 		return errors.New("Job has no committed outputs")
 	}
-	write := func(name string, data []byte) error {
-		f, err := os.OpenFile(filepath.Join(directory, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	// Existing files are never overwritten; outputs stream to disk whatever their size.
+	write := func(name string, data io.Reader) error {
+		path := filepath.Join(directory, name)
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return err
 		}
-		_, werr := f.Write(data)
-		return errors.Join(werr, f.Close())
+		_, werr := io.Copy(f, data)
+		if err := errors.Join(werr, f.Close()); err != nil {
+			// A partial copy is not an export; the file this call created is removed.
+			os.Remove(path)
+			return err
+		}
+		return nil
 	}
 	for _, raw := range job.Arr("outputs") {
 		output, _ := raw.(*jsonv.Object)
@@ -529,16 +542,13 @@ func export(cl *client.Client, jobID, target string, print func(any)) error {
 		if err != nil {
 			return err
 		}
-		data, err := io.ReadAll(res.Body)
-		res.Body.Close()
-		if err != nil {
-			return err
-		}
 		ext := c.Extensions[output.Str("mime_type")]
 		if ext == "" {
 			ext = "bin"
 		}
-		if err := write(fmt.Sprintf("%s-%s.%s", job.Str("job_id"), output.Str("output_id"), ext), data); err != nil {
+		err = write(fmt.Sprintf("%s-%s.%s", job.Str("job_id"), output.Str("output_id"), ext), res.Body)
+		res.Body.Close()
+		if err != nil {
 			return err
 		}
 	}
@@ -546,7 +556,7 @@ func export(cl *client.Client, jobID, target string, print func(any)) error {
 	if err != nil {
 		return err
 	}
-	if err := write(job.Str("job_id")+"-manifest.json", jsonv.Indent(manifest)); err != nil {
+	if err := write(job.Str("job_id")+"-manifest.json", bytes.NewReader(jsonv.Indent(manifest))); err != nil {
 		return err
 	}
 	print(jsonv.O("directory", directory))

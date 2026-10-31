@@ -108,6 +108,10 @@ func describeStage(job *jsonv.Object) string {
 		if progress.Str("stage") == "sampling" && truthy(progress.Get("total_steps")) {
 			return fmt.Sprintf("sampling %s/%s", js(progress, "completed_steps"), js(progress, "total_steps"))
 		}
+		if truthy(progress.Get("total_steps")) && progress.Get("unit") != nil {
+			// Stage progress counted in the worker's unit: decoding frames, upscaling tiles.
+			return fmt.Sprintf("%s %s/%s %s", js(progress, "stage"), js(progress, "completed_steps"), js(progress, "total_steps"), js(progress, "unit"))
+		}
 		if truthy(progress.Get("total")) && progress.Get("unit") != nil {
 			return fmt.Sprintf("%s %s/%s %s", js(progress, "stage"), js(progress, "completed"), js(progress, "total"), js(progress, "unit"))
 		}
@@ -122,6 +126,34 @@ func describeStage(job *jsonv.Object) string {
 		return "queued"
 	}
 	return js(job, "state")
+}
+
+// MediaFacts is the media column: a video job's frame count and duration, or an audio job's
+// duration, from its committed output record once it succeeded and from its resolved request
+// before (an audio clip may then still be rounded up to the model's granularity). Image jobs have
+// none.
+func MediaFacts(job *jsonv.Object) string {
+	media := job.Obj("media")
+	if d, ok := job.Obj("request").Obj("parameters").Num("duration_seconds"); media == nil && ok && job.Str("task") == "text-to-audio" {
+		media = jsonv.O("type", "audio", "duration_seconds", d)
+	}
+	if media == nil {
+		p := job.Obj("request").Obj("parameters")
+		frames, fok := p.Num("frames")
+		fps, pok := p.Num("fps")
+		if !fok || !pok || fps == 0 || job.Str("task") != "image-to-video" {
+			return ""
+		}
+		media = jsonv.O("type", "video", "frames", frames, "duration_seconds", frames/fps)
+	}
+	duration, ok := media.Num("duration_seconds")
+	if !ok {
+		return ""
+	}
+	if media.Str("type") == "video" {
+		return fmt.Sprintf("%sf %.2fs", js(media, "frames"), duration)
+	}
+	return fmt.Sprintf("%.2fs", duration)
 }
 
 // FallbackNames lists applied fallbacks, which the worker records as {fallback, reason, …}.
@@ -218,6 +250,12 @@ func Render(state State, columns, rows int) []string {
 	// column in the job table.
 	workers := rt.Arr("workers")
 	pool := len(workers) > 1
+	// A media column appears only when a listed job has video or audio facts, so image-only
+	// dashboards keep their layout.
+	media := false
+	for _, job := range state.Jobs {
+		media = media || MediaFacts(job) != ""
+	}
 	if pool {
 		for _, raw := range workers {
 			w, _ := raw.(*jsonv.Object)
@@ -251,10 +289,13 @@ func Render(state State, columns, rows int) []string {
 		num(queue, "running", ""), num(queue, "queued", ""), num(queue, "capacity", ""), modelText,
 		num(estimate, "value_mb", " MiB"), source), columns))
 	lines = append(lines, strings.Repeat("─", columns))
-	const wID, wState, wTask, wWorker, wModel, wSeed, wCreated = 14, 18, 14, 10, 12, 11, 15
+	const wID, wState, wTask, wWorker, wMedia, wModel, wSeed, wCreated = 14, 18, 14, 10, 12, 12, 11, 15
 	header := []string{pad("job", wID), pad("stage", wState), pad("task", wTask)}
 	if pool {
 		header = append(header, pad("worker", wWorker))
+	}
+	if media {
+		header = append(header, pad("media", wMedia))
 	}
 	header = append(header, pad("model", wModel), pad("seed", wSeed), pad("created", wCreated), "error / output")
 	lines = append(lines, pad(strings.Join(header, " "), columns))
@@ -320,6 +361,9 @@ func Render(state State, columns, rows int) []string {
 		if pool {
 			row = append(row, pad(job.Str("worker_id"), wWorker))
 		}
+		if media {
+			row = append(row, pad(MediaFacts(job), wMedia))
+		}
 		row = append(row, pad(model, wModel), pad(seed, wSeed), pad(created, wCreated), tail)
 		lines = append(lines, pad(marker+strings.Join(row, " "), columns))
 	}
@@ -354,7 +398,15 @@ func Render(state State, columns, rows int) []string {
 		if pool && selected.Str("worker_id") != "" {
 			backend = selected.Str("worker_id") + " " + backend
 		}
-		detail = fmt.Sprintf("%s  %s  %s×%s steps %s%s  %s", js(selected, "job_id"), backend, js(p, "width"), js(p, "height"), js(p, "steps"), strength, where)
+		if p.Has("frames") {
+			strength += " frames " + js(p, "frames") + " at " + js(p, "fps") + " fps"
+		}
+		if p.Has("duration_seconds") {
+			// An audio job has no image size.
+			detail = fmt.Sprintf("%s  %s  %ss steps %s  %s", js(selected, "job_id"), backend, js(p, "duration_seconds"), js(p, "steps"), where)
+		} else {
+			detail = fmt.Sprintf("%s  %s  %s×%s steps %s%s  %s", js(selected, "job_id"), backend, js(p, "width"), js(p, "height"), js(p, "steps"), strength, where)
+		}
 	}
 	lines = append(lines, pad(detail, columns))
 	footer := state.Message

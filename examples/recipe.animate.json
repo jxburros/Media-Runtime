@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "recipe_id": "animate",
+  "revision": 1,
+  "pipeline": "image-to-video",
+  "model_family": "svd",
+  "inputs": {
+    "image": {
+      "type": "image",
+      "required": true
+    }
+  },
+  "defaults": {
+    "steps": 25
+  }
+}
