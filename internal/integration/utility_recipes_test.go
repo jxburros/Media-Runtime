@@ -28,7 +28,7 @@ func TestExplicitHiresFixAndOutpaintRecipes(t *testing.T) {
 				op := raw.(*jsonv.Object)
 				defaults := op.Obj("defaults")
 				if defaults.Has("steps") {
-					defaults.Set("steps", 2.0)
+					defaults.Set("steps", 4.0)
 				}
 				if defaults.Has("width") {
 					defaults.Set("width", 128.0).Set("height", 128.0)

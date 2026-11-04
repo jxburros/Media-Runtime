@@ -75,8 +75,21 @@ func realpath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := os.Stat(resolved); err != nil {
+	info, err := os.Stat(resolved)
+	if err != nil {
 		return "", err
+	}
+	selected, err := os.Lstat(abs)
+	if err != nil {
+		return "", err
+	}
+	if info.Mode().IsRegular() && selected.Mode()&os.ModeSymlink != 0 {
+		if !ApprovedSnapshotFile(abs) {
+			return "", errors.New("file symlink is outside an approved snapshot")
+		}
+		// The selected snapshot basename is part of the descriptor, unlike the
+		// content-addressed blob filename which has no safetensors extension.
+		return abs, nil
 	}
 	return resolved, nil
 }
@@ -141,7 +154,11 @@ func BuildBundle(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 		if err != nil {
 			return nil, err
 		}
-		configuration, err := fileDigest(root + ".json")
+		companion, err := realpath(root + ".json")
+		if err != nil {
+			return nil, c.Err(400, "missing_component", "Unsafe or missing upscaler companion", "configuration")
+		}
+		configuration, err := fileDigest(companion)
 		if err != nil {
 			return nil, c.Err(400, "missing_component", "A file upscaler needs its .safetensors.json companion", "configuration")
 		}
@@ -307,6 +324,11 @@ func networkConfig(root string) (architecture string, scale float64, ok bool) {
 	configPath := filepath.Join(root, "config.json")
 	if info, err := os.Stat(root); err == nil && info.Mode().IsRegular() {
 		configPath = root + ".json"
+		selected, err := realpath(configPath)
+		if err != nil {
+			return "", 0, false
+		}
+		configPath = selected
 	}
 	config, err := readJSON(configPath)
 	if err != nil {
@@ -436,7 +458,12 @@ func Inspect(catalog *jsonv.Object, handle string) []any {
 		}
 		configured := catalog.Str(artifactHandle)
 		if info, err := os.Stat(configured); err == nil && info.Mode().IsRegular() {
-			entries = append(entries, inspectFile(artifactHandle, configured, info))
+			selected, err := realpath(configured)
+			if err != nil {
+				entries = append(entries, jsonv.O("artifact_handle", artifactHandle, "present", true, "complete", false, "problems", []any{"File handle symlink is outside an approved snapshot"}))
+				continue
+			}
+			entries = append(entries, inspectFile(artifactHandle, selected, info))
 			continue
 		}
 		roles := jsonv.NewObject()

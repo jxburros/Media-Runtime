@@ -92,3 +92,52 @@ func TestDAGRefusesGeneratedIDCollisions(t *testing.T) {
 		t.Fatal("generated ID collision accepted")
 	}
 }
+
+func TestDAGPinsBatchCountBeforeWorkerResolution(t *testing.T) {
+	recipe := dagFixture(t)
+	recipe.Arr("operations")[1].(*jsonv.Object).Obj("defaults").Delete("count")
+	validated, err := Validate(RecipeSchema, recipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, count := range []float64{1, 3} {
+		parameters := jsonv.NewObject()
+		if count != 1 {
+			parameters.Set("count", count)
+		}
+		expanded, err := ExpandDAG(validated, jsonv.O("inputs", jsonv.O("prompt", "test"), "parameters", parameters))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if actual, _ := expanded.Arr("operations")[0].(*jsonv.Object).Obj("defaults").Num("count"); actual != count {
+			t.Fatalf("expanded count %v not pinned to %v", actual, count)
+		}
+		if len(expanded.Arr("operations")) != 1+int(count) {
+			t.Fatal("foreach expansion differs from pinned producer count")
+		}
+	}
+}
+
+func TestDAGPreservesControlNetUsesAndProducerBinding(t *testing.T) {
+	recipe := dagFixture(t)
+	controlled := recipe.Arr("operations")[0].(*jsonv.Object)
+	controlled.Delete("foreach")
+	controlled.Set("task", "text-to-image").Set("defaults", jsonv.O("width", 64.0, "height", 64.0, "steps", 2.0))
+	controlled.Set("controlnets", []any{jsonv.O("controlnet_id", "edges", "scale", 0.5)})
+	controlled.Obj("inputs").Set("control_image", jsonv.O("from", "op:generate/image"))
+	validated, err := Validate(RecipeSchema, recipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expanded, err := ExpandDAG(validated, jsonv.O("inputs", jsonv.O("prompt", "test"), "parameters", jsonv.NewObject()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := expanded.Arr("operations")[1].(*jsonv.Object)
+	if last.Obj("inputs").Obj("control_image").Str("from") != "op:generate/image" {
+		t.Fatal("control image dependency lost")
+	}
+	if len(last.Arr("controlnets")) != 1 || last.Arr("controlnets")[0].(*jsonv.Object).Str("controlnet_id") != "edges" {
+		t.Fatal("controlnet identity lost")
+	}
+}

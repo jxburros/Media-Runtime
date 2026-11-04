@@ -18,6 +18,7 @@ var operationSchemaV3 = StrictObject(
 	Field{Name: "defaults", Check: PartialParameters, Default: func() any { return jsonv.NewObject() }},
 	Field{Name: "adapters", Check: adapterList, Optional: true},
 	Field{Name: "conditioning", Check: ConditioningUses, Optional: true},
+	Field{Name: "controlnets", Check: controlnetList, Optional: true},
 	Field{Name: "foreach", Check: StrictObject(Field{Name: "from", Check: Str(StrOpts{Max: 80, Pattern: bindingPattern})}), Optional: true},
 )
 var recipeSchemaV3 = StrictObject(
@@ -184,6 +185,11 @@ func ExpandDAG(recipe, request *jsonv.Object) (*jsonv.Object, error) {
 			op := source.Clone()
 			op.Delete("foreach")
 			op.Set("source_op_id", id)
+			if task == "text-to-image" {
+				// Expansion fixes the output set before worker probing. Pin its count
+				// so a worker-specific default cannot change the graph afterwards.
+				op.Obj("defaults").Set("count", float64(count))
+			}
 			expandedID := id
 			if from != "" {
 				expandedID = fmt.Sprintf("%s_item_%d", id, index)

@@ -15,6 +15,11 @@ func TestDiTFamiliesRegisterAndExecuteThroughWorker(t *testing.T) {
 			}
 			e.register(t, jsonv.O("model_id", family, "artifact_handle", family, "family", family))
 			body := jsonv.O("recipe_id", family, "model_id", family, "inputs", jsonv.O("prompt", "test"), "parameters", jsonv.O("width", 64.0, "height", 64.0, "steps", 2.0, "seed", 7.0))
+			bad := body.Clone()
+			bad.Set("parameters", body.Obj("parameters").Clone().Set("width", 72.0).Set("height", 72.0))
+			if _, err := e.client.Validate(bad); err == nil {
+				t.Fatal("DiT accepted dimensions that the real model would round")
+			}
 			done := e.wait(ok(e.client.Submit(body, "")).Str("job_id"), nil)
 			equal(t, done.Str("state"), "succeeded", done.Get("error"))
 			equal(t, done.Obj("request").Obj("parameters").Str("sampler"), "flow-euler")

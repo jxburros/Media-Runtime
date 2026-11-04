@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jxburros/media-runtime/internal/catalog"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -200,7 +201,7 @@ func scanFolder(folder *Folder) {
 			}
 			return nil
 		}
-		if entry.Type()&os.ModeSymlink != 0 {
+		if entry.Type()&os.ModeSymlink != 0 && !catalog.ApprovedSnapshotFile(path) {
 			return nil
 		}
 		if strings.HasSuffix(entry.Name(), ".safetensors") {

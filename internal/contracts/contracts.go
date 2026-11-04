@@ -38,6 +38,8 @@ var FAMILIES = map[string][]string{
 // svd bundle serves, and a stable-audio-open bundle's sample rate, channels, latent granularity
 // (hop_length samples per latent frame) and the duration range it serves.
 var BundleFacts = map[string][]string{
+	"flux-schnell":      {"size_multiple"},
+	"sd35":              {"size_multiple"},
 	"esrgan":            {"scale"},
 	"svd":               {"video_sizes", "default_frames"},
 	"stable-audio-open": {"sample_rate", "channels", "hop_length", "duration_range"},

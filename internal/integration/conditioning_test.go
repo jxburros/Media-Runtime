@@ -69,7 +69,13 @@ func TestConditioningRegistrationAdmissionAndProvenance(t *testing.T) {
 	missing.Obj("inputs").Delete("reference_image")
 	_, err := e.client.Validate(missing)
 	rejects(t, err, 400, "invalid_request", "inputs.reference_image")
-	foreign := e.as(token, "other")
-	_, err = foreign.Submit(request, "")
+	// A namespace header needs its own grant, independently of input ownership.
+	_, err = e.as(token, "other").Submit(request, "")
+	rejects(t, err, 403, "forbidden_namespace")
+	otherKey := must[any](t)(e.client.JSON("/v1/keys", "POST", jsonv.O(
+		"name", "other-owner", "namespace", "other", "permissions", []any{"jobs.submit"}, "models", []any{"fixture"},
+	))).(*jsonv.Object)
+	// A valid caller in another namespace still cannot resolve the owner's PNG.
+	_, err = e.as(otherKey.Str("token"), "").Submit(request, "")
 	rejects(t, err, 404)
 }

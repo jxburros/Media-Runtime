@@ -288,3 +288,31 @@ func TestDownloadStagingCannotAliasManifestOrAdoptUserDirectory(t *testing.T) {
 		t.Fatal("unrelated directory changed")
 	}
 }
+
+func TestFolderScanDiscoversOnlyConfinedSnapshotFiles(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "models--org--loras")
+	snapshot := filepath.Join(repo, "snapshots", strings.Repeat("a", 40))
+	blobs := filepath.Join(repo, "blobs")
+	os.MkdirAll(snapshot, 0700)
+	os.MkdirAll(blobs, 0700)
+	blob := filepath.Join(blobs, "blobhash")
+	os.WriteFile(blob, []byte("weights"), 0600)
+	selected := filepath.Join(snapshot, "style.safetensors")
+	os.Symlink(blob, selected)
+	outside := filepath.Join(t.TempDir(), "private")
+	os.WriteFile(outside, nil, 0600)
+	os.Symlink(outside, filepath.Join(snapshot, "escape.safetensors"))
+	os.Symlink(blob, filepath.Join(root, "generic.safetensors"))
+	folders, err := OpenFolders(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := folders.Add(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folder.Entries) != 1 || folder.Entries[0].Path != selected || folder.Entries[0].Kind != "lora" {
+		t.Fatal(folder.Entries)
+	}
+}

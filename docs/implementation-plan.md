@@ -1,5 +1,7 @@
 # Media Runtime implementation plan — deferred capabilities
 
+The original phase map below is historical. The 1.1.0 development PR completes the remaining integration work and implements the later review backlog; see [delivery status](delivery-status.md) for current validation and outstanding operator acceptance.
+
 This plan turns [runtime-spec.md](../runtime-spec.md) revision 0.2.0 into ordered, releasable
 increments of the service. The first increment rewrites the 0.3.0 TypeScript service in Go at
 exact feature parity; every later increment is written in Go. It covers every capability the specification marks

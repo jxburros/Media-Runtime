@@ -570,8 +570,19 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 		}
 	}
 	if family == "flux-schnell" || family == "sd35" {
-		if minor < 4 || effective.Str("sampler") != "flow-euler" || effective.Str("scheduler") != "flow-match" || effective.Has("preview_interval") {
-			return nil, c.Err(400, "unsupported", "This family requires flow-euler/flow-match without SDXL previews", "parameters")
+		multiple, ok := model.Num("size_multiple")
+		if !ok || multiple < 1 || math.Trunc(multiple) != multiple {
+			return nil, c.Err(400, "unsupported", "Re-register this model to discover its required dimension multiple", "model_id")
+		}
+		for _, field := range []string{"width", "height"} {
+			value, _ := effective.Num(field)
+			if math.Mod(value, multiple) != 0 {
+				return nil, c.Err(400, "invalid_request", fmt.Sprintf("%s must be a multiple of %s for this model", field, jsonv.Number(multiple)), "parameters."+field)
+			}
+		}
+
+		if minor < 4 || effective.Str("sampler") != "flow-euler" || effective.Str("scheduler") != "flow-match" || effective.Has("preview_interval") || effective.Has("clip_skip") {
+			return nil, c.Err(400, "unsupported", "This family requires flow-euler/flow-match without SDXL previews or CLIP skip", "parameters")
 		}
 		guidance, _ := effective.Num("guidance")
 		if family == "flux-schnell" && (guidance != 0 || inputs.Str("negative_prompt") != "") {

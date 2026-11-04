@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 env:
   # Updated together with the companion Engine implementation; always a full commit.
-  MEDIA_ENGINE_REF: ca810c2e6dc258c91d311f3f0f18eebbf538f326
+  MEDIA_ENGINE_REF: c19e7cfd5158b86031c9c7b02b0b4db74636fbd3
 jobs:
   fixture:
     runs-on: ubuntu-24.04
