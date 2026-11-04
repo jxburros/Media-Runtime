@@ -6,3 +6,9 @@ dist/
 .env
 /media-runtime
 testbench-runs/
+
+# Python client and tooling build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+python-client/build/

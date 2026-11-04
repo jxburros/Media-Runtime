@@ -1,6 +1,0 @@
-Metadata-Version: 2.2
-Name: media-runtime-client
-Version: 1.1.0
-Summary: Dependency-free authenticated client for the Media Runtime API
-License: MIT
-Requires-Python: >=3.11
