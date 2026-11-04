@@ -53,7 +53,7 @@ func download(t *testing.T, e *env, jobID, outputID string) []byte {
 func TestVideoAnimatesAnUploadedImage(t *testing.T) {
 	e := bootVideo(t)
 	ok := must[*jsonv.Object](t)
-	equal(t, get(ok(e.client.Health()), "worker", "protocol"), "media-worker/1.3")
+	equal(t, get(ok(e.client.Health()), "worker", "protocol"), c.PROTOCOLS[len(c.PROTOCOLS)-1])
 	detail := must[any](t)(e.client.Model("svd", false)).(*jsonv.Object)
 	equal(t, detail.Get("family"), "svd")
 	equal(t, detail.Get("tasks"), []any{"image-to-video"})
@@ -209,9 +209,30 @@ func TestVideoAnimatesAnUploadedImage(t *testing.T) {
 		equal(t, get(failed, "error", "code"), "output_unavailable")
 	})
 
+	t.Run("encoded video metadata must match the request", func(t *testing.T) {
+		mp4 := fakeMP4()
+		inject := advertiseVideo(mp4)
+		e.rt.Worker.SetHooks(func(path, method string, body, result any) (any, error) {
+			result, err := inject(path, method, body, result)
+			if o, ok := result.(*jsonv.Object); ok && strings.HasPrefix(path, "/v1/executions/") && o.Str("state") == "succeeded" {
+				for _, raw := range o.Arr("outputs") {
+					output := raw.(*jsonv.Object)
+					if output.Str("output_id") == "video" {
+						output.Set("fps", 8.0)
+					}
+				}
+			}
+			return result, err
+		}, nil)
+		defer e.rt.Worker.SetHooks(nil, nil)
+		failed := e.wait(ok(e.client.Submit(animate(record.Str("input_id")), "")).Str("job_id"), nil)
+		equal(t, failed.Str("state"), "failed")
+		equal(t, get(failed, "error", "code"), "output_unavailable")
+	})
+
 	t.Run("an advertised video output is committed", func(t *testing.T) {
-		// Engine ships no encoder, so its fixture never produces video; the bytes are injected
-		// here to prove the optional path, not produced by the worker.
+		// Inject container bytes and decoded metadata to exercise the Runtime commit path
+		// even when the fixture Python has no optional PyAV encoder installed.
 		mp4 := fakeMP4()
 		e.rt.Worker.SetHooks(advertiseVideo(mp4), nil)
 		e.rt.Worker.SetResponseHook(func(path, method string) *http.Response {
@@ -247,7 +268,18 @@ func advertiseVideo(mp4 []byte) func(path, method string, body, result any) (any
 		}
 		if mp4 != nil && strings.HasPrefix(path, "/v1/executions/") && o.Str("state") == "succeeded" {
 			sum := sha256.Sum256(mp4)
-			o.Set("outputs", append(o.Arr("outputs"), jsonv.O("output_id", "video", "mime_type", "video/mp4", "size", float64(len(mp4)), "sha256", hex.EncodeToString(sum[:]))))
+			encoded := jsonv.O("output_id", "video", "mime_type", "video/mp4", "size", float64(len(mp4)), "sha256", hex.EncodeToString(sum[:]))
+			// Real Engine finalization decodes the MP4 and supplies these facts. Mirror the
+			// corresponding archive metadata here; omitting them must fail admission to storage.
+			for _, raw := range o.Arr("outputs") {
+				frame := raw.(*jsonv.Object)
+				if frame.Str("output_id") == "frames" {
+					for _, key := range []string{"width", "height", "frames", "fps", "duration_seconds"} {
+						encoded.Set(key, frame.Get(key))
+					}
+				}
+			}
+			o.Set("outputs", append(o.Arr("outputs"), encoded))
 		}
 		return result, nil
 	}

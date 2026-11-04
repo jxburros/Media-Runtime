@@ -2,8 +2,10 @@
 package api
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +24,7 @@ import (
 	c "github.com/jxburros/media-runtime/internal/contracts"
 	"github.com/jxburros/media-runtime/internal/jsonv"
 	"github.com/jxburros/media-runtime/internal/runtime"
+	"github.com/jxburros/media-runtime/internal/security"
 	"github.com/jxburros/media-runtime/internal/transport"
 )
 
@@ -125,7 +128,7 @@ var (
 	workerPattern    = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,80}$`)
 	// Output IDs are the worker's (image, image_2 …) or, for a linear job's intermediates and
 	// colliding published outputs, <op_id>__<output_id>.
-	jobPath = regexp.MustCompile(`^/v1/jobs/(job_[a-f0-9-]+)(?:/(events|cancel|manifest|outputs)(?:/([a-z][a-z0-9_]{0,65}))?)?$`)
+	jobPath = regexp.MustCompile(`^/v1/jobs/(job_[a-f0-9-]+)(?:/(events|cancel|manifest|outputs|previews)(?:/([a-z][a-z0-9_]{0,65}))?)?$`)
 )
 
 type request struct {
@@ -135,10 +138,19 @@ type request struct {
 	namespace string
 	operator  bool
 	fallbacks bool
+	key       *security.Key
+	keyID     string
+	bodyValue any
 }
 
 func (q *request) caller() runtime.Caller {
-	return runtime.Caller{Namespace: q.namespace, AllowFallbacks: q.fallbacks}
+	caller := runtime.Caller{Namespace: q.namespace, AllowFallbacks: q.fallbacks, KeyID: q.keyID}
+	if q.key != nil {
+		caller.Models = q.key.Models
+		caller.ConcurrencyLimit = q.key.ConcurrencyLimit
+		caller.QueueLimit = q.key.QueueLimit
+	}
+	return caller
 }
 
 func (q *request) send(status int, body any) error {
@@ -169,6 +181,7 @@ func (q *request) body() (any, error) {
 	if err != nil {
 		return nil, c.Err(400, "invalid_json", "Expected a JSON body")
 	}
+	q.bodyValue = v
 	return v, nil
 }
 
@@ -181,6 +194,7 @@ func (q *request) requireOperator() error {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestID := c.UUID()
+	w.Header().Set("X-Request-Id", requestID)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	q := &request{w: w, r: r}
@@ -205,10 +219,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !errors.As(err, &api) {
 		api = c.Err(500, "internal_error", "The request could not be completed")
 	}
-	if api.Status == 429 {
+	if api.Status == 429 && w.Header().Get("Retry-After") == "" {
 		w.Header().Set("Retry-After", "1")
 	}
-	body := jsonv.O("code", api.Code, "message", api.Message)
+	body := jsonv.O("code", api.Code, "type", api.Code, "message", api.Message)
+	if repair := s.repair(q, api); repair != nil {
+		body.Set("repair", repair)
+	}
+	if api.Status == 401 || api.Status == 403 {
+		s.Runtime.Security.Audit.Record("authentication.refused", q.keyID, "")
+	}
 	if api.Field != "" {
 		body.Set("field", api.Field)
 	}
@@ -245,6 +265,11 @@ func (s *Server) route(q *request) error {
 	path := r.URL.EscapedPath()
 	method := r.Method
 	query := r.URL.Query()
+	peer, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if allowed, retry := rt.Security.IP.Allow(peer, 6000); !allowed {
+		q.w.Header().Set("Retry-After", strconv.Itoa(retry))
+		return c.Err(429, "ip_rate_limited", "Too many requests from this address")
+	}
 	if origin, ok := header(r, "Origin"); ok {
 		if !allowedOrigin(cfg.AllowedOrigins, origin) {
 			return c.Err(403, "browser_origin_denied", "Use an authenticated application gateway")
@@ -263,6 +288,12 @@ func (s *Server) route(q *request) error {
 			return nil
 		}
 	}
+	if path == "/.well-known/media-runtime" && method == "GET" {
+		return q.send(200, s.descriptor())
+	}
+	if path == "/v1/pairing/redeem" && method == "POST" {
+		return s.redeem(q)
+	}
 	if path == "/health" && method == "GET" {
 		return q.send(200, jsonv.O("status", "ok"))
 	}
@@ -275,24 +306,64 @@ func (s *Server) route(q *request) error {
 			break
 		}
 	}
-	if credential == nil {
-		return c.Err(401, "unauthorized", "A valid bearer credential is required")
+	if credential != nil {
+		q.namespace, q.operator, q.fallbacks = credential.Namespace, credential.Operator, credential.AllowFallbacks
+		sum := sha256.Sum256([]byte(credential.Token))
+		q.keyID = "bootstrap_" + hex.EncodeToString(sum[:8])
+	} else {
+		if !strings.HasPrefix(supplied, "Bearer ") {
+			return c.Err(401, "unauthorized", "A valid bearer credential is required")
+		}
+		key, err := rt.Security.Authenticate(strings.TrimPrefix(supplied, "Bearer "), net.ParseIP(peer))
+		if err != nil {
+			return err
+		}
+		if key == nil {
+			return c.Err(401, "unauthorized", "A valid bearer credential is required")
+		}
+		q.key = key
+		q.keyID = key.ID
+		q.namespace = key.Namespace
+		q.operator = key.Allows("admin")
+		q.fallbacks = key.AllowFallbacks
+		if allowed, retry := rt.Security.Keys.Allow(key.ID, key.RateLimit); !allowed {
+			q.w.Header().Set("Retry-After", strconv.Itoa(retry))
+			return c.Err(429, "key_rate_limited", "Key request limit reached")
+		}
 	}
-	q.namespace, q.operator, q.fallbacks = credential.Namespace, credential.Operator, credential.AllowFallbacks
 	if suppliedNamespace, ok := header(r, "X-Media-Namespace"); ok {
 		if !namespacePattern.MatchString(suppliedNamespace) {
 			return c.Err(400, "invalid_namespace", "Invalid caller namespace")
 		}
 		allowed := false
-		for _, n := range credential.AllowedNamespaces {
-			if n == suppliedNamespace || (strings.HasSuffix(n, "*") && strings.HasPrefix(suppliedNamespace, n[:len(n)-1])) {
-				allowed = true
+		if q.key != nil {
+			allowed = q.key.AllowsNamespace(suppliedNamespace)
+		} else {
+			for _, n := range credential.AllowedNamespaces {
+				if n == suppliedNamespace || (strings.HasSuffix(n, "*") && strings.HasPrefix(suppliedNamespace, n[:len(n)-1])) {
+					allowed = true
+				}
 			}
 		}
 		if !allowed {
 			return c.Err(403, "forbidden_namespace", "Credential cannot use this namespace")
 		}
 		q.namespace = suppliedNamespace
+	}
+	if q.key != nil && !q.key.Allows(permissionFor(path, method)) {
+		return c.Err(403, "permission_denied", "Credential lacks the required permission")
+	}
+	if handled, err := s.securityRoutes(q, path, method); handled {
+		return err
+	}
+	if handled, err := s.operations(q, path, method); handled {
+		return err
+	}
+	if handled, err := s.conditioning(q, path, method); handled {
+		return err
+	}
+	if handled, err := s.controlnets(q, path, method); handled {
+		return err
 	}
 	namespace := q.namespace
 
@@ -302,6 +373,7 @@ func (s *Server) route(q *request) error {
 		if err != nil {
 			return err
 		}
+		diagnostics = q.filterDiagnostics(diagnostics)
 		return q.send(200, diagnostics.Clone().
 			Set("api_version", "1").
 			Set("limits", jsonv.O(
@@ -311,12 +383,12 @@ func (s *Server) route(q *request) error {
 			)).
 			Set("protocols", protocols()))
 	case path == "/v1/workers" && method == "GET":
-		return q.send(200, rt.Workers(namespace))
+		return q.send(200, s.scopedWorkers(q, rt.Workers(namespace)))
 	case path == "/v1/catalog" && method == "GET":
 		if err := q.requireOperator(); err != nil {
 			return err
 		}
-		return q.send(200, catalog.Inspect(cfg.ArtifactCatalog, query.Get("handle")))
+		return q.send(200, catalog.Inspect(cfg.CatalogSnapshot(), query.Get("handle")))
 	case path == "/v1/inputs" && method == "POST":
 		if ct, _ := header(r, "Content-Type"); ct != "image/png" {
 			return c.Err(400, "unsupported", "Upload raw PNG bytes with Content-Type image/png", "image")
@@ -353,6 +425,9 @@ func (s *Server) route(q *request) error {
 	if path == "/v1/models" && method == "GET" {
 		models := []any{}
 		for _, model := range rt.Store.RegistryAll("models") {
+			if q.key != nil && !q.key.AllowsModel(model.Str("model_id")) {
+				continue
+			}
 			bundle := model.Obj("bundle")
 			_, statErr := os.Stat(cfg.Catalog(model.Str("artifact_handle")))
 			models = append(models, withFacts(jsonv.O(
@@ -368,18 +443,26 @@ func (s *Server) route(q *request) error {
 		return q.send(200, models)
 	}
 	if m := modelPath.FindStringSubmatch(path); m != nil && method == "GET" {
+		if q.key != nil && !q.key.AllowsModel(m[1]) {
+			return c.Err(404, "not_found", "Model not found")
+		}
 		return s.modelDetail(q, m[1], query.Get("verify") == "1")
 	}
 	switch {
 	case path == "/v1/models" && method == "POST":
-		if err := q.requireOperator(); err != nil {
+		if err := q.requirePermission("models.register"); err != nil {
 			return err
 		}
 		body, err := q.body()
 		if err != nil {
 			return err
 		}
-		model, err := catalog.BuildBundle(body, cfg.ArtifactCatalog)
+		if q.key != nil {
+			if b, ok := body.(*jsonv.Object); ok && !q.key.AllowsModel(b.Str("model_id")) {
+				return c.Err(403, "model_forbidden", "Credential cannot register this model", "model_id")
+			}
+		}
+		model, err := catalog.BuildBundle(body, cfg.CatalogSnapshot())
 		if err != nil {
 			return err
 		}
@@ -408,6 +491,7 @@ func (s *Server) route(q *request) error {
 			}
 		}
 		rt.Store.Register("models", model.Str("model_id"), model)
+		rt.Security.Audit.Record("model.registered", q.keyID, model.Str("model_id"))
 		return q.send(201, withFacts(jsonv.O(
 			"model_id", model.Get("model_id"),
 			"family", model.Get("family"),
@@ -436,7 +520,7 @@ func (s *Server) route(q *request) error {
 		if err != nil {
 			return err
 		}
-		adapter, err := catalog.BuildAdapter(body, cfg.ArtifactCatalog)
+		adapter, err := catalog.BuildAdapter(body, cfg.CatalogSnapshot())
 		if err != nil {
 			return err
 		}
@@ -452,6 +536,7 @@ func (s *Server) route(q *request) error {
 			return err
 		}
 		rt.Store.Register("adapters", adapter.Str("adapter_id"), adapter)
+		rt.Security.Audit.Record("adapter.registered", q.keyID, adapter.Str("adapter_id"))
 		var layout any
 		if list := validation.Arr("adapters"); len(list) > 0 {
 			if first, ok := list[0].(*jsonv.Object); ok {
@@ -485,6 +570,7 @@ func (s *Server) route(q *request) error {
 			return c.Err(409, "recipe_revision_conflict", "Increase revision when changing a recipe")
 		}
 		rt.Store.Register("recipes", recipe.Str("recipe_id"), value)
+		rt.Security.Audit.Record("recipe.registered", q.keyID, recipe.Str("recipe_id"))
 		return q.send(201, value)
 	case recipePath.MatchString(path) && method == "GET":
 		recipe := rt.Store.Registry("recipes", recipePath.FindStringSubmatch(path)[1])
@@ -495,6 +581,9 @@ func (s *Server) route(q *request) error {
 	case path == "/v1/jobs/validate" && method == "POST":
 		body, err := q.body()
 		if err != nil {
+			return err
+		}
+		if err := q.caller().CheckModels(body); err != nil {
 			return err
 		}
 		result, err := rt.Resolve(body, q.caller())
@@ -556,6 +645,9 @@ func (s *Server) route(q *request) error {
 		jobs, ordinals := rt.Store.Page(namespace, newest, int(after), int(limit), workerID)
 		list := []any{}
 		for _, job := range jobs {
+			if !q.canReadJob(job) {
+				continue
+			}
 			list = append(list, PublicJob(job))
 		}
 		var next any
@@ -573,6 +665,9 @@ func (s *Server) route(q *request) error {
 	if err != nil {
 		return err
 	}
+	if !q.canReadJob(job) {
+		return c.Err(404, "not_found", "Job not found")
+	}
 	switch {
 	case action == "" && method == "GET":
 		return q.send(200, PublicJob(job))
@@ -585,12 +680,24 @@ func (s *Server) route(q *request) error {
 		if err != nil {
 			return err
 		}
+		rt.Security.Audit.Record("job.cancelled", q.keyID, jobID)
 		return q.send(status, PublicJob(cancelled))
 	case action == "manifest" && method == "GET":
 		if !job.Has("manifest") {
 			return c.Err(409, "manifest_not_ready", "Manifest is available after durable output publication")
 		}
 		return q.send(200, job.Get("manifest"))
+	case action == "previews" && method == "GET" && outputID != "":
+		data, mime, err := rt.Preview(jobID, outputID, namespace)
+		if err != nil {
+			return err
+		}
+		q.w.Header().Set("Content-Type", mime)
+		q.w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		q.w.WriteHeader(200)
+		q.sent = true
+		_, err = q.w.Write(data)
+		return err
 	case action == "outputs" && method == "GET" && outputID != "":
 		return s.output(q, job, outputID)
 	case action == "events" && method == "GET":
@@ -867,10 +974,14 @@ func publicOperation(op *jsonv.Object) *jsonv.Object {
 		case "model":
 			model := op.Obj("model")
 			out.Set(k, jsonv.O("model_id", model.Get("model_id"), "bundle_digest", model.Obj("bundle").Get("bundle_digest")))
-		case "input":
-			if input := op.Obj("input"); input != nil {
+		case "input", "mask", "overlay", "control_image", "reference_image":
+			if input := op.Obj(k); input != nil {
 				out.Set(k, PublicInput(input))
 			}
+		case "conditioning":
+			out.Set(k, publicConditioning(op))
+		case "controlnets":
+			out.Set(k, publicControlnets(op))
 		case "adapters":
 			out.Set(k, publicAdapters(op))
 		default:
@@ -911,7 +1022,7 @@ func PublicJob(job *jsonv.Object) *jsonv.Object {
 	out := jsonv.NewObject()
 	for _, k := range job.Keys() {
 		switch k {
-		case "namespace", "model", "backend", "recipe", "manifest", "input", "adapters":
+		case "namespace", "key_id", "key_concurrency_limit", "model", "backend", "recipe", "manifest", "input", "mask", "overlay", "control_image", "reference_image", "conditioning", "controlnets", "adapters":
 			continue
 		case "operations":
 			ops := []any{}
@@ -932,6 +1043,20 @@ func PublicJob(job *jsonv.Object) *jsonv.Object {
 	if input := job.Obj("input"); input != nil {
 		out.Set("input", PublicInput(input))
 	}
+	if mask := job.Obj("mask"); mask != nil {
+		out.Set("mask", PublicInput(mask))
+	}
+	if overlay := job.Obj("overlay"); overlay != nil {
+		out.Set("overlay", PublicInput(overlay))
+	}
+	if control := job.Obj("control_image"); control != nil {
+		out.Set("control_image", PublicInput(control))
+	}
+	if reference := job.Obj("reference_image"); reference != nil {
+		out.Set("reference_image", PublicInput(reference))
+	}
+	out.Set("conditioning", publicConditioning(job))
+	out.Set("controlnets", publicControlnets(job))
 	out.Set("adapters", publicAdapters(job))
 	model := job.Obj("model")
 	out.Set("model", jsonv.O("model_id", model.Get("model_id"), "bundle_digest", model.Obj("bundle").Get("bundle_digest")))

@@ -456,3 +456,25 @@ third-party module.
   computes for the same directory; `tokenizer/tokenizer.json` is required, as the worker requires
   it, and the scheduler class is `CosineDPMSolverMultistepScheduler`.
 - No new dependency; the ledger and `go.sum` are unchanged.
+
+# Implementation decisions — 1.1.0 (2026-11-04)
+
+- This release completes native Runtime acceptance (original phase R7) and addresses the subsequent
+  cross-repo review. The historical implementation plan and review backlog are separate records.
+- Maintainer-approved choices: image utility operations execute explicitly in Engine; an optional
+  pinned MP4 extra; opt-in pinned model acquisition; signed completion webhooks restricted to
+  operator-approved destinations; and an offline translator for a documented ComfyUI subset.
+  None of these authorizes implicit pixel resizing, model selection, downloads during jobs,
+  arbitrary graph execution, or network callbacks selected by an untrusted caller.
+- Existing backend IDs remain stable. Initial release artifacts target Linux x64. Additional
+  native families, owned video/audio loops and custom kernels wait for generation coverage and
+  measured GPU evidence. Native backend ownership is recorded as `engine` unchanged in manifests.
+- Governance uses a concise repository `AGENTS.md` with the invariants; the existing specification,
+  protocol, decisions and compatibility documents remain authoritative rather than duplicating
+  them in a new governance directory. Releases use the shared infrastructure's every-main-change
+  version policy after adoption; historical versions and changelog evidence remain immutable.
+- The maintainer requested runnable GPU jobs in lieu of access to a GPU host. Prepared workflow
+  files do not constitute executed hardware acceptance or benchmark evidence. CPU random-weight
+  inference and fixture protocol checks are recorded separately in the compatibility record.
+- The service core is split into admission, resolution, dispatch, output commitment, diagnostics
+  and cleanup files before extending it. This changes source organization, not persisted jobs.

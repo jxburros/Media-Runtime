@@ -1,0 +1,12 @@
+{
+  "name": "studio-gateway",
+  "namespace": "studio",
+  "permissions": ["jobs.submit", "jobs.read", "models.read"],
+  "models": ["studio-sdxl"],
+  "cidrs": ["127.0.0.0/8", "::1/128"],
+  "allowed_namespaces": ["studio:*"],
+  "allow_fallbacks": false,
+  "concurrency_limit": 1,
+  "queue_limit": 4,
+  "rate_limit": 120
+}

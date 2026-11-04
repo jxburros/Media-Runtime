@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "bumpPolicy": "every-main-change",
+  "apps": {
+    "media-runtime": {
+      "tagPrefix": "v",
+      "paths": [
+        "**"
+      ],
+      "versionFiles": [
+        {
+          "path": "internal/contracts/contracts.go",
+          "format": "text",
+          "pattern": "^const VERSION = \"(?<version>[^\"\\r\\n]+)\"$"
+        },
+        {
+          "path": "gateway-client/package.json",
+          "format": "json",
+          "key": "version"
+        },
+        {
+          "path": "gateway-client/package-lock.json",
+          "format": "json",
+          "key": "version"
+        },
+        {
+          "path": "gateway-client/package-lock.json",
+          "format": "json",
+          "key": "packages..version"
+        },
+        {
+          "path": "python-client/pyproject.toml",
+          "format": "text",
+          "pattern": "^version = \"(?<version>[^\"\\r\\n]+)\"$"
+        }
+      ],
+      "notes": "CHANGELOG.md",
+      "notesSection": true,
+      "assets": [
+        "media-runtime-v{version}-linux-x64.tar.gz",
+        "media-runtime-gateway-client-{version}.tgz",
+        "media-runtime_{version}_amd64.deb",
+        "media_runtime_client-{version}-py3-none-any.whl",
+        "install.sh"
+      ],
+      "security": "standard",
+      "checksumFile": "checksums.txt",
+      "legacyLatest": true
+    }
+  }
+}

@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "revision": 1,
+  "recipe_id": "outpaint",
+  "inputs": {
+    "prompt": {
+      "type": "string",
+      "required": true
+    },
+    "image": {
+      "type": "image",
+      "required": true
+    },
+    "mask": {
+      "type": "image",
+      "required": true
+    }
+  },
+  "operations": [
+    {
+      "op_id": "pad",
+      "task": "image-transform",
+      "model_family": "sdxl-base",
+      "inputs": {
+        "image": {
+          "from": "input:image"
+        }
+      },
+      "defaults": {
+        "width": 1024,
+        "height": 1024,
+        "operation": "pad",
+        "x": 256,
+        "y": 256,
+        "background": [
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "op_id": "inpaint",
+      "task": "inpaint",
+      "model_family": "sdxl-base",
+      "inputs": {
+        "image": {
+          "from": "op:pad/image"
+        },
+        "mask": {
+          "from": "input:mask"
+        },
+        "prompt": {
+          "from": "input:prompt"
+        }
+      },
+      "defaults": {
+        "steps": 30,
+        "strength": 0.9,
+        "guidance": 6
+      }
+    }
+  ],
+  "publish": [
+    "inpaint/image"
+  ]
+}

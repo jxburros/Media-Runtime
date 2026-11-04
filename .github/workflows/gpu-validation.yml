@@ -1,0 +1,39 @@
+name: GPU validation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: media-reference-gpu
+  cancel-in-progress: false
+jobs:
+  reference-hardware:
+    # Never execute pull-request code on a persistent runner with approved weights.
+    if: github.ref == 'refs/heads/main'
+    environment: gpu-validation
+    runs-on: [self-hosted, linux, x64, media-gpu]
+    timeout-minutes: 120
+    env:
+      MEDIA_GPU_CONFIG: ${{ vars.MEDIA_GPU_CONFIG }}
+      MEDIA_GPU_PYTHON: ${{ vars.MEDIA_GPU_PYTHON }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.13'
+      - name: Verify configured reference device and local models
+        run: |
+          test -n "$MEDIA_GPU_CONFIG" && test -f "$MEDIA_GPU_CONFIG"
+          test -n "$MEDIA_GPU_PYTHON" && test -x "$MEDIA_GPU_PYTHON"
+          "$MEDIA_GPU_PYTHON" -c 'import torch; assert torch.cuda.is_available(); assert "4090" in torch.cuda.get_device_name(0), torch.cuda.get_device_name(0)'
+      - name: Run all advertised features through Runtime
+        run: |
+          "$MEDIA_GPU_PYTHON" testbench/testbench.py --config "$MEDIA_GPU_CONFIG"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reference-hardware-results
+          path: testbench-runs/**/report.json
+          if-no-files-found: error

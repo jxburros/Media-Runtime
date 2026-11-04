@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools==75.8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "media-runtime-client"
+version = "1.1.0"
+requires-python = ">=3.11"
+description = "Dependency-free authenticated client for the Media Runtime API"
+license = {text = "MIT"}
+
+[tool.setuptools.packages.find]
+include = ["media_runtime*"]

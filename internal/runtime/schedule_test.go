@@ -127,3 +127,19 @@ func TestEligibilityFollowsTasksFamiliesMinorAndBackend(t *testing.T) {
 		t.Fatal("a worker whose device is not ready is not eligible")
 	}
 }
+
+func TestSchedulingEnforcesKeyConcurrencyBeforeReservingLanes(t *testing.T) {
+	a := queued(t, "a", "x", "").Set("key_id", "limited").Set("key_concurrency_limit", 1.0)
+	b := queued(t, "b", "x", "").Set("key_id", "limited").Set("key_concurrency_limit", 1.0)
+	other := queued(t, "other", "x", "").Set("key_id", "other").Set("key_concurrency_limit", 1.0)
+	lanes := []Lane{lane(t, "gpu0", ""), lane(t, "gpu1", "")}
+	if got := plan(assignWithKeyLimits([]*jsonv.Object{a, b, other}, lanes, true, nil)); got != "a→gpu0 other→gpu1" {
+		t.Fatal(got)
+	}
+	if got := plan(assignWithKeyLimits([]*jsonv.Object{a, other}, lanes, false, map[string]int{"limited": 1})); got != "" {
+		t.Fatal("FIFO bypass", got)
+	}
+	if got := plan(assignWithKeyLimits([]*jsonv.Object{a, other}, lanes, true, map[string]int{"limited": 1})); got != "other→gpu0" {
+		t.Fatal("key stole a worker", got)
+	}
+}

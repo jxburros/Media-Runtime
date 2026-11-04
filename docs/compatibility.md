@@ -4,6 +4,43 @@ Each release records the worker-protocol minors it negotiates, the Engine releas
 was tested against, and how. "Fixture" means Engine's explicitly identified test backend launched
 by `tests/serve_fixture.py`; it proves protocol behavior, not GPU inference.
 
+## 1.1.0 development acceptance — 2026-11-04
+
+Validated Runtime code commit `822604c1a417ee971857663926ad64c223e8f0f3`
+against Engine `c19e7cfd5158b86031c9c7b02b0b4db74636fbd3`. Runtime negotiates
+media-worker/1.0–1.4; new capabilities require both the negotiated minor and explicit
+advertisement. Native remains 1.3 and has the same durable Runtime lifecycle.
+
+[Hosted fixture validation](https://github.com/jxburros/Media-Runtime/actions/runs/41890913399/job/126787750393)
+passes Go vet, the complete Go race suite, TypeScript compilation, the fixture
+testbench, static binary/gateway/Debian packaging and Python-client checks. New
+integration cases cover managed security, namespace isolation, DAG/foreach,
+intermediate reuse/corruption, ControlNet, conditioning, new image families,
+hires-fix/outpaint, explicit pixel transforms and encoded-video metadata refusal.
+
+[Real-backend acceptance](https://github.com/jxburros/Media-Runtime/actions/runs/41890913399/job/126787749781)
+passes on reference Python, owned Python and native CPU workers: registration,
+capability refusal, two-image generation, output hashes, idempotency/restart,
+identical-request repeatability, image-to-image, LoRA effects, multi-operation
+recipes, SSE and cancellation. These use tiny random weights. Both Runtime CI
+jobs and [release validation](https://github.com/jxburros/Media-Runtime/actions/runs/41890914581) passed.
+
+The previous Runtime 0.10.0 is also tested against this Engine:
+[full race suite passes](https://github.com/jxburros/Media-Engine/actions/runs/41890897530/job/126787695292).
+Studio's companion implementation at `80694be` passes its full backend, frontend,
+browser smoke and release checks in
+[CI run 41888797038](https://github.com/jxburros/AI-Server-Studio/actions/runs/41888797038).
+These checks do not claim a live Studio-to-production-weight GPU walkthrough.
+
+The active local environment blocks SQLite module storage downloads. Local standard-
+library/available-dependency race tests pass; the compile-only overlay omits the
+SQLite registration import and is explicitly not persistence evidence. Hosted CI
+uses the real driver and database. GPU acceptance jobs are prepared as requested;
+no RTX 4090 or production weights were available. Production release publication
+remains a manual post-merge operation. See [delivery status](delivery-status.md).
+
+## Historical release record
+
 | Runtime | Negotiates                 | Engine tested                    | Fixture protocol | Toolchain        | Suite                         | Result |
 | ------- | -------------------------- | -------------------------------- | ---------------- | ---------------- | ----------------------------- | ------ |
 | 0.3.0   | media-worker/1.0, 1.1      | 0.3.0 (fixture)                  | 1.1              | Node 22.22, TypeScript 5.8.3 | `npm test` (14 tests)         | pass   |

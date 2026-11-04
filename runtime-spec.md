@@ -1,54 +1,62 @@
 ---
 document_type: product_specification
-status: draft_proposal
-spec_revision: 0.2.0
+status: implemented_with_validation_gates
+spec_revision: 1.1.0
 created_at: 2026-10-26
-updated_at: 2026-10-26
+updated_at: 2026-11-04
 working_name: Media Runtime
 ---
 
 # Media Runtime Specification
 
-Media Runtime is a standalone local media service operated through a CLI, an optional terminal dashboard, or an application API. It turns supported generation recipes into durable jobs and supervises replaceable inference workers. AI Server Studio connects through its existing media-runtime abstraction.
+Media Runtime is a standalone local media service operated through a CLI, an optional terminal dashboard, or an application API. It turns supported generation recipes into durable jobs and supervises replaceable inference workers. AI Server Studio connects through its media-runtime adapter. The product target is ComfyUI-class image, video and audio generation through durable jobs and declarative recipes, with verified outputs and no executable plugins; it does not implement the ComfyUI wire protocol.
 
-This specification describes proposed behavior. `MUST` defines a required behavior within its stated delivery stage; later stages are not requirements for the first increment. The companion [Media Engine Specification](engine-spec.md) owns the worker protocol.
+This specification describes the implemented contract and its validation gates. `MUST` defines a required behavior within its stated delivery stage; later stages are not requirements for the first increment. The companion [Media Engine Specification](https://github.com/jxburros/Media-Engine/blob/main/engine-spec.md) owns the worker protocol.
 
 ## Delivery status
 
-Revision 0.1.0 described the first complete path and listed image-to-image, LoRA, upscaling, multiple GPUs, distributed workers, video, audio and a terminal dashboard as later capabilities. Runtime 0.3.0 delivers the first complete path, the operator-experience stage (dashboard, diagnostics, installation workflow) and image-to-image and LoRA from the additional-operations stage. Revision 0.2.0 specifies every remaining deferred capability with its stage, worker-protocol dependency and acceptance rules. The [implementation plan](docs/implementation-plan.md) orders the work.
-
-| Capability                                        | Stage                       | Needs protocol | Status in Runtime 0.3.0 |
+Runtime 1.1.0 implements the original plan's R0–R7 stages and the generation/operator additions
+listed below. The Go service retains the durable public contract introduced by the TypeScript
+0.3.0 implementation. The [implementation plan](docs/implementation-plan.md) and
+[review action items](docs/reviews/2026-10-31-action-items.md) distinguish implementation,
+automated evidence and outstanding real-weight GPU acceptance.
+| Capability                                        | Stage                       | Needs protocol | Status in Runtime 1.1.0 |
 | ------------------------------------------------- | --------------------------- | -------------- | ----------------------- |
 | CLI/API, durable FIFO jobs, Diffusers worker      | First complete path         | 1.0            | Delivered               |
 | Terminal dashboard, doctor, installation workflow | Operator experience         | 1.1            | Delivered               |
 | Image-to-image, LoRA adapters, owned backend      | Additional media operations | 1.1            | Delivered               |
-| Multiple outputs per job                          | Additional media operations | 1.2            | Specified below         |
-| Upscaling                                         | Additional media operations | 1.2            | Specified below         |
-| Single-file checkpoint conversion workflow        | Operator experience         | 1.2            | Specified below         |
-| Automatic settings and authorized fallbacks       | Additional media operations | 1.2            | Specified below         |
-| Linear typed recipes                              | Additional media operations | 1.2            | Specified below         |
-| Multiple GPUs through a worker pool               | Broader execution           | 1.2            | Specified below         |
-| Distributed workers and network modes             | Broader execution           | 1.2            | Specified below         |
-| Video                                             | Broader execution           | 1.3            | Specified below         |
-| Audio                                             | Broader execution           | 1.3            | Specified below         |
-| Owned native engine as a selectable backend       | Owned inference engine      | 1.x            | Specified below         |
-| Go rewrite of the service at 0.3.0 parity         | Operator experience         | 1.1            | Specified below         |
+| Multiple outputs per job                          | Additional media operations | 1.2            | Delivered (fixture-tested) |
+| Upscaling                                         | Additional media operations | 1.2            | Delivered (fixture-tested) |
+| Single-file checkpoint conversion workflow        | Operator experience         | 1.2            | Delivered (fixture-tested) |
+| Automatic settings and authorized fallbacks       | Additional media operations | 1.2            | Delivered (fixture-tested) |
+| Linear typed recipes                              | Additional media operations | 1.2            | Delivered (fixture-tested) |
+| Multiple GPUs through a worker pool               | Broader execution           | 1.2            | Delivered (fixture-tested) |
+| Distributed workers and network modes             | Broader execution           | 1.2            | Delivered (fixture-tested) |
+| Video                                             | Broader execution           | 1.3            | Delivered (fixture-tested) |
+| Audio                                             | Broader execution           | 1.3            | Delivered (fixture-tested) |
+| Owned native engine as a selectable backend       | Owned inference engine      | 1.3            | Implemented; native conformance/CPU evidence, GPU gate remains |
+| Inpainting, explicit pixel operations, sampler selection, previews and optional MP4 | Generation extensions | 1.4 | Implemented; gated on selected worker capabilities |
+| Conditioning components and newer reference model families | Generation extensions | 1.4 | Implemented; approved local artifacts required |
+| Scoped keys, pairing, limits, metrics, diagnostics and OpenAPI | Operator security | Runtime API | Implemented |
+| Watched folders, pinned acquisition, managed lifecycle, idle unloading and webhooks | Operator workflows | Runtime API | Implemented; downloads/webhooks opt-in |
+| Offline ComfyUI API graph subset translator | Migration | 1.2/1.4 by sampler | Implemented; rejects unsupported nodes |
+| Go rewrite of the service at 0.3.0 parity         | Operator experience         | 1.1            | Delivered (fixture-tested) |
 
-Arbitrary ComfyUI graph import, executable recipe code and a plugin marketplace remain outside the design. Existing Studio ComfyUI support remains a separate option.
+Arbitrary ComfyUI graph execution, executable recipe code and a plugin marketplace remain outside the design. An offline translator may accept a documented subset of API-format workflows, producing ordinary validated recipes; unknown nodes are refused. Existing Studio ComfyUI support remains a separate option.
 
-The service implementation language changes before the deferred capabilities are built: Runtime 0.4.0 rewrites the 0.3.0 TypeScript service in Go at exact parity, and every later stage is implemented in Go. The public API, configuration, state directory, manifests and CLI are unchanged by the rewrite; see [Implementation language](#implementation-language).
+Runtime 0.4.0 rewrote the 0.3.0 TypeScript service in Go at exact parity before the later capability stages. Those stages are implemented in Go. The public API, configuration, state directory, manifests and CLI are unchanged by the rewrite; see [Implementation language](#implementation-language).
 
 ## Product sheet
 
-| Property                 | Proposed specification                                                                       |
+| Property                 | Implemented specification                                                                       |
 | ------------------------ | -------------------------------------------------------------------------------------------- |
 | Primary users            | Local AI server owners, SSH operators, application developers                                |
-| Delivered tasks          | Text-to-image and image-to-image on one explicitly supported SDXL base pipeline, with LoRA   |
-| Planned tasks            | Upscaling, image-to-video, text-to-audio and linear recipes that chain them                  |
+| Delivered tasks          | Text-to-image, image-to-image, inpaint, explicit pixel operations, upscale, video/audio; advertised conditioning; linear recipes   |
+| Further work             | See the dated cross-repo review action items                  |
 | Interfaces               | CLI, HTTP API and terminal dashboard                                                         |
 | Runtime implementation   | Small Go service shipped as one static binary; the 0.3.0 TypeScript service is its parity oracle |
 | First inference backend  | Isolated Python worker using pinned Diffusers and PyTorch                                    |
-| Future inference backend | Project-owned Media Engine implementing the same worker protocol                             |
+| Native inference backend | Project-owned Media Engine implementing the same worker protocol                             |
 | Persistence              | Local SQLite job metadata; local files for assets and run manifests                          |
 | Scheduling               | One active generation per configured worker; bounded FIFO queue; one worker per device       |
 | Default connectivity     | Loopback, authenticated local clients; no telemetry; explicit TLS network mode               |
@@ -73,11 +81,11 @@ The runtime MUST NOT own conversations, RAG, agent loops, task-based model routi
 
 The first increment includes an explicit local model registration, one text-to-image recipe, one output image per job, queue and job commands, genuine execution events, output retrieval, cancellation, process recovery and Studio Create integration. Closing the CLI or browser MUST leave accepted jobs running in the service.
 
-Image-to-image, LoRA and the terminal dashboard are delivered. Upscaling, multiple outputs, linear recipes, multiple GPUs, distributed workers, video and audio are specified in [Deferred capabilities](#deferred-capabilities). Arbitrary ComfyUI graph import, executable recipe code and a plugin marketplace are outside the design.
+The delivered stages extend that increment with image editing, conditioning, upscaling, multiple outputs, linear recipes, worker pools, distributed workers, video/audio and operator tooling. The offline ComfyUI translator accepts only its documented API graph subset; arbitrary graph execution and executable plugins remain outside the design.
 
 ## CLI and terminal experience
 
-`media-runtime` is a placeholder executable name. Representative proposed commands are:
+`media-runtime` is the service and CLI executable. Representative commands are:
 
 ```bash
 media-runtime serve
@@ -100,11 +108,11 @@ media-runtime tui
 - The dashboard presents queue, stage, model, backend, seed, output location and errors. It consumes the public API and adds no execution behavior. Images open in an external viewer initially.
 - Downloads and installation are explicit operator actions. Registering a manifest or running a recipe MUST NOT fetch model weights or execute remote model code.
 
-Later stages add `run --count`, `run --worker`, `run --model-for OP=MODEL`, `workers list`, `outputs export` of every output of a job by its ID and MIME-derived extension, and dashboard columns per worker. Every addition reuses the public API; the CLI gains no private path.
+The CLI also provides `run --count`, `run --worker`, `run --model-for OP=MODEL`, `workers list`, `outputs export` of every output of a job by its ID and MIME-derived extension, and dashboard columns per worker. Every addition reuses the public API; the CLI gains no private path.
 
 ## Recipes and model bundles
 
-A recipe is versioned declarative data. Its identity includes a schema version, recipe ID, revision and content digest. The initial recipe names one supported pipeline, declared inputs and default generation parameters. The initial resolver produces one inference operation; a later recipe may contain a linear sequence of typed media operations.
+A recipe is versioned declarative data. Its identity includes a schema version, recipe ID, revision and content digest. The initial recipe names one supported pipeline, declared inputs and default generation parameters. Schema 1 resolves to one inference operation; schema 2 contains a validated linear sequence of typed media operations.
 
 ```yaml
 schema_version: 1
@@ -125,7 +133,7 @@ defaults:
 
 The model is selected explicitly at submission. Effective values resolve in this order: request overrides, recipe defaults, then advertised backend defaults. The runtime MUST persist the resulting request before execution; unsupported or unknown fields are errors, not discarded options. A random seed is resolved and recorded before submission to the worker.
 
-A model registration describes a bundle of components, not merely a checkpoint filename. It includes family, component roles, local artifact paths and digests, configuration/tokenizer identity, compatible tasks, and available source/revision and license metadata. [The engine specification](engine-spec.md#model-bundles) defines the resolved form sent to a worker. Initial support targets a complete local Diffusers-format bundle; single-file checkpoint conversion is a separate capability.
+A model registration describes a bundle of components, not merely a checkpoint filename. It includes family, component roles, local artifact paths and digests, configuration/tokenizer identity, compatible tasks, and available source/revision and license metadata. [The engine specification](https://github.com/jxburros/Media-Engine/blob/main/engine-spec.md#model-bundles) defines the resolved form sent to a worker. Initial support targets a complete local Diffusers-format bundle; single-file checkpoint conversion is a separate capability.
 
 Recipes MUST NOT contain arbitrary Python, shell commands, templates that execute code, or hidden network access. Backend-specific options belong in an explicitly named, advertised option namespace. An option offered by one backend does not imply support in another.
 
@@ -151,7 +159,7 @@ Default dispatch allows one active generation on one configured GPU. Additional 
 
 ## Application API
 
-These are proposed runtime endpoints, independent of the engine endpoints. All except coarse `/health` require a bearer credential; credentials and ownership are checked on every referenced resource.
+These runtime endpoints are independent of the engine endpoints; the full route inventory is in [OpenAPI](docs/openapi.json). The coarse `/health` and public discovery document need no credential, and pairing redemption uses a single-use code; protected resource routes require a bearer credential; credentials and ownership are checked on every referenced resource.
 
 | Endpoint                                    | Meaning                                                                         |
 | ------------------------------------------- | ------------------------------------------------------------------------------- |
@@ -160,7 +168,7 @@ These are proposed runtime endpoints, independent of the engine endpoints. All e
 | `GET /v1/workers`                           | Configured workers, device identity, readiness and loaded identity              |
 | `GET /v1/catalog`                           | Operator-only inspection of approved artifact handles                           |
 | `GET /v1/models`                            | Registered model bundles and current availability                               |
-| `POST /v1/models`                           | Operator-only registration of an existing local bundle                          |
+| `POST /v1/models`                           | Registration of an existing local bundle with `models.register` permission                          |
 | `GET /v1/adapters`, `POST /v1/adapters`     | Registered LoRA adapters; operator-only registration                            |
 | `GET /v1/recipes`                           | Recipe identities, inputs and supported tasks                                   |
 | `GET /v1/recipes/{recipe_id}`               | One recipe with its typed input declarations and operations                     |
@@ -177,23 +185,23 @@ These are proposed runtime endpoints, independent of the engine endpoints. All e
 
 Submission carries `recipe_id`, `model_id`, `inputs`, `parameters`, and an optional explicit `backend_id`. A credential has a default namespace; only a privileged integration credential may supply an authorized caller namespace. A body-supplied user or namespace ID is not authentication. Standalone mode uses a default owner namespace without requiring projects.
 
-Job events use `job_state`, `stage`, `progress`, `output` and `error`, each with `job_id`, monotonic `sequence` and timestamp. This is a new runtime event vocabulary; it does not rename Studio's existing SSE events. After event retention expires, the server explicitly requires a fresh state snapshot rather than silently skipping history.
+Job events use `job_state`, `stage`, `progress`, `preview`, `output` and `error`, each with `job_id`, monotonic `sequence` and timestamp. This is a new runtime event vocabulary; it does not rename Studio's existing SSE events. After event retention expires, the server explicitly requires a fresh state snapshot rather than silently skipping history.
 
 Errors return `error.code`, a readable `error.message`, optional `error.field`, and `request_id`. Invalid requests use `400`, authorization uses `401/403`, inaccessible resources use `404`, conflicts use `409`, and unavailable backends use `503`. A returned error MUST NOT include secrets or uncontrolled worker stderr.
 
 ## Dependency policy
 
-The runtime relies on other libraries and services as little as is practical. Standard library first. A third-party dependency is accepted only when it does something unsafe or impractical to own (SQLite durability, TLS), is pinned by checksum, and is isolated in one package so it can be replaced. Adding one is a recorded decision in [docs/decisions.md](docs/decisions.md), which keeps a ledger of every dependency with its justification. From 0.4.0 the service binary carries one third-party module, the SQLite driver; HTTP, SSE, TLS, JSON, the CLI and the terminal dashboard are standard library and owned code. No external service is used: no telemetry, no downloads, no registries.
+The runtime relies on other libraries and services as little as is practical. Standard library first. A third-party dependency is accepted only when it does something unsafe or impractical to own (SQLite durability, TLS), is pinned by checksum, and is isolated in one package so it can be replaced. Adding one is a recorded decision in [docs/decisions.md](docs/decisions.md), which keeps a ledger of every dependency with its justification. From 0.4.0 the service binary carries one third-party module, the SQLite driver; HTTP, SSE, TLS, JSON, the CLI and the terminal dashboard are standard library and owned code. Serving never downloads weights or contacts a model registry, and telemetry remains prohibited. Explicit operator commands may acquire pinned artifacts with per-file SHA-256 verification. Completion webhooks are opt-in signed requests to operator-approved destinations, never arbitrary job-supplied URLs.
 
 ## Storage and access
 
 Runtime metadata, active models and working files stay on local hot storage. Outputs are immutable after publication and include MIME type, size and digest. Export does not remove originals. Cleanup policies are explicit and configurable, preserve active jobs and undelivered worker outputs, and expose expiry in metadata. A formerly available output returns `410` when its authorized metadata survives but its bytes no longer do.
 
-The runtime binds loopback by default, requires credentials, rejects browser origins by default, and keeps operator routes separate from generation permission. Prompts, outputs and credentials are excluded from normal logs; local state files receive restrictive permissions. Future network modes require explicit configuration and authenticated encrypted transport. No inference operation initiates a model download or telemetry request.
+The runtime binds loopback by default, requires credentials, rejects browser origins by default, and keeps operator routes separate from generation permission. Prompts, outputs and credentials are excluded from normal logs; local state files receive restrictive permissions. Network mode requires explicit configuration and authenticated encrypted transport. No inference operation initiates a model download or telemetry request. Revocable scoped keys, single-use pairing, explicit permission/model/CIDR restrictions and admission budgets are defined in [operator security](docs/operator-security.md); environment credentials remain the bootstrap path.
 
 Each backend runs in its own pinned environment or package. The runtime supervises owned child processes, probes protocol/capability compatibility, tracks process identity, bounds logs and handles clean shutdown. Externally managed services are never killed or reconfigured as though the runtime owned them. Python dependencies do not enter Studio's application environment.
 
-## Deferred capabilities
+## Delivered capability contracts
 
 Each capability below is a separately advertised feature with its own stage. A capability is available to a caller only when the configured worker advertises it on the negotiated protocol minor; otherwise the submission fails with `unsupported` naming the field, exactly as image-to-image and adapters do today. None of them relaxes a rule above.
 
@@ -257,7 +265,7 @@ Recipe schema version 2 declares an ordered list of typed operations. Each opera
 
 The configuration lists workers instead of one worker. Each entry has a `worker_id`, a loopback URL or an owned command, its credential, expected `backend_id`, `device` and an optional per-worker memory budget. Every worker is one Engine process on one device; a device is listed once, and the runtime refuses a configuration or a probe result where two workers report the same device identity.
 
-- The scheduler keeps one active execution per worker. The FIFO head is dispatched to an idle, ready worker whose loaded identity (bundle, adapters, options) matches when one exists, else to any idle worker, so that FIFO order is preserved per worker without reordering by model.
+- The scheduler keeps one active execution per worker. By default the FIFO head is dispatched to an idle, ready worker whose loaded identity (bundle, adapters, options) matches when one exists, else to any idle worker, so that FIFO order is preserved per worker without reordering by model.
 - A submission may pin `worker_id`; an unknown or unsuitable worker fails admission. Without pinning, a job may run on any worker that advertises its task, family and protocol minor.
 - Jobs, events, manifests, `jobs list`, the dashboard and `doctor` record and display the worker ID and device identity. Restart reconciliation runs per worker session; a lost worker interrupts only its own job.
 - Queue capacity stays global; `GET /v1/runtime` reports per-worker readiness and `GET /v1/workers` lists the pool. A single `worker` entry remains valid and is treated as a pool of one.
@@ -283,27 +291,60 @@ A worker entry may name a remote `https://` URL when it also names a client cert
 
 `text-to-audio` is a recipe pipeline on the `stable-audio-open` family (protocol 1.3). The default recipe `soundscape` takes `prompt` and optional `negative_prompt` and resolves `duration_seconds`, `steps`, `guidance` and `seed`. The output is `audio` (`audio/wav`); the job and manifest record sample rate, channels and actual duration. The runtime verifies the RIFF/WAVE header and size before success and exports `.wav`. The dashboard shows duration; playback happens in an external player.
 
+### Generation extensions and explicit composition
+
+Protocol 1.4 tasks and fields are accepted only when the selected worker advertises them.
+`inpaint` carries a source image, a same-size mask and prompt. `image-transform` performs a named
+resize, crop, pad, composite or Canny operation with explicit geometry/filter/threshold settings.
+These are ordinary linear-recipe operations: hires-fix and outpaint expose every intermediate
+image and dimension change rather than enabling hidden preprocessing.
+
+Sampler/scheduler pairs are resolved exactly. Approved conditioning registrations (VAE,
+textual inversion, IP-Adapter and ControlNet) become immutable per-operation load identities;
+reference/control images remain durable namespace-owned inputs. The worker validates supported
+combinations. FLUX.1-schnell and SD3.5 Medium remain reference families; a family name does not
+imply availability on the owned/native backends.
+
+Opt-in preview events refer to bounded nonfinal images; only completed verified outputs settle
+the job. Optional MP4 is an explicit `encode_video` request to an advertising worker with its
+pinned codec extra; Runtime never invokes an encoder. The standalone Studio adapter currently
+imports published outputs and provenance; preview events remain available through Runtime's API.
+
+### Operator workflows and opt-in external requests
+
+Watched folders discover approved local artifacts in place and refresh owned-worker catalogs.
+Only immutable Hugging Face snapshot links confined to the repository's own blobs are accepted;
+arbitrary symlinks and executable model files remain refused. Pinned artifact acquisition and
+Engine installation are explicit operator CLI commands with URL allowlists, sizes and SHA-256;
+registration and generation never acquire missing files.
+
+Managed stdio lifecycle, systemd user-service commands, per-worker idle unload, protected
+metrics/diagnostics and signed completion webhooks are described in [operations](docs/operations.md).
+Webhook destinations and secret environments belong to operator configuration, never job data;
+payloads omit prompts and media. Queue policy remains explicit, with FIFO as the default and
+bounded ready-first reordering only when configured.
+
 ### Implementation language
 
-Runtime 0.4.0 is a Go rewrite of the 0.3.0 service, delivered before any other deferred capability so that the parity target is as small as it will ever be and so that the worker pool and network-mode stages are built on Go's concurrency and TLS primitives rather than ported later.
+Runtime 0.4.0 delivered the Go rewrite at 0.3.0 parity before subsequent feature stages. Worker pools and network modes were then built on Go's concurrency and TLS primitives. The historical rewrite acceptance contract remains:
 
 - The rewrite MUST preserve the HTTP API, error codes, SSE semantics, configuration file, environment variables, SQLite schema and state directory layout, manifest schema, CLI commands, flags, output and exit codes of 0.3.0. A 0.3.0 state directory MUST be served by 0.4.0 without migration.
 - Parity is proven by running the 0.3.0 integration and dashboard test suites against the Go binary with Engine 0.3.0 before those suites are ported to Go.
 - The service ships as one static binary with no cgo and exactly one third-party module, a pure-Go SQLite driver. The dashboard renders with ANSI escapes as the 0.3.0 dashboard does, and the CLI uses the standard flag package; dependencies are pinned in the module files and the toolchain version is recorded with the release.
-- The typed gateway client used by Studio remains a TypeScript package maintained in this repository; it is the only TypeScript retained, and it gains every later output, recipe and worker type.
+- A typed gateway client remains a TypeScript package maintained in this repository for public API consumers; it is the only TypeScript retained, and it gains every later output, recipe and worker type.
 - 0.4.0 MUST NOT include any capability beyond 0.3.0. The TypeScript service is frozen when the rewrite starts and retired after the first Go feature release.
 
 ### Owned native engine as a selectable backend
 
-When Engine ships its native backend, the runtime accepts `backend_id: native-sdxl` beside `diffusers-sdxl` and `owned-sdxl`, records `ownership: engine` from the worker's `/v1/info`, and otherwise treats it identically: the caller chooses the backend explicitly, a request for a backend other than the running one is rejected, and no recipe, scheduler or parameter is reinterpreted. The runtime's integration suite runs unchanged against the native worker and is part of its acceptance.
+The runtime accepts `backend_id: native-sdxl` beside `diffusers-sdxl` and `owned-sdxl`, records `ownership: engine` from the worker's `/v1/info`, and otherwise treats it identically: the caller chooses the backend explicitly, a request for a backend other than the running one is rejected, and no recipe, scheduler or parameter is reinterpreted. The runtime's integration suite runs unchanged against the native worker and is part of its acceptance.
 
 ## AI Server Studio integration
 
-Add one Studio `MediaRuntime` adapter for this service. It maps health, model discovery, request validation, generation, status, progress, cancellation, output retrieval and provenance through the existing interface. The new runtime kind and registry entry require corresponding backend/frontend capability handling; configuration alone is not integration.
+The companion [Studio integration](https://github.com/jxburros/AI-Server-Studio/pull/1979) adds a named `MediaRuntime` adapter for this service. It maps health, model discovery, request validation, generation, status, progress, cancellation, output retrieval and provenance through the existing interface. The new runtime kind and registry entry require corresponding backend/frontend capability handling; configuration alone is not integration.
 
 Studio keeps its own job identity and stores the runtime job ID as its native handle. It enforces permissions before dispatch and uses namespace isolation to keep direct runtime credentials from exposing other users' jobs. Outputs imported into Studio become Studio-owned file objects with provenance; runtime retention cannot delete those copies.
 
-Personal and project use MUST have equivalent generation, status, cancellation and output behavior. The browser talks only to Studio's gateway. Existing model routing chooses the requested model; this adapter does not add a second picker. Native recipes may later use Studio's sanctioned native-workflow path, with declared input mappings and the same job lifecycle.
+Personal and project use MUST have equivalent generation, status, cancellation and output behavior. The browser talks only to Studio's gateway. Existing model routing chooses the requested model; this adapter does not add a second picker. Registered recipes use Studio's sanctioned native-workflow path, with declared input mappings, explicit operation model choices and the same chore lifecycle.
 
 The first Studio increment must be runnable from Create with honest setup, loading, failure, Stop and output states. The standalone runtime is independently useful; its CLI milestone alone does not complete a Studio implementation phase.
 
@@ -319,8 +360,16 @@ Later stages extend the adapter rather than the gateway contract: multiple outpu
 | Owned inference engine      | Owned pipeline backend (delivered); native backend behind the unchanged worker protocol; caller explicitly chooses it                                    |
 | Broader execution           | Worker pool for multiple GPUs, remote workers over mutual TLS with API network mode, video, audio                                                        |
 
-## Decisions before implementation
+## Recorded decisions and acceptance gates
 
-Record final product/repository names, the exact reference model and hardware, dependency pins, supported Go/Python versions and distribution licenses. The control plane is Go from 0.4.0 (the 0.1.0 proposal of a TypeScript control plane was implemented through 0.3.0 and is superseded); the isolated Python worker remains until Engine's native backend exists. Select concrete queue, storage and cancellation defaults and publish them as configuration rather than unexplained hard limits.
+The Go control plane, pinned Python reference stack, Rust native engine, supported model families,
+optional pinned MP4 extra, explicit pixel operations, signed operator-allowlisted webhooks and
+opt-in pinned acquisition are recorded decisions, not pending implementation choices. See
+[decisions](docs/decisions.md), [operations](docs/operations.md) and
+[operator security](docs/operator-security.md) for their current contracts and limits.
 
-For the deferred stages, record before each starts: the per-MIME output limits, the pool scheduling tie-break when several idle workers match, the TLS material format and rotation expectations for remote workers and API network mode, the video and audio reference bundles and their licenses, and the retention rule for intermediate operation outputs. The next implementation step is the Go rewrite at 0.3.0 parity, then protocol 1.2 support (multiple outputs, upscaling, conversion provenance, automatic settings and fallbacks) followed by linear typed recipes; the [implementation plan](docs/implementation-plan.md) sequences the rest.
+R0–R7 are implemented. The subsequent review development is tracked in
+[review action items](docs/reviews/2026-10-31-action-items.md). Automated CPU/fixture evidence does
+not certify real model quality, CUDA execution, memory fit or throughput. Those acceptance jobs
+require operator-approved weights and the RTX 4090 target; additional native families and measured
+optimization claims remain gated on that evidence.

@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.0 — 2026-11-04
+
+Complete native worker acceptance with real tiny-weight reference, owned and native
+integration tests. Add managed scoped API keys, admission/rate limits, audit,
+pairing, metrics, diagnostics, discovery and generated OpenAPI. Add watched folders,
+owned-worker catalogs, managed stdio/systemd lifecycle, pinned acquisition/installers,
+orphan protection, idle unloading and signed allowlisted completion webhooks.
+
+Consume protocol 1.4 sampling, new image families, inpainting, ControlNet,
+conditioning, previews, pixel operations and verified MP4 outputs. Add schema-3
+DAG/fanout/foreach recipes, scoped opt-in intermediate reuse, explicit hires-fix and
+outpaint recipes, Python/TypeScript clients and offline ComfyUI subset import.
+Split the service core by responsibility and integrate Studio's Runtime adapter.
+
+Hosted full Go race/integration checks, client builds and release packaging supply
+SQLite-dependent validation that the local environment's download policy blocks.
+See [the compatibility record](docs/compatibility.md) for exact tested commits and
+job links. GPU jobs are prepared without claiming hardware acceptance; cross-service
+GPU coexistence uses operator budgets pending a jointly adopted lease protocol.
+
 ## 0.10.0 — 2026-10-31
 
 Audio, phase R6 of the implementation plan (worker protocol unchanged: `media-worker/1.3`;

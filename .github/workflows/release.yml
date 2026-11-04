@@ -1,0 +1,97 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        type: choice
+        options: [stable, preview]
+        default: stable
+      dry_run:
+        description: Build and verify every asset without publishing
+        type: boolean
+        default: true
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  plan:
+    uses: JX-Holdings-LLC/release-infrastructure/.github/workflows/plan.yml@d7f42f9910c075ef34915fa2b95cf28dd2be534a
+    with:
+      toolkit-ref: d7f42f9910c075ef34915fa2b95cf28dd2be534a
+      channel: ${{ inputs.channel }}
+  build:
+    needs: plan
+    if: needs.plan.outputs.selected == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.13'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.14'
+      - run: python -m pip install build==1.2.2.post1
+      - run: bash packaging/package-runtime.sh dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: payload-runtime
+          path: dist/*
+          if-no-files-found: error
+  stage:
+    needs: [plan, build]
+    if: needs.plan.outputs.selected == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: JX-Holdings-LLC/release-infrastructure
+          ref: d7f42f9910c075ef34915fa2b95cf28dd2be534a
+          path: .toolkit
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: payload-*
+          path: payloads
+          merge-multiple: true
+      - name: Stage complete source-bound inventory and checksums
+        env:
+          RELEASE_SOURCE_SHA: ${{ needs.plan.outputs.sha }}
+        run: node .toolkit/src/release.mjs stage --app media-runtime --from payloads --bundle release-bundle --sha "$RELEASE_SOURCE_SHA"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-bundle
+          path: release-bundle
+          if-no-files-found: error
+  finish:
+    needs: [plan, stage]
+    if: needs.plan.outputs.selected == 'true'
+    permissions:
+      contents: write
+    uses: JX-Holdings-LLC/release-infrastructure/.github/workflows/finish.yml@d7f42f9910c075ef34915fa2b95cf28dd2be534a
+    with:
+      toolkit-ref: d7f42f9910c075ef34915fa2b95cf28dd2be534a
+      source-sha: ${{ needs.plan.outputs.sha }}
+      app: media-runtime
+      security: standard
+      artifact: release-bundle
+      dry-run: ${{ inputs.dry_run }}
