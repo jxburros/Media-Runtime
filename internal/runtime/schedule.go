@@ -109,6 +109,9 @@ func Eligible(job *jsonv.Object, lane Lane) bool {
 		if !c.Contains(tasks, task) || minor < c.TaskMinor(task) || op.Obj("backend").Str("backend_id") != caps.Str("backend_id") {
 			return false
 		}
+		if len(op.Arr("controlnets")) > 0 && (minor < 4 || caps.Obj("controlnets") == nil) {
+			return false
+		}
 		if family := op.Obj("model").Obj("bundle").Str("family"); minor >= 2 && family != "" && !loads(caps, family) {
 			return false
 		}
@@ -133,7 +136,7 @@ func loadMatches(info, job, op *jsonv.Object) bool {
 		loadedIdentity = append(loadedIdentity, jsonv.O("adapter_id", jsonv.Maybe(a.Get("adapter_id")), "digest", jsonv.Maybe(a.Get("digest")), "scale", jsonv.Maybe(a.Get("scale"))))
 	}
 	return loaded != nil && jsonEqual(loaded.Get("bundle_digest"), op.Obj("model").Obj("bundle").Get("bundle_digest")) &&
-		c.Hash(loaded.Get("options")) == c.Hash(desired) && c.Hash(loadedIdentity) == c.Hash(identity)
+		c.Hash(loaded.Get("options")) == c.Hash(desired) && c.Hash(loadedIdentity) == c.Hash(identity) && controlNetsMatch(loaded, op) && conditioningMatches(loaded, op)
 }
 
 // next is the queued job this worker should dispatch now, or nil; the caller holds r.mu. Jobs

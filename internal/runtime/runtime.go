@@ -198,11 +198,11 @@ func (r *Runtime) referenced(inputID string) bool {
 		if c.Terminal(j.Str("state")) {
 			continue
 		}
-		if j.Obj("input").Str("input_id") == inputID || j.Obj("mask").Str("input_id") == inputID || j.Obj("overlay").Str("input_id") == inputID {
+		if j.Obj("input").Str("input_id") == inputID || j.Obj("mask").Str("input_id") == inputID || j.Obj("overlay").Str("input_id") == inputID || j.Obj("control_image").Str("input_id") == inputID || j.Obj("reference_image").Str("input_id") == inputID {
 			return true
 		}
 		for _, op := range Operations(j) {
-			if op.Obj("input").Str("input_id") == inputID || op.Obj("mask").Str("input_id") == inputID || op.Obj("overlay").Str("input_id") == inputID {
+			if op.Obj("input").Str("input_id") == inputID || op.Obj("mask").Str("input_id") == inputID || op.Obj("overlay").Str("input_id") == inputID || op.Obj("control_image").Str("input_id") == inputID || op.Obj("reference_image").Str("input_id") == inputID {
 				return true
 			}
 		}

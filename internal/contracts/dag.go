@@ -17,6 +17,7 @@ var operationSchemaV3 = StrictObject(
 	Field{Name: "inputs", Check: keyed(inputNamePattern, binding)},
 	Field{Name: "defaults", Check: PartialParameters, Default: func() any { return jsonv.NewObject() }},
 	Field{Name: "adapters", Check: adapterList, Optional: true},
+	Field{Name: "conditioning", Check: ConditioningUses, Optional: true},
 	Field{Name: "foreach", Check: StrictObject(Field{Name: "from", Check: Str(StrOpts{Max: 80, Pattern: bindingPattern})}), Optional: true},
 )
 var recipeSchemaV3 = StrictObject(
@@ -141,6 +142,7 @@ func ExpandDAG(recipe, request *jsonv.Object) (*jsonv.Object, error) {
 		return nil, err
 	}
 	expanded := []any{}
+	expandedIDs := map[string]bool{}
 	groups := map[string][]string{}
 	counts := map[string]int{}
 	tasks := map[string]string{}
@@ -191,6 +193,10 @@ func ExpandDAG(recipe, request *jsonv.Object) (*jsonv.Object, error) {
 				}
 				op.Obj("inputs").Set("image", jsonv.O("from", "op:"+from+"/"+output))
 			}
+			if expandedIDs[expandedID] {
+				return nil, Err(400, "invalid_request", "Expanded operation ID collides with another operation", "operations."+id)
+			}
+			expandedIDs[expandedID] = true
 			op.Set("op_id", expandedID)
 			for _, name := range op.Obj("inputs").Keys() {
 				kind, producer, output := Binding(op.Obj("inputs").Obj(name))

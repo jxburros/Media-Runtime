@@ -79,3 +79,16 @@ func TestSchemaTwoStillRejectsForwardBindings(t *testing.T) {
 		t.Fatal("legacy recipe changed semantics")
 	}
 }
+
+func TestDAGRefusesGeneratedIDCollisions(t *testing.T) {
+	r := dagFixture(t)
+	extra := r.Arr("operations")[1].(*jsonv.Object).Clone().Set("op_id", "refine_item_1")
+	r.Set("operations", append(r.Arr("operations"), extra))
+	recipe, err := Validate(RecipeSchema, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ExpandDAG(recipe, jsonv.O("inputs", jsonv.O("prompt", "test"), "parameters", jsonv.NewObject())); err == nil {
+		t.Fatal("generated ID collision accepted")
+	}
+}

@@ -18,14 +18,18 @@ if args.kind == 'rust':
     packages = {(p['name'], p['version']): p for p in metadata['packages'] if p['source']}
     dependencies = [(p['name'], p['version'], Path(p['manifest_path']).parent) for p in packages.values()]
 else:
-    raw = subprocess.check_output(['go', 'list', '-m', '-json', 'all'], text=True)
+    # Inspect the binary's import graph, not unused/test-only modules in go.mod.
+    # Every selected module has been downloaded by the preceding binary build.
+    raw = subprocess.check_output(['go', 'list', '-deps', '-json', './cmd/media-runtime'], text=True)
     decoder = json.JSONDecoder()
-    dependencies = []
+    modules = {}
     while raw.strip():
         item, end = decoder.raw_decode(raw.lstrip())
         raw = raw.lstrip()[end:]
-        if not item.get('Main'):
-            dependencies.append((item['Path'], item['Version'], Path(item['Dir'])))
+        module = item.get('Module', {})
+        if module and not module.get('Main'):
+            modules[module['Path']] = (module['Path'], module['Version'], Path(module['Dir']))
+    dependencies = list(modules.values())
 notices = []
 for name, version, root in sorted(dependencies):
     files = sorted(p for p in root.rglob('*') if p.is_file() and p.name.upper().startswith(('LICENSE', 'LICENCE', 'COPYING', 'NOTICE')) and p.stat().st_size < 1024 * 1024)

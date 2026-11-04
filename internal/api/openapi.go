@@ -9,6 +9,8 @@ import (
 // RouteDescriptions is the public route inventory used to generate the committed
 // OpenAPI document. The drift test checks it against the route source files.
 var RouteDescriptions = map[string][]string{
+	"/v1/conditioning":                        {"GET", "POST"},
+	"/v1/controlnets":                         {"GET", "POST"},
 	"/health":                                 {"GET"},
 	"/.well-known/media-runtime":              {"GET"},
 	"/v1/runtime":                             {"GET"},

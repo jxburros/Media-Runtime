@@ -35,6 +35,8 @@ const schema = `PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign
       CREATE TABLE IF NOT EXISTS models (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS recipes (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS adapters (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS controlnets (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS conditioning (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS inputs (input_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, data TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS inputs_namespace ON inputs(namespace, input_id);
       CREATE TABLE IF NOT EXISTS worker_certificates (worker_id TEXT PRIMARY KEY, data TEXT NOT NULL);`
@@ -365,7 +367,7 @@ func (s *Store) Register(kind, id string, data *jsonv.Object) {
 
 func table(kind string) string {
 	switch kind {
-	case "models", "recipes", "adapters":
+	case "models", "recipes", "adapters", "controlnets", "conditioning":
 		return kind
 	}
 	panic("unknown registry " + kind)

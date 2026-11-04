@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -161,11 +162,22 @@ func (cfg *Config) CatalogSnapshot() *jsonv.Object {
 func (cfg *Config) AddArtifacts(entries map[string]string) {
 	cfg.catalogMu.Lock()
 	defer cfg.catalogMu.Unlock()
-	next := cfg.ArtifactCatalog.Clone()
-	for handle, path := range entries {
-		if !next.Has(handle) {
-			next.Set(handle, path)
+	keys := []string{}
+	for handle := range entries {
+		if !cfg.ArtifactCatalog.Has(handle) {
+			keys = append(keys, handle)
 		}
+	}
+	if len(keys) == 0 {
+		return
+	}
+	sort.Strings(keys)
+	next := cfg.ArtifactCatalog.Clone()
+	if next == nil {
+		next = jsonv.NewObject()
+	}
+	for _, handle := range keys {
+		next.Set(handle, entries[handle])
 	}
 	cfg.ArtifactCatalog = next
 }

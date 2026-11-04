@@ -29,6 +29,8 @@ var FAMILIES = map[string][]string{
 	"esrgan":            {"upscale"},
 	"svd":               {"image-to-video"},
 	"stable-audio-open": {"text-to-audio"},
+	"flux-schnell":      {"text-to-image", "image-to-image", "inpaint"},
+	"sd35":              {"text-to-image", "image-to-image", "inpaint"},
 }
 
 // BundleFacts are the facts a 1.2+ worker reports when it validates a bundle of each family,
@@ -42,7 +44,7 @@ var BundleFacts = map[string][]string{
 }
 
 // FAMILY_NAMES lists the families in the order they were introduced.
-var FAMILY_NAMES = []string{"sdxl-base", "esrgan", "svd", "stable-audio-open"}
+var FAMILY_NAMES = []string{"sdxl-base", "esrgan", "svd", "stable-audio-open", "flux-schnell", "sd35"}
 
 // TaskFamily is the family whose bundles serve a task.
 func TaskFamily(task string) string {
@@ -75,6 +77,8 @@ func TaskMinor(task string) int {
 // FamilyMinor is the lowest protocol minor whose bundles may name a family.
 func FamilyMinor(family string) int {
 	switch family {
+	case "flux-schnell", "sd35":
+		return 4
 	case "esrgan":
 		return 2
 	case "svd", "stable-audio-open":
@@ -125,15 +129,18 @@ var parameterFields = []Field{
 	{Name: "steps", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(150)})},
 	{Name: "guidance", Check: Num(NumOpts{Min: F(0), Max: F(30)})},
 	{Name: "seed", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(4294967295)})},
-	{Name: "sampler", Check: Enum("euler", "euler-ancestral", "dpmpp-2m", "ddim", "unipc")},
-	{Name: "scheduler", Check: Enum("euler", "karras", "ddim", "unipc")},
+	{Name: "sampler", Check: Enum("euler", "euler-ancestral", "dpmpp-2m", "ddim", "unipc", "flow-euler")},
+	{Name: "scheduler", Check: Enum("euler", "karras", "ddim", "unipc", "flow-match")},
 	{Name: "strength", Check: Num(NumOpts{GreaterThan: F(0), Max: F(1)}), Optional: true},
 	{Name: "preview_interval", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(50)}), Optional: true},
 	{Name: "count", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(MaxCount)}), Optional: true},
+	{Name: "clip_skip", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(2)}), Optional: true},
 }
 
 var transformFields = []Field{
-	{Name: "operation", Check: Enum("resize", "crop", "pad", "composite")},
+	{Name: "threshold_low", Check: Num(NumOpts{Min: F(0), Max: F(1)}), Optional: true},
+	{Name: "threshold_high", Check: Num(NumOpts{Min: F(0), Max: F(1)}), Optional: true},
+	{Name: "operation", Check: Enum("resize", "crop", "pad", "composite", "canny")},
 	{Name: "filter", Check: Enum("nearest", "bilinear"), Optional: true},
 	{Name: "x", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(2048)}), Optional: true},
 	{Name: "y", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(2048)}), Optional: true},
@@ -181,13 +188,13 @@ var AudioParameterNames = []string{"seed", "steps", "guidance", "duration_second
 
 // TaskParameterNames are the parameters each task takes; any other parameter is refused by name.
 var TaskParameterNames = map[string][]string{
-	"text-to-image":   {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "count", "preview_interval"},
-	"image-to-image":  {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "strength", "preview_interval"},
-	"inpaint":         {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "strength", "preview_interval"},
+	"text-to-image":   {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "count", "preview_interval", "clip_skip"},
+	"image-to-image":  {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "strength", "preview_interval", "clip_skip"},
+	"inpaint":         {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "strength", "preview_interval", "clip_skip"},
 	"upscale":         {"width", "height", "tile", "tile_overlap"},
 	"image-to-video":  VideoParameterNames,
 	"text-to-audio":   AudioParameterNames,
-	"image-transform": {"width", "height", "operation", "filter", "x", "y", "background", "opacity"},
+	"image-transform": {"width", "height", "operation", "filter", "x", "y", "background", "opacity", "threshold_low", "threshold_high"},
 }
 
 // MediaParameter reports whether a parameter belongs only to the video or audio tasks.
@@ -228,6 +235,8 @@ var Inputs = StrictObject(
 	Field{Name: "image", Check: InputID, Optional: true},
 	Field{Name: "mask", Check: InputID, Optional: true},
 	Field{Name: "overlay", Check: InputID, Optional: true},
+	Field{Name: "control_image", Check: InputID, Optional: true},
+	Field{Name: "reference_image", Check: InputID, Optional: true},
 )
 
 var loadOptionFields = []Field{
@@ -247,12 +256,15 @@ var AdapterUse = StrictObject(
 var adapterList = Array(AdapterUse, ArrOpts{Max: MaxAdapters})
 
 var Submission = StrictObject(
+	Field{Name: "reuse_intermediates", Check: Bool(), Optional: true},
 	Field{Name: "keep_loaded", Check: Bool(), Optional: true},
 	Field{Name: "recipe_id", Check: ID},
 	Field{Name: "model_id", Check: ID},
 	Field{Name: "inputs", Check: submissionInputs},
 	Field{Name: "parameters", Check: PartialParameters, Default: func() any { return jsonv.NewObject() }},
 	Field{Name: "adapters", Check: adapterList, Optional: true},
+	Field{Name: "controlnets", Check: controlnetList, Optional: true},
+	Field{Name: "conditioning", Check: ConditioningUses, Optional: true},
 	Field{Name: "backend_id", Check: Enum(BACKENDS...), Optional: true},
 	Field{Name: "backend_options", Check: StrictObject(
 		Field{Name: "diffusers-sdxl", Check: partialLoadOptions, Optional: true},
@@ -284,15 +296,22 @@ var recipeSchemaV1 = Refine(StrictObject(
 			Field{Name: "required", Check: Literal(true)},
 		), Optional: true},
 		Field{Name: "mask", Check: StrictObject(Field{Name: "type", Check: Literal("image")}, Field{Name: "required", Check: Literal(true)}), Optional: true},
+		Field{Name: "reference_image", Check: StrictObject(Field{Name: "type", Check: Literal("image")}, Field{Name: "required", Check: Literal(true)}), Optional: true},
+		Field{Name: "control_image", Check: StrictObject(Field{Name: "type", Check: Literal("image")}, Field{Name: "required", Check: Literal(true)}), Optional: true},
 		Field{Name: "overlay", Check: StrictObject(Field{Name: "type", Check: Literal("image")}, Field{Name: "required", Check: Literal(true)}), Optional: true},
 	)},
 	Field{Name: "defaults", Check: PartialParameters},
 	Field{Name: "adapters", Check: adapterList, Optional: true},
+	Field{Name: "controlnets", Check: controlnetList, Optional: true},
+	Field{Name: "conditioning", Check: ConditioningUses, Optional: true},
 ), func(v any) bool {
 	r := v.(*jsonv.Object)
 	inputs, defaults := r.Obj("inputs"), r.Obj("defaults")
 	pipeline := r.Str("pipeline")
-	if r.Str("model_family") != TaskFamily(pipeline) || !defaultsServe(pipeline, defaults, r.Has("adapters")) {
+	if (r.Has("controlnets") || inputs.Has("control_image")) && pipeline != "text-to-image" {
+		return false
+	}
+	if !Contains(FAMILIES[r.Str("model_family")], pipeline) || !defaultsServe(pipeline, defaults, r.Has("adapters")) {
 		return false
 	}
 	switch {
@@ -343,6 +362,9 @@ var AdapterRegistration = StrictObject(
 // DefaultRecipes are seeded into every state directory.
 func DefaultRecipes() []*jsonv.Object {
 	return []*jsonv.Object{
+		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"flux-schnell","revision":1,"pipeline":"text-to-image","model_family":"flux-schnell","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"width":1024,"height":1024,"steps":4,"guidance":0,"sampler":"flow-euler","scheduler":"flow-match"}}`),
+		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"sd35","revision":1,"pipeline":"text-to-image","model_family":"sd35","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"width":1024,"height":1024,"steps":28,"guidance":4.5,"sampler":"flow-euler","scheduler":"flow-match"}}`),
+		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"resize","revision":1,"pipeline":"image-transform","model_family":"sdxl-base","inputs":{"image":{"type":"image","required":true}},"defaults":{"operation":"resize","filter":"bilinear"}}`),
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"portrait","revision":1,"pipeline":"text-to-image","model_family":"sdxl-base","inputs":{"prompt":{"type":"string","required":true}},"defaults":{"width":1024,"height":1024,"steps":30,"guidance":6}}`),
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"enlarge","revision":1,"pipeline":"upscale","model_family":"esrgan","inputs":{"image":{"type":"image","required":true}},"defaults":{"tile":0,"tile_overlap":16}}`),
 		// steps is the recipe's: the worker has no default for video steps (fps, motion,

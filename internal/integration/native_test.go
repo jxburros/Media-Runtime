@@ -136,7 +136,9 @@ func TestInferenceBackends(t *testing.T) {
 			e.boot()
 			equal(t, obj(e.client.Submit(batch, "real-batch")).Str("job_id"), done.Str("job_id"))
 			equal(t, obj(e.client.Status(done.Str("job_id"))).Str("state"), "succeeded")
-			repeat := wait(obj(e.client.Submit(request(), "")).Str("job_id"), nil)
+			// Repeat the identical batch shape: batching may change floating-point kernel
+			// rounding relative to count=1, which the Engine oracle checks by pixel tolerance.
+			repeat := wait(obj(e.client.Submit(batch.Clone(), "")).Str("job_id"), nil)
 			equal(t, repeat.Str("state"), "succeeded", repeat.Get("error"))
 			equal(t, get(repeat, "outputs", "0", "sha256"), firstDigest)
 			image := obj(e.client.UploadInput(MakePNG(64, 64)))
@@ -145,7 +147,7 @@ func TestInferenceBackends(t *testing.T) {
 			changed := wait(obj(e.client.Submit(variation, "")).Str("job_id"), nil)
 			equal(t, changed.Str("state"), "succeeded", changed.Get("error"))
 			equal(t, get(changed, "input", "sha256"), image.Get("sha256"))
-			adapted := request().Set("adapters", []any{jsonv.O("adapter_id", "fixture-lora", "scale", 0.8)})
+			adapted := batch.Clone().Set("adapters", []any{jsonv.O("adapter_id", "fixture-lora", "scale", 0.8)})
 			lora := wait(obj(e.client.Submit(adapted, "")).Str("job_id"), nil)
 			equal(t, lora.Str("state"), "succeeded", lora.Get("error"))
 			if get(lora, "outputs", "0", "sha256") == firstDigest {

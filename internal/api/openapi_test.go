@@ -17,7 +17,7 @@ import (
 // Check direct route predicates against the same inventory used by OpenAPI.
 // Parameter routes are backed by the named regexp/prefix dispatches below.
 func TestRouteDocumentationDoesNotDrift(t *testing.T) {
-	sources := []string{"api.go", "security.go", "operations.go"}
+	sources := []string{"api.go", "security.go", "operations.go", "conditioning.go", "controlnets.go"}
 	seen := map[string]bool{}
 	for _, name := range sources {
 		f, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
@@ -26,7 +26,7 @@ func TestRouteDocumentationDoesNotDrift(t *testing.T) {
 		}
 		for _, decl := range f.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || (fn.Name.Name != "route" && fn.Name.Name != "securityRoutes" && fn.Name.Name != "operations") {
+			if !ok || (fn.Name.Name != "route" && fn.Name.Name != "securityRoutes" && fn.Name.Name != "operations" && fn.Name.Name != "conditioning" && fn.Name.Name != "controlnets") {
 				continue
 			}
 			ast.Inspect(fn.Body, func(n ast.Node) bool {

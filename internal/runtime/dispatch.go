@@ -79,7 +79,7 @@ func (r *Runtime) tick(m *pool.Member) (err error) {
 		changed := false
 		for _, op := range Operations(done) {
 			if !c.Terminal(op.Str("state")) || truthy(op.Get("released")) ||
-				!(truthy(op.Get("execution_id")) || truthy(op.Get("worker_input_id")) || truthy(op.Get("worker_mask_id"))) || !jsonEqual(op.Get("session_id"), session) {
+				!(truthy(op.Get("execution_id")) || truthy(op.Get("worker_input_id")) || truthy(op.Get("worker_mask_id")) || truthy(op.Get("worker_overlay_id")) || truthy(op.Get("worker_control_id")) || truthy(op.Get("worker_reference_id"))) || !jsonEqual(op.Get("session_id"), session) {
 				continue
 			}
 			err := func() error {
@@ -88,7 +88,7 @@ func (r *Runtime) tick(m *pool.Member) (err error) {
 						return err
 					}
 				}
-				for _, field := range []string{"worker_input_id", "worker_mask_id", "worker_overlay_id"} {
+				for _, field := range []string{"worker_input_id", "worker_mask_id", "worker_overlay_id", "worker_control_id", "worker_reference_id"} {
 					if id := op.Str(field); id != "" {
 						if _, err := client.JSON("/v1/inputs/"+id, "DELETE", nil, ""); err != nil {
 							var api *c.ApiError
@@ -222,6 +222,12 @@ func (r *Runtime) tick(m *pool.Member) (err error) {
 		model := op.Obj("model")
 		if !loadMatches(info, job, op) {
 			body := jsonv.O("protocol", protocol, "bundle", model.Get("bundle"), "options", desired)
+			if len(op.Arr("controlnets")) > 0 {
+				body.Set("controlnets", op.Get("controlnets"))
+			}
+			if len(op.Arr("conditioning")) > 0 {
+				body.Set("conditioning", op.Get("conditioning"))
+			}
 			if len(asArray(op.Get("adapters"))) > 0 {
 				body.Set("adapters", op.Get("adapters"))
 			}
@@ -273,6 +279,9 @@ func (r *Runtime) tick(m *pool.Member) (err error) {
 			if truthy(job.Get("cancel_requested")) {
 				r.finish(job, "cancelled", nil)
 				return nil
+			}
+			if reused, err := r.tryCached(client, job, op, index); reused || err != nil {
+				return err
 			}
 			inputs := op.Obj("inputs").Clone()
 			if c.UsesImage(op.Str("task")) {
@@ -339,6 +348,12 @@ func (r *Runtime) tick(m *pool.Member) (err error) {
 					}
 				}
 				inputs.Set("overlay", op.Get("worker_overlay_id"))
+			}
+			if err := r.uploadControlImage(client, job, op, inputs); err != nil {
+				return err
+			}
+			if err := r.uploadReference(client, job, op, inputs); err != nil {
+				return err
 			}
 			snapshot, err = client.Obj("/v1/executions", "POST", jsonv.O(
 				"protocol", protocol,

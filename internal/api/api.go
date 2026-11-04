@@ -359,6 +359,12 @@ func (s *Server) route(q *request) error {
 	if handled, err := s.operations(q, path, method); handled {
 		return err
 	}
+	if handled, err := s.conditioning(q, path, method); handled {
+		return err
+	}
+	if handled, err := s.controlnets(q, path, method); handled {
+		return err
+	}
 	namespace := q.namespace
 
 	switch {
@@ -968,10 +974,14 @@ func publicOperation(op *jsonv.Object) *jsonv.Object {
 		case "model":
 			model := op.Obj("model")
 			out.Set(k, jsonv.O("model_id", model.Get("model_id"), "bundle_digest", model.Obj("bundle").Get("bundle_digest")))
-		case "input", "mask", "overlay":
+		case "input", "mask", "overlay", "control_image", "reference_image":
 			if input := op.Obj(k); input != nil {
 				out.Set(k, PublicInput(input))
 			}
+		case "conditioning":
+			out.Set(k, publicConditioning(op))
+		case "controlnets":
+			out.Set(k, publicControlnets(op))
 		case "adapters":
 			out.Set(k, publicAdapters(op))
 		default:
@@ -1012,7 +1022,7 @@ func PublicJob(job *jsonv.Object) *jsonv.Object {
 	out := jsonv.NewObject()
 	for _, k := range job.Keys() {
 		switch k {
-		case "namespace", "key_id", "key_concurrency_limit", "model", "backend", "recipe", "manifest", "input", "mask", "overlay", "adapters":
+		case "namespace", "key_id", "key_concurrency_limit", "model", "backend", "recipe", "manifest", "input", "mask", "overlay", "control_image", "reference_image", "conditioning", "controlnets", "adapters":
 			continue
 		case "operations":
 			ops := []any{}
@@ -1039,6 +1049,14 @@ func PublicJob(job *jsonv.Object) *jsonv.Object {
 	if overlay := job.Obj("overlay"); overlay != nil {
 		out.Set("overlay", PublicInput(overlay))
 	}
+	if control := job.Obj("control_image"); control != nil {
+		out.Set("control_image", PublicInput(control))
+	}
+	if reference := job.Obj("reference_image"); reference != nil {
+		out.Set("reference_image", PublicInput(reference))
+	}
+	out.Set("conditioning", publicConditioning(job))
+	out.Set("controlnets", publicControlnets(job))
 	out.Set("adapters", publicAdapters(job))
 	model := job.Obj("model")
 	out.Set("model", jsonv.O("model_id", model.Get("model_id"), "bundle_digest", model.Obj("bundle").Get("bundle_digest")))

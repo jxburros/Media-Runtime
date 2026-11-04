@@ -1,0 +1,66 @@
+{
+  "schema_version": 2,
+  "revision": 1,
+  "recipe_id": "hires-fix",
+  "inputs": {
+    "prompt": {
+      "type": "string",
+      "required": true
+    }
+  },
+  "operations": [
+    {
+      "op_id": "generate",
+      "task": "text-to-image",
+      "model_family": "sdxl-base",
+      "inputs": {
+        "prompt": {
+          "from": "input:prompt"
+        }
+      },
+      "defaults": {
+        "width": 512,
+        "height": 512,
+        "steps": 25,
+        "guidance": 6
+      }
+    },
+    {
+      "op_id": "resize",
+      "task": "image-transform",
+      "model_family": "sdxl-base",
+      "inputs": {
+        "image": {
+          "from": "op:generate/image"
+        }
+      },
+      "defaults": {
+        "width": 1024,
+        "height": 1024,
+        "operation": "resize",
+        "filter": "bilinear"
+      }
+    },
+    {
+      "op_id": "refine",
+      "task": "image-to-image",
+      "model_family": "sdxl-base",
+      "inputs": {
+        "image": {
+          "from": "op:resize/image"
+        },
+        "prompt": {
+          "from": "input:prompt"
+        }
+      },
+      "defaults": {
+        "steps": 20,
+        "strength": 0.35,
+        "guidance": 6
+      }
+    }
+  ],
+  "publish": [
+    "refine/image"
+  ]
+}

@@ -7,7 +7,7 @@ version=$(node -p 'require("./release.json").apps["media-runtime"].version')
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$stage/media-runtime" ./cmd/media-runtime
-"$stage/media-runtime" --version
+test "$("$stage/media-runtime" --version)" = "$version"
 if ldd "$stage/media-runtime" 2>&1 | grep -q '=>'; then
   echo 'Runtime binary must be static' >&2; exit 1
 fi

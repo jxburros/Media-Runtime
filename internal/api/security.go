@@ -36,7 +36,7 @@ func permissionFor(path, method string) string {
 			return "jobs.read"
 		}
 		return "jobs.submit"
-	case (path == "/v1/runtime" || path == "/v1/workers" || strings.HasPrefix(path, "/v1/recipes") || path == "/v1/adapters") && method == "GET":
+	case (path == "/v1/runtime" || path == "/v1/workers" || strings.HasPrefix(path, "/v1/recipes") || path == "/v1/adapters" || path == "/v1/conditioning" || path == "/v1/controlnets") && method == "GET":
 		return "jobs.read"
 	default:
 		return "admin"
@@ -290,13 +290,31 @@ func (q *request) filterDiagnostics(report *jsonv.Object) *jsonv.Object {
 	}
 	out := report.Clone()
 	models := []any{}
+	allowedDigests := map[string]bool{}
 	for _, raw := range out.Arr("models") {
 		model, _ := raw.(*jsonv.Object)
 		if q.key.AllowsModel(model.Str("model_id")) {
 			models = append(models, raw)
+			if digest := model.Str("bundle_digest"); digest != "" {
+				allowedDigests[digest] = true
+			}
 		}
 	}
 	out.Set("models", models)
+	// Doctor exposes both the legacy first-worker view and the complete pool.
+	// Only a digest associated with an allowed registered model is visible;
+	// unknown/unregistered loaded bundles have no model grant to authorize them.
+	redactLoaded := func(worker *jsonv.Object) {
+		if worker != nil && worker.Str("loaded_bundle_digest") != "" && !allowedDigests[worker.Str("loaded_bundle_digest")] {
+			worker.Set("loaded_bundle_digest", nil)
+			worker.Set("applied_fallbacks", []any{})
+		}
+	}
+	redactLoaded(out.Obj("worker"))
+	for _, raw := range out.Arr("workers") {
+		worker, _ := raw.(*jsonv.Object)
+		redactLoaded(worker)
+	}
 	return out
 }
 func (s *Server) scopedWorkers(q *request, list []any) []any {

@@ -53,7 +53,7 @@ func download(t *testing.T, e *env, jobID, outputID string) []byte {
 func TestVideoAnimatesAnUploadedImage(t *testing.T) {
 	e := bootVideo(t)
 	ok := must[*jsonv.Object](t)
-	equal(t, get(ok(e.client.Health()), "worker", "protocol"), "media-worker/1.3")
+	equal(t, get(ok(e.client.Health()), "worker", "protocol"), c.PROTOCOLS[len(c.PROTOCOLS)-1])
 	detail := must[any](t)(e.client.Model("svd", false)).(*jsonv.Object)
 	equal(t, detail.Get("family"), "svd")
 	equal(t, detail.Get("tasks"), []any{"image-to-video"})

@@ -36,12 +36,27 @@ func TestDownloadResumesAndVerifiesBytes(t *testing.T) {
 	}))
 	defer server.Close()
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "model.safetensors.part"), payload[:5], 0600); err != nil {
+	manifest := DownloadManifest{Files: []DownloadFile{{Path: "model.safetensors", URL: server.URL, SHA256: digest, Size: int64(len(payload))}}}
+	staging, lock, err := stagingArea(root, manifest)
+	if err != nil {
 		t.Fatal(err)
 	}
-	manifest := DownloadManifest{Files: []DownloadFile{{Path: "model.safetensors", URL: server.URL, SHA256: digest, Size: int64(len(payload))}}}
+	partial, err := stagedFile(staging, manifest.Files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(partial, payload[:5], 0600); err != nil {
+		t.Fatal(err)
+	}
+	lock.Close()
+	// Legacy-looking partial files are user files now and must remain untouched.
+	neighbor := filepath.Join(root, "model.safetensors.part")
+	os.WriteFile(neighbor, []byte("unrelated"), 0600)
 	if err := download(context.Background(), manifest, root, server.Client()); err != nil {
 		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(neighbor); string(data) != "unrelated" {
+		t.Fatal("unrelated partial changed")
 	}
 	if !resumed {
 		t.Fatal("resume range not sent")
@@ -67,13 +82,27 @@ func TestDownloadRejectsTamperingAndSymlinks(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "model")); err == nil {
 		t.Fatal("published wrong bytes")
 	}
+	staging, lock, err := stagingArea(root, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partial, err := stagedFile(staging, m.Files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock.Close()
 	outside := filepath.Join(t.TempDir(), "outside")
-	if err := os.Symlink(outside, filepath.Join(root, "model.part")); err != nil {
+	os.WriteFile(outside, []byte("preserved"), 0600)
+	if err := os.Symlink(outside, partial); err != nil {
 		t.Fatal(err)
 	}
 	if err := download(context.Background(), m, root, server.Client()); err == nil {
-		t.Fatal("accepted symlink")
+		t.Fatal("accepted staged symlink")
 	}
+	if data, _ := os.ReadFile(outside); string(data) != "preserved" {
+		t.Fatal("followed staging symlink")
+	}
+
 }
 func TestNetworkDestinationsAreExplicitAndPublic(t *testing.T) {
 	for _, ip := range []string{"127.0.0.1", "10.0.0.1", "169.254.169.254", "100.64.0.1", "::1", "fc00::1", "198.18.0.1"} {
@@ -213,5 +242,49 @@ func TestUpdateUsesSemanticVersionOrdering(t *testing.T) {
 		if err != nil || got != tc.want {
 			t.Fatal(tc, got, err)
 		}
+	}
+}
+
+func TestDownloadStagingCannotAliasManifestOrAdoptUserDirectory(t *testing.T) {
+	payload := []byte("pinned")
+	hash := sha256.Sum256(payload)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write(payload) }))
+	defer server.Close()
+	file := DownloadFile{Path: "weights", URL: server.URL, SHA256: hex.EncodeToString(hash[:]), Size: int64(len(payload))}
+	second := file
+	second.Path = "weights.part"
+	m := DownloadManifest{Files: []DownloadFile{file, second}}
+	root := t.TempDir()
+	// A previously completed weights.part is a normal published model file.
+	os.WriteFile(filepath.Join(root, second.Path), payload, 0600)
+	if err := download(context.Background(), m, root, server.Client()); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"weights", "weights.part"} {
+		data, _ := os.ReadFile(filepath.Join(root, name))
+		if string(data) != string(payload) {
+			t.Fatal("staging aliased publication", name)
+		}
+	}
+	for _, paths := range [][]string{{"weights", "weights/child"}, {stagingName + "/owner"}, {stagingName}, {"."}} {
+		files := []DownloadFile{}
+		for _, path := range paths {
+			copy := file
+			copy.Path = path
+			files = append(files, copy)
+		}
+		if err := publicationPaths(files); err == nil {
+			t.Fatal("unsafe publication path accepted", paths)
+		}
+	}
+	unrelated := t.TempDir()
+	os.Mkdir(filepath.Join(unrelated, stagingName), 0700)
+	marker := filepath.Join(unrelated, stagingName, "precious")
+	os.WriteFile(marker, []byte("preserve"), 0600)
+	if err := download(context.Background(), m, unrelated, server.Client()); err == nil {
+		t.Fatal("adopted unrelated directory")
+	}
+	if data, _ := os.ReadFile(marker); string(data) != "preserve" {
+		t.Fatal("unrelated directory changed")
 	}
 }

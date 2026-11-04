@@ -27,23 +27,36 @@ export type OutputRecord = {
 
 export type Fallback = "cpu" | "lower_precision";
 
+export type ConditioningUse = { conditioning_id: string; scale?: number; token?: string; encoder?: "text_encoder" | "text_encoder_2" };
+
 export type Submission = {
+  /** Reuse verified intermediate outputs in schema 2/3, within the same key and worker session. */
+  reuse_intermediates?: boolean;
   recipe_id: string;
   /** The model of the first operation. */
   model_id: string;
   /** Schema-2 recipes: the models of later operations by op_id. */
   models?: Record<string, string>;
   /** Schema-1 inputs, or the declared inputs of a schema-2 recipe (images are input IDs). */
-  inputs: { prompt?: string; negative_prompt?: string; image?: string } | Record<string, string | number>;
+  inputs: { prompt?: string; negative_prompt?: string; image?: string; mask?: string; overlay?: string; control_image?: string; reference_image?: string } | Record<string, string | number>;
   parameters?: {
     width?: number;
     height?: number;
     steps?: number;
     guidance?: number;
     seed?: number;
-    sampler?: "euler";
-    scheduler?: "euler";
+    sampler?: "euler" | "euler-ancestral" | "dpmpp-2m" | "ddim" | "unipc" | "flow-euler";
+    scheduler?: "euler" | "karras" | "ddim" | "unipc" | "flow-match";
     strength?: number;
+    preview_interval?: number;
+    operation?: "resize" | "crop" | "pad" | "composite" | "canny";
+    filter?: "nearest" | "bilinear";
+    x?: number;
+    y?: number;
+    background?: [number,number,number];
+    opacity?: number;
+    threshold_low?: number;
+    threshold_high?: number;
     /** text-to-image only; produces image, image_2 … image_N in one execution. */
     count?: number;
     /** upscale only. */
@@ -56,10 +69,14 @@ export type Submission = {
     motion?: number;
     noise_augmentation?: number;
     decode_chunk?: number;
+    encode_video?: boolean;
     /** text-to-audio only; must lie within the model's duration_range (never trimmed). */
     duration_seconds?: number;
+    clip_skip?: 1 | 2;
   };
   adapters?: { adapter_id: string; scale?: number }[];
+  conditioning?: ConditioningUse[];
+  controlnets?: { controlnet_id: string; scale?: number }[];
   backend_id?: "diffusers-sdxl" | "owned-sdxl" | "native-sdxl";
   backend_options?: Record<
     string,
@@ -122,9 +139,9 @@ export type WorkerSummary = {
 
 export type JobState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
-export type Task = "text-to-image" | "image-to-image" | "upscale" | "image-to-video" | "text-to-audio";
+export type Task = "text-to-image" | "image-to-image" | "upscale" | "image-to-video" | "text-to-audio" | "inpaint" | "image-transform";
 
-export type Family = "sdxl-base" | "esrgan" | "svd" | "stable-audio-open";
+export type Family = "sdxl-base" | "esrgan" | "svd" | "stable-audio-open" | "flux-schnell" | "sd35";
 
 /** Facts of a job's video operation, from the verified frame archive record. */
 export type VideoFacts = {
@@ -158,12 +175,16 @@ export type InputDeclaration =
 export type Binding = { from: string };
 
 export type RecipeOperation = {
+  /** Schema 3: expand once per image in a text-to-image producer batch. */
+  foreach?: Binding;
   op_id: string;
   task: Task;
   model_family: Family;
   inputs: Record<string, Binding>;
   defaults: Record<string, number | string>;
   adapters?: { adapter_id: string; scale?: number }[];
+  conditioning?: ConditioningUse[];
+  controlnets?: { controlnet_id: string; scale?: number }[];
 };
 
 /** GET /v1/recipes/{id}: any recipe in its schema-2 form, for native-workflow input mapping. */
@@ -171,7 +192,7 @@ export type RecipeDetail = {
   recipe_id: string;
   revision: number;
   /** The registered schema; schema-1 recipes are shown as one operation. */
-  schema_version: 1 | 2;
+  schema_version: 1 | 2 | 3;
   digest: string;
   inputs: Record<string, InputDeclaration>;
   operations: RecipeOperation[];
@@ -182,6 +203,8 @@ export type RecipeDetail = {
 export type OperationState = "pending" | "running" | "succeeded" | "failed" | "cancelled";
 
 export type JobOperation = {
+  source_op_id?: string;
+  cache?: { key: string; source_job_id: string; source_op_id: string; source_execution_id?: string | null; source_measurements?: Record<string, unknown> };
   op_id: string;
   task: Task;
   state: OperationState;
@@ -321,6 +344,8 @@ export class MediaRuntimeClient {
       "/v1/catalog" + (handle ? `?handle=${encodeURIComponent(handle)}` : ""),
     );
   }
+  controlnets() { return this.json("/v1/controlnets"); }
+  registerControlNet(registration: {controlnet_id:string; artifact_handle:string; source?:Record<string,string>}) { return this.json("/v1/controlnets", "POST", registration); }
   adapters() {
     return this.json("/v1/adapters");
   }

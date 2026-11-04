@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 env:
   # Updated together with the companion Engine implementation; always a full commit.
-  MEDIA_ENGINE_REF: f70951415023aa38cd2dc3d834254ea141ae066b
+  MEDIA_ENGINE_REF: ca810c2e6dc258c91d311f3f0f18eebbf538f326
 jobs:
   fixture:
     runs-on: ubuntu-24.04
@@ -85,8 +85,10 @@ jobs:
       - name: Install real CPU inference engines
         working-directory: Media-Engine
         run: |
+          python -m pip install uv==0.9.5
+          uv export --frozen --no-dev --extra inference --extra inference-audio --extra inference-video --no-hashes --no-emit-project > "$RUNNER_TEMP/engine-constraints.txt"
           python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e '.[inference,inference-audio,inference-video]'
+          python -m pip install -c "$RUNNER_TEMP/engine-constraints.txt" -e '.[inference,inference-audio,inference-video]'
       - run: cargo build --release --locked --manifest-path Media-Engine/native/Cargo.toml
       - name: Full integration suite plus real shared SDXL lifecycle
         working-directory: Media-Runtime

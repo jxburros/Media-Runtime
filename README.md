@@ -1,27 +1,27 @@
 # Media Runtime
 
 A standalone, authenticated local media service with a Go CLI/API, terminal dashboard,
-SQLite FIFO jobs, resumable job events, cancellation, durable PNG inputs, immutable PNG outputs and
+SQLite jobs, resumable job events, cancellation, durable PNG inputs, verified media outputs and
 provenance. Media Engine is its separately installed image, video and audio inference worker. Studio connects to this
 service through its gateway.
 
-This release implements the **first complete path**, the **operator experience** stage and
-image-to-image from the **additional media operations** stage in [runtime-spec.md](runtime-spec.md),
-and accepts Engine's **owned pipeline** backend behind the unchanged worker protocol. Release 0.4.0
-is the Go rewrite of the 0.3.0 TypeScript service at exact feature parity: the API, configuration,
-state directory, manifests and CLI are unchanged, and a 0.3.0 state directory is served as is.
-Release 0.5.0 speaks `media-worker/1.2` and adds multiple outputs per job, upscaling, the
-conversion provenance workflow, and automatic settings with authorized fallbacks. Release 0.6.0
-adds linear typed recipes (schema 2): several operations, each its own worker execution, chained
-through durable intermediate outputs. Release 0.7.0 drives a pool of workers, one Engine process
-per GPU, with one execution per worker. Release 0.8.0 adds remote workers over mutual TLS (Engine
-0.5.0's network mode) and a network mode for the runtime's own API. Release 0.9.0 speaks
-`media-worker/1.3` (Engine 0.6.0) and adds [video](#video): image-to-video on the `svd` family,
-committed as a lossless frame archive and a poster image. Release 0.10.0 adds [audio](#audio):
-text-to-audio on the `stable-audio-open` family (Engine 0.7.0), committed as a WAV clip.
-Release 1.0.0 accepts Engine 1.0.0's `native-sdxl` backend and records its `engine` ownership
-in jobs and manifests. Features are delivered and fixture-tested; real inference acceptance
-uses tiny random-weight bundles on CPU. CUDA and real-weight validation remain outstanding.
+Runtime 1.1.0 implements durable image, video and audio jobs, typed linear recipes, worker pools,
+remote workers over mutual TLS, and the operator workflows described in
+[runtime-spec.md](runtime-spec.md). It negotiates `media-worker/1.0`–`1.4`; capabilities on the
+selected worker decide which tasks and options are accepted. The reference Python worker offers
+1.4 generation features, while `native-sdxl` remains an SDXL worker on protocol 1.3. Backend IDs
+are stable and a request never silently switches implementation.
+
+The 1.1.0 additions include inpainting and explicit pixel operations, advertised sampler pairs,
+optional preview/MP4 handling, explicit conditioning components and newer reference families;
+scoped revocable keys and pairing; watched model folders; explicit pinned downloads; service and
+managed-process lifecycle; metrics, diagnostics and signed opt-in completion webhooks. See
+[operator workflows](docs/operations.md), [credentials and observability](docs/operator-security.md),
+and the [offline ComfyUI migration subset](docs/comfyui-migration.md).
+
+Implementation and automated CPU/fixture evidence are distinct from real-weight GPU acceptance.
+The Linux x64 RTX 4090 acceptance jobs are prepared; their results are required before hardware,
+quality or performance claims. See the [compatibility record](docs/compatibility.md).
 
 ## Install and run
 
@@ -33,9 +33,10 @@ CGO_ENABLED=0 go build -o media-runtime ./cmd/media-runtime
 ```
 
 1. Prepare an already-downloaded, complete SDXL base Diffusers directory with safetensors weights.
-   No command here downloads weights or converts checkpoints. All seven component directories,
+   The quickstart uses local weights and performs no download or conversion. All seven component directories,
    model_index.json and the Euler scheduler configuration must be present; remove Python/pickle
-   weights and symlinks. Keep the approved directory read-only while serving.
+   weights and unapproved symlinks. Immutable Hugging Face snapshot-to-blob links have the
+   narrowly checked exception described in operator workflows. Keep the approved directory read-only while serving.
 2. Copy `examples/runtime.config.json` to `runtime.config.json`. Set the approved artifact path.
    Give Engine the same handle/path mapping using its catalog file. A model registration uses an
    opaque handle, never a caller-supplied filesystem path.
@@ -83,13 +84,16 @@ behavior; images open in an external viewer after `outputs export`.
 
 ## Model installation workflow
 
-Nothing here downloads weights. Download the complete SDXL base Diffusers bundle out of band,
+Obtain the complete SDXL base Diffusers bundle out of band, or use the explicit, hash-pinned
+`downloads install` workflow described in [operator workflows](docs/operations.md#pinned-downloads-and-engine-installation). Then
 place it in a directory the service may read, add the directory to `artifact_catalog` under an
 opaque handle, then run `models inspect`. It lists each handle's completeness, missing roles,
-forbidden Python/pickle files and symlinks without hashing or registering, and prints the
+forbidden Python/pickle files and unsafe symlinks without hashing or registering, and prints the
 registration document for a complete bundle. `models register` hashes every file through the
 worker and records the bundle identity; `models show MODEL --verify` repeats that check later and
-returns the worker's memory estimate for its load defaults.
+returns the worker's memory estimate for its load defaults. Registration and generation never download missing files.
+`folders add` can catalog approved directories in place; supported immutable Hugging Face cache snapshots
+use narrowly checked blob links rather than general symlink traversal.
 
 ## LoRA adapters
 
@@ -116,7 +120,8 @@ reports the real total and the manifest lists the input's digest. Inputs follow
 loopback (see [API network mode](#api-network-mode)), and `MEDIA_RUNTIME_CA` names a PEM CA when the
 runtime's certificate comes from a private CA. `MEDIA_RUNTIME_NAMESPACE` supplies a namespace
 only for a credential with a matching `allowed_namespaces` grant. Never put an integration token
-in a browser. All routes except coarse `/health` require bearer authentication; browser origins
+in a browser. Coarse `/health` and `/.well-known/media-runtime` are public; pairing redemption requires its
+single-use code. Other protected routes require bearer authentication; browser origins
 are refused unless `allowed_origins` lists them, and the server binds loopback unless configured
 for network mode with TLS.
 
@@ -168,7 +173,9 @@ media-runtime outputs export JOB_ID --directory ./exports   # JOB_ID-frames.zip,
   `frames.json` that must match the worker's record and the request (frame count, rate, size; one
   PNG per frame), so frames are never dropped or re-timed. When a worker advertises an encoded
   `video` output (`video/mp4`) it is required and committed too and exported as `.mp4`; the runtime
-  never encodes video, and Engine 0.6.0 and 0.7.0 do not produce one.
+  never encodes video. Protocol 1.4 reference workers with Engine's pinned `inference-video` extra
+  can encode MP4 when the request explicitly selects `encode_video: true`; the lossless archive
+  and poster remain the baseline.
 - The job, each operation and the manifest record the frame count, rate and duration
   (`frames / fps`) from the verified record (`media`); jobs with a video operation write manifest
   schema 5. The per-MIME `max_output_bytes` limit for the archive defaults to 256 MiB, and outputs
@@ -289,29 +296,31 @@ state the choice explicitly. A request for a backend other than the running one 
 leak prompts or grow without bound. Only this child can be terminated after the cancellation grace
 period; forced termination settles the job as `execution_interrupted`, not confirmed cancellation.
 
-The worker contract is [media-worker/1.3](https://github.com/jxburros/Media-Engine/blob/main/docs/protocol.md).
-Runtime 1.0.0 negotiates the highest minor the worker lists: Engine 0.6.0 and later give
-`media-worker/1.3` (video, and audio from Engine 0.7.0); Engine 0.4.0 gives `media-worker/1.2`
-with multiple outputs, upscaling, loaders, automatic settings, fallbacks and device identity;
-Engine 0.2.0 and later give `media-worker/1.1` with image-to-image and (Engine 0.3.0) LoRA adapters;
-Engine 0.1.0 gives `media-worker/1.0` with text-to-image only. Every 1.2 feature is refused with
-`unsupported` naming the field against an older worker. There is one
-active execution per worker and at most 32 queued jobs by default; all operational limits are in the config.
+The [worker contract](https://github.com/jxburros/Media-Engine/blob/main/docs/protocol.md)
+is negotiated at the highest mutually supported minor. Runtime 1.1.0 supports 1.0–1.4. Engine's
+Python workers advertise 1.4; the native worker advertises 1.3. Older workers keep their previous
+surface: 1.0 text-to-image, 1.1 image-to-image/LoRA, 1.2 batches/upscale/loaders/fallbacks,
+and 1.3 video/audio when the task is advertised. A higher-minor task or option is refused against
+an older worker. There is one active execution per worker and at most 32 queued jobs by default.
 Requested model, backend, seed, dimensions, precision and scheduler are never silently changed.
 
 ## Choosing a backend
 
-- `diffusers-sdxl`: the reference implementation; SDXL, ESRGAN, SVD and Stable Audio Open.
-- `owned-sdxl`: the owned Python SDXL pipeline and ESRGAN upscaler.
-- `native-sdxl`: the standalone Rust binary; SDXL text-to-image, image-to-image and LoRA.
-  It requires no Python installation on the serving host, binds loopback only, and currently
-  advertises no video, audio, upscaling or optimization support.
+- `diffusers-sdxl`: the reference Python implementation. Advertised families include SDXL,
+  ESRGAN, SVD, Stable Audio Open, FLUX.1-schnell and SD3.5 Medium when their dependencies are ready.
+  The backend ID remains unchanged as families are added.
+- `owned-sdxl`: the owned Python SDXL pipeline and ESRGAN upscaler; only its advertised sampler
+  and task surface is accepted.
+- `native-sdxl`: the standalone Rust SDXL binary, with text-to-image, image-to-image, batches and
+  LoRA. It needs no Python on the serving host. Loopback HTTP is the default; remote mode requires
+  mutual TLS. It does not advertise the reference worker's inpainting, additional families,
+  video/audio, upscaling or benchmark-gated optimizations.
 
-For native inference, set `worker.command` to the `media-engine-native` binary with
-`--catalog`, `--directory`, `--device` and `--port 0`, and set `worker.backend_id` to
-`native-sdxl`. See [the native configuration](examples/runtime.native.config.json).
-Select it per request with `--backend native-sdxl`; its load options use the `native-sdxl`
-namespace. The advertised capabilities still determine whether a request is accepted.
+For native inference, set `worker.command` to `media-engine-native` with `--catalog`,
+`--directory`, `--device` and `--port 0`, and set `worker.backend_id` to `native-sdxl`.
+See [the native configuration](examples/runtime.native.config.json). Select it per request with
+`--backend native-sdxl`; load options use the `native-sdxl` namespace. Always consult worker
+capabilities before selecting a task, family, sampler or conditioning component.
 
 ## Worker pool
 
@@ -462,17 +471,26 @@ Prompts remain private job data. Local state uses directory mode 0700 and file m
 
 ## Studio
 
-The companion Studio integration adds **Media Runtime (local SDXL)** to Settings → Runtimes.
-Connect to `http://127.0.0.1:7810` (or the runtime's `https://` address in network mode) with the dedicated Studio access key, then select the registered
-model in Create. Its gateway derives `studio:<scope digest>` namespaces from authenticated user
-and project context, preserves model routing, displays actual stage/step status, sends Stop to the
-runtime and imports verified output copies with provenance. Personal and project paths are the same.
+The companion [Studio PR](https://github.com/jxburros/AI-Server-Studio/pull/1979) adds
+**Media Runtime (Media Engine)** in Settings → Engines. Connect to Runtime with a dedicated
+Studio key granting `jobs.read`, `jobs.submit`, `models.read` and the intended `studio:*`
+namespace/model access. Its gateway derives `studio:personal:<user_id>` or
+`studio:project:<project_id>:<user_id>` namespaces from authenticated context; the browser never
+receives Runtime credentials.
+
+Create's workflow tab lists registered recipes, per-operation registered models and scoped PNG
+Library inputs in both personal and project views. It uses ordinary chore approval, cancellation
+and output import, verifies output size/SHA-256, and preserves Runtime's immutable manifest.
+Images, frame archives, posters, optional MP4 and audio are separate Studio-owned Library copies.
+The companion integration currently accepts local/LAN targets; its live-service walkthrough is
+separate from the HTTP adapter and UI tests.
 
 ## Gateway client
 
-Studio's typed entry point is the TypeScript package in [`gateway-client/`](gateway-client/README.md)
-(`@media-runtime/gateway-client`, no runtime dependencies). It is versioned with the service and
-speaks only the public API.
+[`gateway-client/`](gateway-client/README.md) provides the typed public HTTP client
+(`@media-runtime/gateway-client`, no runtime dependencies), versioned with the service. Studio's
+named adapter also implements the public HTTP contract behind its existing gateway boundary;
+applications never import Engine internals.
 
 ## Testbench
 

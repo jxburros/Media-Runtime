@@ -202,12 +202,12 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 					return err
 				}
 			}
-			if mime == "application/zip" {
+			if mime == "application/zip" || mime == "video/mp4" {
 				// The archive holds exactly the requested frames at the requested rate and size;
 				// frames are never dropped or re-timed.
 				for _, k := range []string{"width", "height", "frames", "fps"} {
 					if !jsonEqual(output.Get(k), params.Get(k)) {
-						return errors.New("frame archive differs from the request")
+						return errors.New("video output differs from the request")
 					}
 				}
 			}
@@ -221,7 +221,13 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 				return err
 			}
 			synced[filepath.Dir(file)] = true
-			if err := receive(client, "/v1/executions/"+op.Str("execution_id")+"/outputs/"+id, file, int64(limit), output, check); err != nil {
+			var receiveErr error
+			if op.Obj("cache") != nil {
+				receiveErr = r.receiveCached(job, op, output, file, int64(limit), check)
+			} else {
+				receiveErr = receive(client, "/v1/executions/"+op.Str("execution_id")+"/outputs/"+id, file, int64(limit), output, check)
+			}
+			if err := receiveErr; err != nil {
 				return err
 			}
 			if seeded && task == "text-to-image" {
@@ -291,6 +297,9 @@ func (r *Runtime) commitOutputs(client *worker.Client, job, snapshot *jsonv.Obje
 			if hasMedia(job) {
 				schema = 5
 			}
+			if job.Obj("recipe").Get("schema_version") == 3.0 || job.Obj("request").Bool("reuse_intermediates") {
+				schema = 6
+			}
 			manifest = r.linearManifest(job, schema)
 		} else {
 			job.Set("outputs", committed)
@@ -338,6 +347,10 @@ func receive(client *worker.Client, path, file string, limit int64, output *json
 		return err
 	}
 	defer res.Body.Close()
+	return receiveBody(res.Body, file, limit, output, check)
+}
+
+func receiveBody(body io.Reader, file string, limit int64, output *jsonv.Object, check c.Signature) error {
 	temp := file + ".tmp"
 	f, err := os.OpenFile(temp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -351,7 +364,7 @@ func receive(client *worker.Client, path, file string, limit int64, output *json
 		}
 	}()
 	digest := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, digest), io.LimitReader(res.Body, limit+1))
+	n, err := io.Copy(io.MultiWriter(f, digest), io.LimitReader(body, limit+1))
 	if err != nil {
 		return err
 	}
@@ -406,6 +419,14 @@ func (r *Runtime) manifest(job, op, snapshot *jsonv.Object, committed []any, sca
 	if mask := op.Obj("mask"); mask != nil {
 		inputs = append(inputs, manifestInput(mask).Set("role", "mask"))
 	}
+	if overlay := op.Obj("overlay"); overlay != nil {
+		inputs = append(inputs, manifestInput(overlay).Set("role", "overlay"))
+	}
+	for _, role := range []string{"control_image", "reference_image"} {
+		if input := op.Obj(role); input != nil {
+			inputs = append(inputs, manifestInput(input).Set("role", role))
+		}
+	}
 	var scaleValue any = jsonv.Absent
 	if op.Str("task") == "upscale" {
 		scaleValue = scale
@@ -422,6 +443,9 @@ func (r *Runtime) manifest(job, op, snapshot *jsonv.Object, committed []any, sca
 		"request", job.Get("request"),
 		"inputs", inputs,
 		"adapters", manifestAdapters(op),
+		"controlnets", manifestControlNets(op),
+		"control_image_from", jsonv.Maybe(op.Get("control_image_from")),
+		"conditioning", manifestConditioning(op),
 		"backend", backend,
 		"worker_id", nullish(job.Get("worker_id")),
 		"device_identity", nullish(backend.Get("device_identity")),
@@ -547,6 +571,20 @@ func (r *Runtime) linearManifest(job *jsonv.Object, schema float64) *jsonv.Objec
 				inputs = append(inputs, mask)
 			}
 		}
+		var overlay any = jsonv.Absent
+		if record := op.Obj("overlay"); record != nil {
+			overlay = manifestInput(record).Set("role", "overlay")
+			if !seen[record.Str("input_id")] {
+				seen[record.Str("input_id")] = true
+				inputs = append(inputs, overlay)
+			}
+		}
+		for _, role := range []string{"control_image", "reference_image"} {
+			if input := op.Obj(role); input != nil && !seen[input.Str("input_id")] {
+				seen[input.Str("input_id")] = true
+				inputs = append(inputs, manifestInput(input).Set("role", role))
+			}
+		}
 		var scale any = jsonv.Absent
 		if op.Str("task") == "upscale" {
 			scale = op.Obj("model").Get("scale")
@@ -560,8 +598,12 @@ func (r *Runtime) linearManifest(job *jsonv.Object, schema float64) *jsonv.Objec
 			"model", op.Obj("model").Get("bundle"),
 			"input", input,
 			"mask", mask,
+			"overlay", overlay,
 			"input_from", jsonv.Maybe(op.Get("input_from")),
 			"adapters", manifestAdapters(op),
+			"controlnets", manifestControlNets(op),
+			"control_image_from", jsonv.Maybe(op.Get("control_image_from")),
+			"conditioning", manifestConditioning(op),
 			"parameters", op.Get("parameters"),
 			"backend", backend,
 			"worker_id", nullish(op.Get("worker_id"), job.Get("worker_id")),
@@ -577,6 +619,15 @@ func (r *Runtime) linearManifest(job *jsonv.Object, schema float64) *jsonv.Objec
 			"execution_id", op.Get("execution_id"),
 			"outputs", op.Get("outputs"),
 		)
+		for _, role := range []string{"control_image", "reference_image"} {
+			if input := op.Obj(role); input != nil {
+				entry.Set(role, manifestInput(input).Set("role", role))
+			}
+		}
+		if schema >= 6 {
+			entry.Set("source_op_id", jsonv.Maybe(op.Get("source_op_id")))
+			entry.Set("cache", jsonv.Maybe(op.Get("cache")))
+		}
 		if schema >= 5 {
 			entry.Set("media", nullish(op.Get("media")))
 		}

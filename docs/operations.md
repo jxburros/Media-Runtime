@@ -61,8 +61,7 @@ JSON manifest to `downloads install MANIFEST --directory DIR`:
 ```
 
 The example deliberately cannot install until its real hash, revision, hosts and byte size are
-provided. Paths must be unique safe relative paths. Transfers check free space, resume `.part`
-files with HTTP ranges, verify complete size/SHA-256 and atomically publish. Existing mismatched
+provided. Paths must be unique safe relative paths without ancestor conflicts. Transfers check free space, resume manifest-keyed partials inside the private, ownership-marked `.media-runtime-downloads` directory with HTTP ranges, verify complete size/SHA-256 and atomically publish without overwriting concurrent files. That staging name is reserved; an existing unrelated directory or neighboring `.part` file is never adopted. Existing mismatched
 files are refused. URL user-info, non-HTTPS/custom-port destinations, private/reserved IPs,
 symlink destinations, and redirects outside the host allowlist are refused. DNS is resolved and
 pinned at connection time; a redirect is revalidated. Every allowed CDN hostname must be explicit.
@@ -98,3 +97,7 @@ Delivery has five persisted attempts with exponential backoff, ten-second reques
 public-address validation and no redirects. A crash can repeat an already-received event; this is
 at-least-once delivery, not exactly once. Exhausted attempts remain recorded in the private
 `webhooks.json` state file and are not retried indefinitely.
+
+When several configured workers reach their idle deadlines together, Runtime unloads the oldest eligible idle worker first, with worker ID as a stable tie breaker. A worker with active work, an eligible queued job, or an explicit latest `keep_loaded: true` is ineligible. An unload failure backs off that lane so it cannot block others. This is idle release, not memory-pressure eviction.
+
+GPU coexistence with JX or another service uses explicit operator-set per-service memory budgets for this release. Operators must size the combined budgets for the shared device. A cross-service GPU lease is deferred until both services agree on a shared protocol; Runtime does not unilaterally lock or kill another service's process.

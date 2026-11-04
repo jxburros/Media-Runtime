@@ -51,11 +51,18 @@ func ReadManifest(path string) (DownloadManifest, error) {
 	if err = decoder.Decode(&m); err != nil {
 		return m, err
 	}
+	var trailing any
+	if err = decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return m, errors.New("manifest must contain exactly one JSON document")
+	}
 	if m.SchemaVersion != 1 || len(m.Files) == 0 || len(m.AllowedHosts) == 0 {
 		return m, errors.New("manifest needs schema_version 1, files and allowed_hosts")
 	}
 	if m.Revision != "" && !revisionPattern.MatchString(m.Revision) {
 		return m, errors.New("revision must be an immutable 40-character commit")
+	}
+	if err := publicationPaths(m.Files); err != nil {
+		return m, err
 	}
 	seen := map[string]bool{}
 	for _, file := range m.Files {
@@ -172,11 +179,15 @@ func safeDestination(root, relative string) (string, error) {
 }
 
 // Download verifies every byte before atomic publication. Existing verified files are reused;
-// incomplete .part files resume, and files outside the explicit manifest are never touched.
+// incomplete downloads resume inside an explicitly reserved private staging directory.
+// User files outside the manifest, including neighboring .part files, are never touched.
 func Download(ctx context.Context, m DownloadManifest, directory string) error {
 	return download(ctx, m, directory, SafeClient(m.AllowedHosts))
 }
 func download(ctx context.Context, m DownloadManifest, directory string, client *http.Client) error {
+	if err := publicationPaths(m.Files); err != nil {
+		return err
+	}
 	root, err := filepath.Abs(directory)
 	if err != nil {
 		return err
@@ -205,6 +216,11 @@ func download(ctx context.Context, m DownloadManifest, directory string, client 
 	if uint64(needed)+64*1024*1024 > fs.Bavail*uint64(fs.Bsize) {
 		return errors.New("insufficient free disk space")
 	}
+	staging, lock, err := stagingArea(root, m)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	for _, item := range m.Files {
 		path, err := safeDestination(root, item.Path)
 		if err != nil {
@@ -220,8 +236,8 @@ func download(ctx context.Context, m DownloadManifest, directory string, client 
 		if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 			return err
 		}
-		partial := path + ".part"
-		if _, err = safeDestination(root, item.Path+".part"); err != nil {
+		partial, err := stagedFile(staging, item)
+		if err != nil {
 			return err
 		}
 		var offset int64
@@ -287,7 +303,11 @@ func download(ctx context.Context, m DownloadManifest, directory string, client 
 			os.Remove(partial)
 			return fmt.Errorf("SHA-256 mismatch for %s", item.Path)
 		}
-		if err = os.Rename(partial, path); err != nil {
+		// Hard-link publication is atomic and never replaces a concurrently created file.
+		if err = os.Link(partial, path); err != nil {
+			return err
+		}
+		if err = os.Remove(partial); err != nil {
 			return err
 		}
 		dir, err := os.Open(filepath.Dir(path))

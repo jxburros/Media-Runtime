@@ -39,6 +39,10 @@ type diffusersFamily struct {
 }
 
 var diffusersFamilies = map[string]diffusersFamily{
+	"flux-schnell": {pipeline: "text-to-image", class: "FluxPipeline", scheduler: "FlowMatchEulerDiscreteScheduler", schedulerName: "Flow match Euler",
+		roles: []string{"transformer", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2", "scheduler"}, weightRoles: []string{"transformer", "vae", "text_encoder", "text_encoder_2"}, required: []string{"tokenizer_2/tokenizer.json"}, unsupported: "A flux-schnell bundle is a local FluxPipeline directory"},
+	"sd35": {pipeline: "text-to-image", class: "StableDiffusion3Pipeline", scheduler: "FlowMatchEulerDiscreteScheduler", schedulerName: "Flow match Euler",
+		roles: []string{"transformer", "vae", "text_encoder", "text_encoder_2", "text_encoder_3", "tokenizer", "tokenizer_2", "tokenizer_3", "scheduler"}, weightRoles: []string{"transformer", "vae", "text_encoder", "text_encoder_2", "text_encoder_3"}, required: []string{"tokenizer_3/tokenizer.json"}, unsupported: "An sd35 bundle is a local StableDiffusion3Pipeline directory"},
 	"sdxl-base": {pipeline: "text-to-image", class: "StableDiffusionXLPipeline", scheduler: "EulerDiscreteScheduler", schedulerName: "Euler discrete", roles: ROLES, weightRoles: WEIGHT_ROLES,
 		unsupported: "Only SDXL base Diffusers bundles are supported"},
 	"svd": {pipeline: "image-to-video", class: "StableVideoDiffusionPipeline", scheduler: "EulerDiscreteScheduler", schedulerName: "Euler discrete",

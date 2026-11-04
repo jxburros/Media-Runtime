@@ -50,9 +50,9 @@ var OutputMIME = map[string]string{
 
 // TaskParameterInputs are the parameters a typed number input may bind to, per task.
 var TaskParameterInputs = map[string][]string{
-	"text-to-image":  {"width", "height", "steps", "guidance", "seed", "count"},
-	"image-to-image": {"steps", "guidance", "seed", "strength"},
-	"inpaint":        {"steps", "guidance", "seed", "strength"},
+	"text-to-image":  {"width", "height", "steps", "guidance", "seed", "count", "clip_skip"},
+	"image-to-image": {"steps", "guidance", "seed", "strength", "clip_skip"},
+	"inpaint":        {"steps", "guidance", "seed", "strength", "clip_skip"},
 	"upscale":        {"tile", "tile_overlap"},
 	"image-to-video": {"seed", "steps", "frames", "fps", "motion", "noise_augmentation", "decode_chunk"},
 	"text-to-audio":  {"seed", "steps", "guidance", "duration_seconds"},
@@ -115,6 +115,8 @@ var operationSchema = StrictObject(
 	Field{Name: "inputs", Check: keyed(inputNamePattern, binding)},
 	Field{Name: "defaults", Check: PartialParameters, Default: func() any { return jsonv.NewObject() }},
 	Field{Name: "adapters", Check: adapterList, Optional: true},
+	Field{Name: "controlnets", Check: controlnetList, Optional: true},
+	Field{Name: "conditioning", Check: ConditioningUses, Optional: true},
 )
 
 var publishPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}/[a-z][a-z0-9_]{0,31}$`)
@@ -173,6 +175,10 @@ func taskInputType(task, key string) string {
 		if UsesPrompt(task) {
 			return "string"
 		}
+	case "control_image", "reference_image":
+		if task == "text-to-image" {
+			return "image"
+		}
 	case "overlay":
 		if task == "image-transform" {
 			return "image"
@@ -212,7 +218,7 @@ func checkLinear(r *jsonv.Object, path []string) error {
 		if _, dup := ops[id]; dup {
 			return Invalid(at(here, "op_id"))
 		}
-		if op.Str("model_family") != TaskFamily(task) {
+		if !Contains(FAMILIES[op.Str("model_family")], task) {
 			return Invalid(at(here, "model_family"))
 		}
 		if !defaultsServe(task, op.Obj("defaults"), op.Has("adapters")) {
@@ -232,7 +238,7 @@ func checkLinear(r *jsonv.Object, path []string) error {
 				}
 				used[name] = true
 			case "op":
-				if key != "image" {
+				if key != "image" && key != "control_image" {
 					return Invalid(at(at(at(here, "inputs"), key), "from"))
 				}
 				producer, earlier := ops[name]
@@ -355,7 +361,7 @@ func NormalizeRecipe(recipe *jsonv.Object) *jsonv.Object {
 	}
 	task := recipe.Str("pipeline")
 	declared, bindings := jsonv.NewObject(), jsonv.NewObject()
-	for _, name := range []string{"prompt", "negative_prompt", "image"} {
+	for _, name := range []string{"prompt", "negative_prompt", "image", "mask", "overlay", "control_image", "reference_image"} {
 		switch {
 		case recipe.Obj("inputs").Has(name):
 			declared.Set(name, recipe.Obj("inputs").Get(name))
@@ -373,6 +379,8 @@ func NormalizeRecipe(recipe *jsonv.Object) *jsonv.Object {
 		"inputs", bindings,
 		"defaults", recipe.Get("defaults"),
 		"adapters", jsonv.Maybe(recipe.Get("adapters")),
+		"controlnets", jsonv.Maybe(recipe.Get("controlnets")),
+		"conditioning", jsonv.Maybe(recipe.Get("conditioning")),
 	)
 	out := jsonv.O(
 		"schema_version", 2.0,
@@ -451,7 +459,7 @@ var namedInputs = keyed(inputNamePattern, func(v any, path []string) (any, error
 
 // reservedInputs keep their schema-1 types in every recipe, so a submission using only these
 // names is validated exactly as before.
-var reservedInputs = map[string]string{"prompt": "string", "negative_prompt": "string", "image": "image", "mask": "image", "overlay": "image"}
+var reservedInputs = map[string]string{"prompt": "string", "negative_prompt": "string", "image": "image", "mask": "image", "overlay": "image", "control_image": "image", "reference_image": "image"}
 
 // submissionInputs accepts the schema-1 inputs exactly as before, else named schema-2 inputs
 // when the submission uses a name schema 1 does not know; otherwise the schema-1 error stands.

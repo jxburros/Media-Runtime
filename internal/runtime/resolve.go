@@ -25,9 +25,6 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 	if err := caller.CheckModels(body); err != nil {
 		return nil, err
 	}
-	if err := caller.CheckModels(body); err != nil {
-		return nil, err
-	}
 	namespace := caller.Namespace
 	request, err := c.Validate(c.Submission, body)
 	if err != nil {
@@ -40,6 +37,9 @@ func (r *Runtime) Resolve(body any, caller Caller) (*jsonv.Object, error) {
 	}
 	if recipe == nil {
 		return nil, c.Err(400, "unknown_recipe", "Recipe not found", "recipe_id")
+	}
+	if request.Bool("reuse_intermediates") && !c.IsLinear(recipe) {
+		return nil, c.Err(400, "invalid_request", "Intermediate reuse requires recipe schema 2 or 3", "reuse_intermediates")
 	}
 	if recipe, err = c.ExpandDAG(recipe, request); err != nil {
 		return nil, err
@@ -140,6 +140,17 @@ func (r *Runtime) resolveOn(m *pool.Member, p *worker.Probe, request, recipe, mo
 			}
 			plan.fromSize = [2]float64{width, height}
 		}
+		if from := plan.controlFrom; from != nil {
+			producer := resolved[int(from.index)]
+			width, _ := producer.Obj("parameters").Num("width")
+			height, _ := producer.Obj("parameters").Num("height")
+			if producer.Str("task") == "upscale" {
+				scale, _ := producer.Obj("model").Num("scale")
+				width *= scale
+				height *= scale
+			}
+			plan.controlSize = [2]float64{width, height}
+		}
 		op, err := r.resolveOperation(plan, request, w, caller)
 		if err != nil {
 			var job jobLevel
@@ -171,6 +182,10 @@ func (r *Runtime) resolveOn(m *pool.Member, p *worker.Probe, request, recipe, mo
 		"input", jsonv.Maybe(first.operation.Get("input")),
 		"mask", jsonv.Maybe(first.operation.Get("mask")),
 		"overlay", jsonv.Maybe(first.operation.Get("overlay")),
+		"control_image", jsonv.Maybe(first.operation.Get("control_image")),
+		"controlnets", first.operation.Get("controlnets"),
+		"reference_image", jsonv.Maybe(first.operation.Get("reference_image")),
+		"conditioning", first.operation.Get("conditioning"),
 		"adapters", first.operation.Get("adapters"),
 		"model", model,
 		"recipe", recipe,
@@ -191,13 +206,15 @@ type workerView struct {
 // operationPlan is one operation of a submission before resolution: its recipe operation, the
 // model selected for it, its task inputs, its parameter overrides and its adapters.
 type operationPlan struct {
-	op       *jsonv.Object
-	model    *jsonv.Object
-	inputs   *jsonv.Object
-	from     *binding
-	fromSize [2]float64
-	params   *jsonv.Object
-	uses     []any
+	op          *jsonv.Object
+	model       *jsonv.Object
+	inputs      *jsonv.Object
+	from        *binding
+	fromSize    [2]float64
+	controlFrom *binding
+	controlSize [2]float64
+	params      *jsonv.Object
+	uses        []any
 	// first is the operation the submission's model_id, parameters and adapters select.
 	first bool
 }
@@ -247,18 +264,21 @@ func (r *Runtime) linearPlans(recipe, request, model *jsonv.Object) ([]*operatio
 	}
 	ops := normalized.Arr("operations")
 	index := map[string]int{}
+	modelIDs := map[string]int{}
 	for i, raw := range ops {
 		op := raw.(*jsonv.Object)
 		index[op.Str("op_id")] = i
+		modelID := op.Str("op_id")
 		if source := op.Str("source_op_id"); source != "" {
-			if _, exists := index[source]; !exists {
-				index[source] = i
-			}
+			modelID = source
+		}
+		if _, exists := modelIDs[modelID]; !exists {
+			modelIDs[modelID] = i
 		}
 	}
 	models := request.Obj("models")
 	for _, opID := range models.Keys() {
-		if i, ok := index[opID]; !ok || i == 0 {
+		if i, ok := modelIDs[opID]; !ok || i == 0 {
 			return nil, c.Err(400, "invalid_request", "models names operations after the first; model_id selects the first", "models."+opID)
 		}
 	}
@@ -288,7 +308,11 @@ func (r *Runtime) linearPlans(recipe, request, model *jsonv.Object) ([]*operatio
 		for _, key := range bound.Keys() {
 			kind, name, output := c.Binding(bound.Obj(key))
 			if kind == "op" {
-				plan.from = &binding{index: float64(index[name]), opID: name, output: output}
+				if key == "control_image" {
+					plan.controlFrom = &binding{index: float64(index[name]), opID: name, output: output}
+				} else {
+					plan.from = &binding{index: float64(index[name]), opID: name, output: output}
+				}
 				continue
 			}
 			if !submitted.Has(name) {
@@ -545,6 +569,17 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 			return nil, c.Err(400, "unsupported", "The worker does not advertise this sampler/scheduler pair", "parameters.scheduler")
 		}
 	}
+	if family == "flux-schnell" || family == "sd35" {
+		if minor < 4 || effective.Str("sampler") != "flow-euler" || effective.Str("scheduler") != "flow-match" || effective.Has("preview_interval") {
+			return nil, c.Err(400, "unsupported", "This family requires flow-euler/flow-match without SDXL previews", "parameters")
+		}
+		guidance, _ := effective.Num("guidance")
+		if family == "flux-schnell" && (guidance != 0 || inputs.Str("negative_prompt") != "") {
+			return nil, c.Err(400, "unsupported", "FLUX.1-schnell requires guidance zero and no negative prompt", "parameters.guidance")
+		}
+	} else if effective.Str("sampler") == "flow-euler" {
+		return nil, c.Err(400, "unsupported", "Flow matching requires a DiT family", "parameters.sampler")
+	}
 	if task == "image-transform" {
 		iw, _ := imageDefaults.Num("width")
 		ih, _ := imageDefaults.Num("height")
@@ -552,7 +587,16 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 		oh, _ := effective.Num("height")
 		x, _ := effective.Num("x")
 		y, _ := effective.Num("y")
+		if effective.Str("operation") != "canny" && (effective.Has("threshold_low") || effective.Has("threshold_high")) {
+			return nil, forbidden("parameters.threshold_low", "Thresholds apply only to canny")
+		}
 		switch effective.Str("operation") {
+		case "canny":
+			low, hasLow := effective.Num("threshold_low")
+			high, hasHigh := effective.Num("threshold_high")
+			if !hasLow || !hasHigh || low >= high || ow != iw || oh != ih || effective.Has("filter") || effective.Has("x") || effective.Has("y") || effective.Has("background") || effective.Has("opacity") {
+				return nil, forbidden("parameters", "Canny requires ordered thresholds and unchanged image dimensions")
+			}
 		case "resize":
 			if !effective.Has("filter") || effective.Has("x") || effective.Has("y") || effective.Has("background") || effective.Has("opacity") {
 				return nil, forbidden("parameters", "Resize needs an explicit filter and no other operation settings")
@@ -647,7 +691,21 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 	if err != nil {
 		return nil, jobLevel{err}
 	}
+	controlnets, controlImage, err := r.resolveControlNets(plan, request, w, options, effective, caller)
+	if err != nil {
+		return nil, err
+	}
+	conditioning, referenceImage, err := r.resolveConditioning(plan, request, w, options, effective, caller)
+	if err != nil {
+		return nil, err
+	}
 	validateBody := jsonv.O("protocol", protocol, "bundle", bundle, "options", options)
+	if len(controlnets) > 0 {
+		validateBody.Set("controlnets", controlnets)
+	}
+	if len(conditioning) > 0 {
+		validateBody.Set("conditioning", conditioning)
+	}
 	if len(adapters) > 0 {
 		validateBody.Set("adapters", adapters)
 	}
@@ -694,14 +752,24 @@ func (r *Runtime) resolveOperation(plan *operationPlan, request *jsonv.Object, w
 	if plan.from != nil {
 		from = jsonv.O("op_id", plan.from.opID, "output_id", plan.from.output)
 	}
+	var controlFrom any = jsonv.Absent
+	if plan.controlFrom != nil {
+		controlFrom = jsonv.O("op_id", plan.controlFrom.opID, "output_id", plan.controlFrom.output)
+	}
 	operation := jsonv.O(
 		"op_id", op.Get("op_id"),
+		"source_op_id", jsonv.Maybe(op.Get("source_op_id")),
 		"task", task,
 		"state", "pending",
 		"model", model,
 		"input", jsonv.Maybe(input),
 		"mask", jsonv.Maybe(mask),
 		"overlay", jsonv.Maybe(overlay),
+		"control_image", jsonv.Maybe(controlImage),
+		"control_image_from", controlFrom,
+		"controlnets", controlnets,
+		"reference_image", jsonv.Maybe(referenceImage),
+		"conditioning", conditioning,
 		"input_from", from,
 		"inputs", inputs,
 		"adapters", adapters,

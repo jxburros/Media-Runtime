@@ -57,7 +57,7 @@ func wav(rate, channels, samples int) []byte {
 func TestAudioGeneratesAClipFromAPrompt(t *testing.T) {
 	e := bootAudio(t)
 	ok := must[*jsonv.Object](t)
-	equal(t, get(ok(e.client.Health()), "worker", "protocol"), "media-worker/1.3")
+	equal(t, get(ok(e.client.Health()), "worker", "protocol"), c.PROTOCOLS[len(c.PROTOCOLS)-1])
 	detail := must[any](t)(e.client.Model("stable-audio", false)).(*jsonv.Object)
 	equal(t, detail.Get("family"), "stable-audio-open")
 	equal(t, detail.Get("tasks"), []any{"text-to-audio"})
