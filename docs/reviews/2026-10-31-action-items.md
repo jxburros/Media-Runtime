@@ -17,7 +17,7 @@ Items marked **(decision)** wait on a decision in section D.
 
 ## A. P0: prove it works
 
-- [ ] **A1. Continuous integration.** Add `.github/workflows/ci.yml` running:
+- [x] **A1. Continuous integration.** Add `.github/workflows/ci.yml` running:
   - `go vet ./...` and `go test -race ./...`, with Media-Engine checked out beside the repository at
     a pinned commit, so the integration suites drive its `tests/serve_fixture.py`
   - `npm ci && npm run build` in `gateway-client/`

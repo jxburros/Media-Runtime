@@ -1,19 +1,24 @@
 # Changelog
 
-## 1.1.0 — 2026-11-04 (development)
+## 1.1.0 — 2026-11-04
 
-Accept native-sdxl and preserve engine ownership in provenance. Add real-backend acceptance
-tests; managed scoped API keys, rate/queue limits, audit, metrics, discovery, diagnostics and
-pairing; managed process/service/catalog/folder operations; explicit pinned acquisition and
-signed completion callbacks; a Python client; offline ComfyUI subset import; shared release
-packaging and CI/GPU jobs. Split the core into admission, resolution, dispatch, outputs and
-diagnostics modules. Protocol1.4 generation and schema3 recipes are in development.
+Complete native worker acceptance with real tiny-weight reference, owned and native
+integration tests. Add managed scoped API keys, admission/rate limits, audit,
+pairing, metrics, diagnostics, discovery and generated OpenAPI. Add watched folders,
+owned-worker catalogs, managed stdio/systemd lifecycle, pinned acquisition/installers,
+orphan protection, idle unloading and signed allowlisted completion webhooks.
 
-Validation so far: gateway build and targeted standard-library Go/Python tests pass. A
-compile-only Go overlay passed with the unavailable SQLite driver omitted; this is not Runtime
-execution validation. Full local Go tests are blocked by this session's network policy on Go
-module storage. Hosted CI runs the real dependency set. GPU jobs are prepared, not executed.
-The broader review backlog and final integration remain in development in this PR.
+Consume protocol 1.4 sampling, new image families, inpainting, ControlNet,
+conditioning, previews, pixel operations and verified MP4 outputs. Add schema-3
+DAG/fanout/foreach recipes, scoped opt-in intermediate reuse, explicit hires-fix and
+outpaint recipes, Python/TypeScript clients and offline ComfyUI subset import.
+Split the service core by responsibility and integrate Studio's Runtime adapter.
+
+Hosted full Go race/integration checks, client builds and release packaging supply
+SQLite-dependent validation that the local environment's download policy blocks.
+See [the compatibility record](docs/compatibility.md) for exact tested commits and
+job links. GPU jobs are prepared without claiming hardware acceptance; cross-service
+GPU coexistence uses operator budgets pending a jointly adopted lease protocol.
 
 ## 0.10.0 — 2026-10-31
 
