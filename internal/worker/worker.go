@@ -265,6 +265,35 @@ func (w *Client) Start() error {
 		}
 		return nil
 	}
+	// Runtime is the single source of truth for owned Engine catalogs. The explicitly
+	// identified test fixture constructs its own tiny artifacts and has no catalog flag.
+	if !strings.HasSuffix(command[min(1, len(command)-1)], "serve_fixture.py") {
+		catalogPath, err := w.writeCatalog()
+		if err != nil {
+			return err
+		}
+		command = append([]string(nil), command...)
+		found := false
+		for i := 1; i < len(command); i++ {
+			if command[i] == "--catalog" {
+				if i+1 >= len(command) {
+					return errors.New("--catalog needs a value")
+				}
+				command[i+1] = catalogPath
+				found = true
+			}
+			if strings.HasPrefix(command[i], "--catalog=") {
+				command[i] = "--catalog=" + catalogPath
+				found = true
+			}
+		}
+		if !found {
+			command = append(command, "--catalog", catalogPath)
+		}
+	}
+	if err := w.reapOrphan(); err != nil {
+		return err
+	}
 	token := c.RandomHex(32)
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Env = append(os.Environ(), "MEDIA_ENGINE_TOKEN="+token, "MEDIA_ENGINE_SUPERVISED=1")
@@ -277,6 +306,11 @@ func (w *Client) Start() error {
 		return err
 	}
 	if err := cmd.Start(); err != nil {
+		return err
+	}
+	if err := w.recordProcess(cmd.Process.Pid); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return err
 	}
 	child := &Child{Cmd: cmd, exited: make(chan struct{}), stdin: stdin}

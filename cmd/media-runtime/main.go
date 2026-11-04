@@ -29,7 +29,7 @@ import (
 
 const help = `Media Runtime %s (Go)
 
-media-runtime serve --config runtime.config.json
+media-runtime serve --config runtime.config.json [--managed --port 0]
 media-runtime doctor [--json]
 media-runtime models inspect [HANDLE] | models register model.json | models list | models show MODEL [--verify]
 media-runtime recipes register recipe.json | recipes list | recipes inspect portrait
@@ -38,9 +38,17 @@ media-runtime inputs upload image.png | inputs list | inputs delete INPUT
 media-runtime run RECIPE --model MODEL [--prompt TEXT] [--image FILE|INPUT] [--strength S] [--adapter ID[:SCALE]]... [--seed N] [--count N]
                    [--tile N] [--tile-overlap N] [--frames N] [--fps N] [--motion N] [--noise-augmentation X]
                    [--decode-chunk N] [--duration SECONDS] [--precision P|auto] [--fallback cpu|lower_precision]...
-                   [--model-for OP=MODEL]... [--input NAME=VALUE]... [--worker ID] [--wait] [--json]
+                   [--model-for OP=MODEL]... [--input NAME=VALUE]... [--worker ID] [--keep-loaded] [--wait] [--json]
 media-runtime jobs list [--worker ID] | jobs watch JOB | jobs cancel JOB | jobs retry JOB
 media-runtime workers list
+media-runtime keys create POLICY.json | keys list | keys revoke KEY_ID
+media-runtime pairing create POLICY.json | pairing redeem CODE
+media-runtime diagnostics export FILE.json
+media-runtime folders add PATH | folders list | folders remove FOLDER_ID
+media-runtime service install|uninstall|status --instance NAME --config FILE
+media-runtime downloads install MANIFEST --directory DIR
+media-runtime engine install MANIFEST --directory DIR
+media-runtime update [MANIFEST]  # check only
 media-runtime outputs export JOB --directory DIR
 media-runtime tui
 
@@ -60,17 +68,19 @@ func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(v string) error { *m = append(*m, v); return nil }
 
 type options struct {
-	strings   map[string]*string
-	set       map[string]bool
-	adapters  multi
-	fallbacks multi
-	modelFor  multi
-	inputs    multi
-	wait      bool
-	json      bool
-	verify    bool
-	help      bool
-	version   bool
+	strings    map[string]*string
+	set        map[string]bool
+	adapters   multi
+	fallbacks  multi
+	modelFor   multi
+	inputs     multi
+	wait       bool
+	json       bool
+	verify     bool
+	help       bool
+	managed    bool
+	keepLoaded bool
+	version    bool
 }
 
 func (o *options) get(name string) (string, bool) { return *o.strings[name], o.set[name] }
@@ -80,7 +90,7 @@ func parse(args []string) (*options, []string, error) {
 	o := &options{strings: map[string]*string{}, set: map[string]bool{}}
 	fs := flag.NewFlagSet("media-runtime", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	for _, name := range []string{"config", "model", "prompt", "negative-prompt", "image", "strength", "seed", "width", "height", "steps", "guidance", "precision", "backend", "directory", "idempotency-key", "count", "tile", "tile-overlap", "worker", "frames", "fps", "motion", "noise-augmentation", "decode-chunk", "duration"} {
+	for _, name := range []string{"config", "model", "prompt", "negative-prompt", "image", "strength", "seed", "width", "height", "steps", "guidance", "precision", "backend", "directory", "idempotency-key", "count", "tile", "tile-overlap", "worker", "frames", "fps", "motion", "noise-augmentation", "decode-chunk", "duration", "port", "instance"} {
 		o.strings[name] = fs.String(name, "", "")
 	}
 	fs.Var(&o.adapters, "adapter", "")
@@ -91,6 +101,8 @@ func parse(args []string) (*options, []string, error) {
 	fs.BoolVar(&o.json, "json", false, "")
 	fs.BoolVar(&o.verify, "verify", false, "")
 	fs.BoolVar(&o.help, "help", false, "")
+	fs.BoolVar(&o.keepLoaded, "keep-loaded", false, "")
+	fs.BoolVar(&o.managed, "managed", false, "")
 	fs.BoolVar(&o.version, "version", false, "")
 	var positionals []string
 	for {
@@ -151,10 +163,13 @@ func run(argv []string) error {
 	}
 	if args[0] == "serve" {
 		configPath, _ := values.get("config")
-		return serve(configPath)
+		return serveOptions(configPath, values)
+	}
+	if handled, err := localOperations(args, values); handled {
+		return err
 	}
 	token := os.Getenv("MEDIA_RUNTIME_TOKEN")
-	if token == "" {
+	if token == "" && !(len(args) > 1 && args[0] == "pairing" && args[1] == "redeem") {
 		return errors.New("Set MEDIA_RUNTIME_TOKEN")
 	}
 	base := os.Getenv("MEDIA_RUNTIME_URL")
@@ -171,6 +186,20 @@ func run(argv []string) error {
 		} else {
 			fmt.Println(string(jsonv.Indent(v)))
 		}
+	}
+	if handled, result, err := securityCommand(cl, args); handled {
+		if err != nil {
+			return err
+		}
+		print(result)
+		return nil
+	}
+	if handled, result, err := remoteOperations(cl, args); handled {
+		if err != nil {
+			return err
+		}
+		print(result)
+		return nil
 	}
 	at := func(i int) string {
 		if i < len(args) {
@@ -450,6 +479,9 @@ func runJob(cl *client.Client, values *options, recipe string, print func(any), 
 		body.Set("model_id", model)
 	}
 	body.Set("inputs", inputs).Set("parameters", parameters)
+	if values.set["keep-loaded"] {
+		body.Set("keep_loaded", values.keepLoaded)
+	}
 	if len(values.adapters) > 0 {
 		list := []any{}
 		for _, entry := range values.adapters {
@@ -564,10 +596,20 @@ func export(cl *client.Client, jobID, target string, print func(any)) error {
 }
 
 // serve owns the state directory through an exclusive lock file until SIGINT or SIGTERM.
-func serve(configPath string) error {
+func serve(configPath string) error { return serveOptions(configPath, nil) }
+
+func serveOptions(configPath string, options *options) error {
 	cfg, err := config.Read(configPath)
 	if err != nil {
 		return err
+	}
+	managed := options != nil && options.managed
+	if options != nil && options.set["port"] {
+		port, err := strconv.Atoi(*options.strings["port"])
+		if err != nil || port < 0 || port > 65535 {
+			return errors.New("port must be 0–65535")
+		}
+		cfg.Port = port
 	}
 	// Refuse unusable API TLS material before any worker is started.
 	if cfg.TLS != nil {
@@ -594,9 +636,15 @@ func serve(configPath string) error {
 			return
 		}
 		closed = true
+		if managed {
+			fmt.Println(`{"type":"stopping","service":"media-runtime"}`)
+		}
 		server.Close()
 		rt.Stop()
 		os.Remove(lockPath)
+		if managed {
+			fmt.Println(`{"type":"stopped","service":"media-runtime"}`)
+		}
 	}
 	if err := rt.Start(); err != nil {
 		shutdown()
@@ -611,15 +659,23 @@ func serve(configPath string) error {
 		fingerprint = f
 	}
 	fmt.Println(string(jsonv.MustMarshal(jsonv.O("service", "media-runtime", "version", c.VERSION, "port", float64(server.Port()),
-		"scheme", server.Scheme(), "bind", cfg.Bind, "certificate_sha256", fingerprint))))
+		"scheme", server.Scheme(), "bind", cfg.Bind, "certificate_sha256", fingerprint, "type", "ready"))))
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	parentClosed := make(chan struct{})
+	if managed {
+		go func() { _, _ = io.Copy(io.Discard, os.Stdin); close(parentClosed) }()
+	}
 	cleanup := time.NewTicker(time.Minute)
 	defer cleanup.Stop()
 	for {
 		select {
 		case <-cleanup.C:
 			_ = rt.Cleanup()
+		case <-parentClosed:
+			shutdown()
+			return nil
 		case <-signals:
 			shutdown()
 			return nil

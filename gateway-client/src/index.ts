@@ -60,16 +60,18 @@ export type Submission = {
     duration_seconds?: number;
   };
   adapters?: { adapter_id: string; scale?: number }[];
-  backend_id?: "diffusers-sdxl" | "owned-sdxl";
+  backend_id?: "diffusers-sdxl" | "owned-sdxl" | "native-sdxl";
   backend_options?: Record<
     string,
-    { precision?: "float16" | "float32" | "auto"; attention?: "sdpa"; offload?: "none" }
+    { precision?: "float16" | "float32" | "auto"; attention?: "sdpa"; offload?: "none" | "model" | "sequential" }
   >;
   /** Forwarded only for credentials configured with allow_fallbacks. */
   authorized_fallbacks?: Fallback[];
   retry_of?: string;
   /** Pins the job to one configured worker of the pool; it waits for that worker. */
   worker_id?: string;
+  /** Prevent idle unloading until a later job changes this hint. */
+  keep_loaded?: boolean;
 };
 
 /** The device a 1.2 worker reports; host, device and index name it, pid is the process. */

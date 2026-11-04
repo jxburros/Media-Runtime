@@ -1,40 +1,40 @@
 ---
 document_type: product_specification
-status: draft_proposal
-spec_revision: 0.2.0
+status: implemented_with_validation_gates
+spec_revision: 1.1.0
 created_at: 2026-10-26
-updated_at: 2026-10-26
+updated_at: 2026-11-04
 working_name: Media Runtime
 ---
 
 # Media Runtime Specification
 
-Media Runtime is a standalone local media service operated through a CLI, an optional terminal dashboard, or an application API. It turns supported generation recipes into durable jobs and supervises replaceable inference workers. AI Server Studio connects through its existing media-runtime abstraction.
+Media Runtime is a standalone local media service operated through a CLI, an optional terminal dashboard, or an application API. It turns supported generation recipes into durable jobs and supervises replaceable inference workers. AI Server Studio connects through its media-runtime adapter. The product target is ComfyUI-class image, video and audio generation through durable jobs and declarative recipes, with verified outputs and no executable plugins; it does not implement the ComfyUI wire protocol.
 
-This specification describes proposed behavior. `MUST` defines a required behavior within its stated delivery stage; later stages are not requirements for the first increment. The companion [Media Engine Specification](engine-spec.md) owns the worker protocol.
+This specification describes the implemented contract and its validation gates. `MUST` defines a required behavior within its stated delivery stage; later stages are not requirements for the first increment. The companion [Media Engine Specification](https://github.com/jxburros/Media-Engine/blob/main/engine-spec.md) owns the worker protocol.
 
 ## Delivery status
 
 Revision 0.1.0 described the first complete path and listed image-to-image, LoRA, upscaling, multiple GPUs, distributed workers, video, audio and a terminal dashboard as later capabilities. Runtime 0.3.0 delivers the first complete path, the operator-experience stage (dashboard, diagnostics, installation workflow) and image-to-image and LoRA from the additional-operations stage. Revision 0.2.0 specifies every remaining deferred capability with its stage, worker-protocol dependency and acceptance rules. The [implementation plan](docs/implementation-plan.md) orders the work.
 
-| Capability                                        | Stage                       | Needs protocol | Status in Runtime 0.3.0 |
+| Capability                                        | Stage                       | Needs protocol | Status in Runtime 1.1.0 |
 | ------------------------------------------------- | --------------------------- | -------------- | ----------------------- |
 | CLI/API, durable FIFO jobs, Diffusers worker      | First complete path         | 1.0            | Delivered               |
 | Terminal dashboard, doctor, installation workflow | Operator experience         | 1.1            | Delivered               |
 | Image-to-image, LoRA adapters, owned backend      | Additional media operations | 1.1            | Delivered               |
-| Multiple outputs per job                          | Additional media operations | 1.2            | Specified below         |
-| Upscaling                                         | Additional media operations | 1.2            | Specified below         |
-| Single-file checkpoint conversion workflow        | Operator experience         | 1.2            | Specified below         |
-| Automatic settings and authorized fallbacks       | Additional media operations | 1.2            | Specified below         |
-| Linear typed recipes                              | Additional media operations | 1.2            | Specified below         |
-| Multiple GPUs through a worker pool               | Broader execution           | 1.2            | Specified below         |
-| Distributed workers and network modes             | Broader execution           | 1.2            | Specified below         |
-| Video                                             | Broader execution           | 1.3            | Specified below         |
-| Audio                                             | Broader execution           | 1.3            | Specified below         |
-| Owned native engine as a selectable backend       | Owned inference engine      | 1.x            | Specified below         |
-| Go rewrite of the service at 0.3.0 parity         | Operator experience         | 1.1            | Specified below         |
+| Multiple outputs per job                          | Additional media operations | 1.2            | Delivered (fixture-tested) |
+| Upscaling                                         | Additional media operations | 1.2            | Delivered (fixture-tested) |
+| Single-file checkpoint conversion workflow        | Operator experience         | 1.2            | Delivered (fixture-tested) |
+| Automatic settings and authorized fallbacks       | Additional media operations | 1.2            | Delivered (fixture-tested) |
+| Linear typed recipes                              | Additional media operations | 1.2            | Delivered (fixture-tested) |
+| Multiple GPUs through a worker pool               | Broader execution           | 1.2            | Delivered (fixture-tested) |
+| Distributed workers and network modes             | Broader execution           | 1.2            | Delivered (fixture-tested) |
+| Video                                             | Broader execution           | 1.3            | Delivered (fixture-tested) |
+| Audio                                             | Broader execution           | 1.3            | Delivered (fixture-tested) |
+| Owned native engine as a selectable backend       | Owned inference engine      | 1.x            | Delivered (fixture-tested) |
+| Go rewrite of the service at 0.3.0 parity         | Operator experience         | 1.1            | Delivered (fixture-tested) |
 
-Arbitrary ComfyUI graph import, executable recipe code and a plugin marketplace remain outside the design. Existing Studio ComfyUI support remains a separate option.
+Arbitrary ComfyUI graph execution, executable recipe code and a plugin marketplace remain outside the design. An offline translator may accept a documented subset of API-format workflows, producing ordinary validated recipes; unknown nodes are refused. Existing Studio ComfyUI support remains a separate option.
 
 The service implementation language changes before the deferred capabilities are built: Runtime 0.4.0 rewrites the 0.3.0 TypeScript service in Go at exact parity, and every later stage is implemented in Go. The public API, configuration, state directory, manifests and CLI are unchanged by the rewrite; see [Implementation language](#implementation-language).
 
@@ -43,12 +43,12 @@ The service implementation language changes before the deferred capabilities are
 | Property                 | Proposed specification                                                                       |
 | ------------------------ | -------------------------------------------------------------------------------------------- |
 | Primary users            | Local AI server owners, SSH operators, application developers                                |
-| Delivered tasks          | Text-to-image and image-to-image on one explicitly supported SDXL base pipeline, with LoRA   |
-| Planned tasks            | Upscaling, image-to-video, text-to-audio and linear recipes that chain them                  |
+| Delivered tasks          | Text-to-image, image-to-image, upscaling, video and audio; SDXL LoRA; linear recipes   |
+| Further work             | See the dated cross-repo review action items                  |
 | Interfaces               | CLI, HTTP API and terminal dashboard                                                         |
 | Runtime implementation   | Small Go service shipped as one static binary; the 0.3.0 TypeScript service is its parity oracle |
 | First inference backend  | Isolated Python worker using pinned Diffusers and PyTorch                                    |
-| Future inference backend | Project-owned Media Engine implementing the same worker protocol                             |
+| Native inference backend | Project-owned Media Engine implementing the same worker protocol                             |
 | Persistence              | Local SQLite job metadata; local files for assets and run manifests                          |
 | Scheduling               | One active generation per configured worker; bounded FIFO queue; one worker per device       |
 | Default connectivity     | Loopback, authenticated local clients; no telemetry; explicit TLS network mode               |
@@ -183,7 +183,7 @@ Errors return `error.code`, a readable `error.message`, optional `error.field`, 
 
 ## Dependency policy
 
-The runtime relies on other libraries and services as little as is practical. Standard library first. A third-party dependency is accepted only when it does something unsafe or impractical to own (SQLite durability, TLS), is pinned by checksum, and is isolated in one package so it can be replaced. Adding one is a recorded decision in [docs/decisions.md](docs/decisions.md), which keeps a ledger of every dependency with its justification. From 0.4.0 the service binary carries one third-party module, the SQLite driver; HTTP, SSE, TLS, JSON, the CLI and the terminal dashboard are standard library and owned code. No external service is used: no telemetry, no downloads, no registries.
+The runtime relies on other libraries and services as little as is practical. Standard library first. A third-party dependency is accepted only when it does something unsafe or impractical to own (SQLite durability, TLS), is pinned by checksum, and is isolated in one package so it can be replaced. Adding one is a recorded decision in [docs/decisions.md](docs/decisions.md), which keeps a ledger of every dependency with its justification. From 0.4.0 the service binary carries one third-party module, the SQLite driver; HTTP, SSE, TLS, JSON, the CLI and the terminal dashboard are standard library and owned code. Serving never downloads weights or contacts a model registry, and telemetry remains prohibited. Explicit operator commands may acquire pinned artifacts with per-file SHA-256 verification. Completion webhooks are opt-in signed requests to operator-approved destinations, never arbitrary job-supplied URLs.
 
 ## Storage and access
 
@@ -323,4 +323,4 @@ Later stages extend the adapter rather than the gateway contract: multiple outpu
 
 Record final product/repository names, the exact reference model and hardware, dependency pins, supported Go/Python versions and distribution licenses. The control plane is Go from 0.4.0 (the 0.1.0 proposal of a TypeScript control plane was implemented through 0.3.0 and is superseded); the isolated Python worker remains until Engine's native backend exists. Select concrete queue, storage and cancellation defaults and publish them as configuration rather than unexplained hard limits.
 
-For the deferred stages, record before each starts: the per-MIME output limits, the pool scheduling tie-break when several idle workers match, the TLS material format and rotation expectations for remote workers and API network mode, the video and audio reference bundles and their licenses, and the retention rule for intermediate operation outputs. The next implementation step is the Go rewrite at 0.3.0 parity, then protocol 1.2 support (multiple outputs, upscaling, conversion provenance, automatic settings and fallbacks) followed by linear typed recipes; the [implementation plan](docs/implementation-plan.md) sequences the rest.
+For the deferred stages, record before each starts: the per-MIME output limits, the pool scheduling tie-break when several idle workers match, the TLS material format and rotation expectations for remote workers and API network mode, the video and audio reference bundles and their licenses, and the retention rule for intermediate operation outputs. Phases R0–R7 in the [implementation plan](docs/implementation-plan.md) are implemented. CPU and fixture evidence is recorded separately from the outstanding GPU and real-weight acceptance gates. The [review action items](docs/reviews/2026-10-31-action-items.md) track the subsequent development work.

@@ -10,9 +10,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	c "github.com/jxburros/media-runtime/internal/contracts"
 	"github.com/jxburros/media-runtime/internal/jsonv"
+	"github.com/jxburros/media-runtime/internal/operations"
 )
 
 type Credential struct {
@@ -53,7 +55,8 @@ type Worker struct {
 	// Device is the device the operator expects; informational until the probe confirms it.
 	Device string
 	// MemoryBudgetMB is the operator's per-worker budget (0 when unset); informational.
-	MemoryBudgetMB int
+	MemoryBudgetMB    int
+	IdleUnloadMinutes float64
 	// Remote is an https:// worker: spoken to over mutual TLS and never owned.
 	Remote bool
 	// TLS is the remote worker's client certificate, CA and optional pin; nil for loopback HTTP.
@@ -83,7 +86,8 @@ type ServerTLS struct {
 const DefaultWorkerID = "default"
 
 type Config struct {
-	Port int
+	catalogMu sync.RWMutex
+	Port      int
 	// Bind is the API's listen address, an IP address (default 127.0.0.1).
 	Bind string
 	// TLS serves the API over HTTPS; Parse requires it when Bind is not loopback.
@@ -113,6 +117,7 @@ type Config struct {
 	// AllowReordering lets a later queued job run on a free worker the FIFO head cannot use.
 	AllowReordering bool
 	Tokens          []Token
+	Webhooks        []operations.WebhookConfig
 }
 
 // Pool is the configured workers in order: Workers, or the single legacy Worker as "default".
@@ -140,7 +145,30 @@ func DefaultOutputLimits() map[string]int {
 func (cfg *Config) OutputLimit(mime string) int { return cfg.MaxOutputBytes[mime] }
 
 // Catalog returns the configured directory for a handle, or "".
-func (cfg *Config) Catalog(handle string) string { return cfg.ArtifactCatalog.Str(handle) }
+func (cfg *Config) Catalog(handle string) string {
+	cfg.catalogMu.RLock()
+	defer cfg.catalogMu.RUnlock()
+	return cfg.ArtifactCatalog.Str(handle)
+}
+
+func (cfg *Config) CatalogSnapshot() *jsonv.Object {
+	cfg.catalogMu.RLock()
+	defer cfg.catalogMu.RUnlock()
+	return cfg.ArtifactCatalog.Clone()
+}
+
+// AddArtifacts publishes a whole scan atomically; configured handles cannot be replaced.
+func (cfg *Config) AddArtifacts(entries map[string]string) {
+	cfg.catalogMu.Lock()
+	defer cfg.catalogMu.Unlock()
+	next := cfg.ArtifactCatalog.Clone()
+	for handle, path := range entries {
+		if !next.Has(handle) {
+			next.Set(handle, path)
+		}
+	}
+	cfg.ArtifactCatalog = next
+}
 
 var positive = c.Num(c.NumOpts{Int: true, GreaterThan: c.F(0)})
 
@@ -177,6 +205,10 @@ var schema = c.StrictObject(
 	c.Field{Name: "workers", Check: c.Array(workerEntry(true), c.ArrOpts{Min: 1}), Optional: true},
 	c.Field{Name: "strict_devices", Check: c.Bool(), Default: def(true)},
 	c.Field{Name: "allow_reordering", Check: c.Bool(), Default: def(false)},
+	c.Field{Name: "webhooks", Check: c.Array(c.StrictObject(
+		c.Field{Name: "url", Check: nonEmpty}, c.Field{Name: "secret_env", Check: nonEmpty},
+		c.Field{Name: "allowed_hosts", Check: c.Array(nonEmpty, c.ArrOpts{Min: 1})},
+	), c.ArrOpts{Max: 16}), Optional: true},
 )
 
 // workerEntry is one worker's fields; a pool entry must name its worker_id, the legacy single
@@ -193,6 +225,7 @@ func workerEntry(pool bool) c.Check {
 		c.Field{Name: "backend_id", Check: c.Enum(c.BACKENDS...), Optional: true},
 		c.Field{Name: "device", Check: c.Str(c.StrOpts{Min: 1, Max: 80}), Optional: true},
 		c.Field{Name: "memory_budget_mb", Check: positive, Optional: true},
+		c.Field{Name: "idle_unload_minutes", Check: c.Num(c.NumOpts{GreaterThan: c.F(0)}), Optional: true},
 		c.Field{Name: "tls", Check: c.StrictObject(
 			c.Field{Name: "ca_file", Check: nonEmpty},
 			c.Field{Name: "cert_file", Check: nonEmpty},
@@ -295,6 +328,7 @@ func workers(parsed *jsonv.Object, cfg *Config) error {
 				PinnedSHA256: strings.ToLower(t.Str("pinned_sha256"))}
 			w.RemoteTimeoutMS = num(o, "remote_timeout_ms")
 		}
+		w.IdleUnloadMinutes, _ = o.Num("idle_unload_minutes")
 		if ids[w.WorkerID] {
 			return fmt.Errorf("Worker IDs must be unique: %s", w.WorkerID)
 		}
@@ -402,6 +436,17 @@ func Parse(raw any, env func(string) string) (*Config, error) {
 	for _, raw := range parsed.Arr("allowed_origins") {
 		origin, _ := NormalizeOrigin(raw.(string))
 		cfg.AllowedOrigins = append(cfg.AllowedOrigins, origin)
+	}
+	for _, raw := range parsed.Arr("webhooks") {
+		value := raw.(*jsonv.Object)
+		entry := operations.WebhookConfig{URL: value.Str("url"), Secret: env(value.Str("secret_env"))}
+		if len(entry.Secret) < 32 {
+			return nil, fmt.Errorf("Set %s to at least 32 random characters", value.Str("secret_env"))
+		}
+		for _, host := range value.Arr("allowed_hosts") {
+			entry.AllowedHosts = append(entry.AllowedHosts, host.(string))
+		}
+		cfg.Webhooks = append(cfg.Webhooks, entry)
 	}
 	seen := map[string]bool{}
 	for _, raw := range parsed.Arr("credentials") {

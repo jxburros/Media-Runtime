@@ -65,7 +65,7 @@ goroutine per worker, mutual TLS from the standard library), so the rewrite land
 
 ### R0.1 Stack and layout
 
-- Go 1.23 or later; a single static binary `media-runtime` with no cgo. Module layout:
+- Go 1.24 or later; a single static binary `media-runtime` with no cgo. Module layout:
   `cmd/media-runtime` (CLI entry), `internal/contracts` (request/recipe/registration shapes and
   strict validation), `internal/config`, `internal/store` (SQLite), `internal/worker` (Engine
   client and child supervision), `internal/runtime` (resolve, submit, scheduler, commit, doctor,
@@ -394,8 +394,12 @@ a remote process, and no plain-HTTP non-loopback listener can be configured.
 - README and decisions: when to choose each backend; nothing else changes because the protocol
   is unchanged.
 
-Acceptance: every integration test passes against all three backends; the compatibility record
-lists each tested combination.
+Acceptance: the shared SDXL lifecycle passes against all three real backends, and the full
+fixture integration suite passes for every advertised family and transport. Native 1.0.0
+advertises SDXL over loopback only: video, audio, upscale and TLS are not native acceptance
+cases. `TestInferenceBackends` is enabled by `MEDIA_ENGINE_NATIVE` (all three backends) or
+`MEDIA_ENGINE_INFERENCE=1` (both Python backends); opt-in dependency failures fail the run.
+The compatibility record lists each tested combination.
 
 ## Cross-cutting work
 

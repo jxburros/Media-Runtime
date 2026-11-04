@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.0 — 2026-11-04 (development)
+
+Accept native-sdxl and preserve engine ownership in provenance. Add real-backend acceptance
+tests; managed scoped API keys, rate/queue limits, audit, metrics, discovery, diagnostics and
+pairing; managed process/service/catalog/folder operations; explicit pinned acquisition and
+signed completion callbacks; a Python client; offline ComfyUI subset import; shared release
+packaging and CI/GPU jobs. Split the core into admission, resolution, dispatch, outputs and
+diagnostics modules. Protocol1.4 generation and schema3 recipes are in development.
+
+Validation so far: gateway build and targeted standard-library Go/Python tests pass. A
+compile-only Go overlay passed with the unavailable SQLite driver omitted; this is not Runtime
+execution validation. Full local Go tests are blocked by this session's network policy on Go
+module storage. Hosted CI runs the real dependency set. GPU jobs are prepared, not executed.
+The broader review backlog and final integration remain in development in this PR.
+
 ## 0.10.0 — 2026-10-31
 
 Audio, phase R6 of the implementation plan (worker protocol unchanged: `media-worker/1.3`;

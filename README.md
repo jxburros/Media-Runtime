@@ -2,7 +2,7 @@
 
 A standalone, authenticated local media service with a Go CLI/API, terminal dashboard,
 SQLite FIFO jobs, resumable job events, cancellation, durable PNG inputs, immutable PNG outputs and
-provenance. Media Engine is its separately installed SDXL inference worker. Studio connects to this
+provenance. Media Engine is its separately installed image, video and audio inference worker. Studio connects to this
 service through its gateway.
 
 This release implements the **first complete path**, the **operator experience** stage and
@@ -18,9 +18,10 @@ per GPU, with one execution per worker. Release 0.8.0 adds remote workers over m
 0.5.0's network mode) and a network mode for the runtime's own API. Release 0.9.0 speaks
 `media-worker/1.3` (Engine 0.6.0) and adds [video](#video): image-to-video on the `svd` family,
 committed as a lossless frame archive and a poster image. Release 0.10.0 adds [audio](#audio):
-text-to-audio on the `stable-audio-open` family (Engine 0.7.0), committed as a WAV clip. Native
-inference is a later stage, specified in the same document and sequenced in
-[docs/implementation-plan.md](docs/implementation-plan.md).
+text-to-audio on the `stable-audio-open` family (Engine 0.7.0), committed as a WAV clip.
+Release 1.0.0 accepts Engine 1.0.0's `native-sdxl` backend and records its `engine` ownership
+in jobs and manifests. Features are delivered and fixture-tested; real inference acceptance
+uses tiny random-weight bundles on CPU. CUDA and real-weight validation remain outstanding.
 
 ## Install and run
 
@@ -288,14 +289,29 @@ state the choice explicitly. A request for a backend other than the running one 
 leak prompts or grow without bound. Only this child can be terminated after the cancellation grace
 period; forced termination settles the job as `execution_interrupted`, not confirmed cancellation.
 
-The worker contract is [media-worker/1.2](https://github.com/jxburros/Media-Engine/blob/main/docs/protocol.md).
-Runtime 0.5.0 negotiates the highest minor the worker lists: Engine 0.4.0 gives `media-worker/1.2`
+The worker contract is [media-worker/1.3](https://github.com/jxburros/Media-Engine/blob/main/docs/protocol.md).
+Runtime 1.0.0 negotiates the highest minor the worker lists: Engine 0.6.0 and later give
+`media-worker/1.3` (video, and audio from Engine 0.7.0); Engine 0.4.0 gives `media-worker/1.2`
 with multiple outputs, upscaling, loaders, automatic settings, fallbacks and device identity;
 Engine 0.2.0 and later give `media-worker/1.1` with image-to-image and (Engine 0.3.0) LoRA adapters;
 Engine 0.1.0 gives `media-worker/1.0` with text-to-image only. Every 1.2 feature is refused with
 `unsupported` naming the field against an older worker. There is one
 active execution per worker and at most 32 queued jobs by default; all operational limits are in the config.
 Requested model, backend, seed, dimensions, precision and scheduler are never silently changed.
+
+## Choosing a backend
+
+- `diffusers-sdxl`: the reference implementation; SDXL, ESRGAN, SVD and Stable Audio Open.
+- `owned-sdxl`: the owned Python SDXL pipeline and ESRGAN upscaler.
+- `native-sdxl`: the standalone Rust binary; SDXL text-to-image, image-to-image and LoRA.
+  It requires no Python installation on the serving host, binds loopback only, and currently
+  advertises no video, audio, upscaling or optimization support.
+
+For native inference, set `worker.command` to the `media-engine-native` binary with
+`--catalog`, `--directory`, `--device` and `--port 0`, and set `worker.backend_id` to
+`native-sdxl`. See [the native configuration](examples/runtime.native.config.json).
+Select it per request with `--backend native-sdxl`; its load options use the `native-sdxl`
+namespace. The advertised capabilities still determine whether a request is accepted.
 
 ## Worker pool
 

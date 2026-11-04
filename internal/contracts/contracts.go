@@ -16,16 +16,16 @@ import (
 	"github.com/jxburros/media-runtime/internal/jsonv"
 )
 
-const VERSION = "0.10.0"
+const VERSION = "1.1.0"
 
-var PROTOCOLS = []string{"media-worker/1.0", "media-worker/1.1", "media-worker/1.2", "media-worker/1.3"}
+var PROTOCOLS = []string{"media-worker/1.0", "media-worker/1.1", "media-worker/1.2", "media-worker/1.3", "media-worker/1.4"}
 var PROTOCOL = PROTOCOLS[len(PROTOCOLS)-1]
-var BACKENDS = []string{"diffusers-sdxl", "owned-sdxl"}
-var TASKS = []string{"text-to-image", "image-to-image", "upscale", "image-to-video", "text-to-audio"}
+var BACKENDS = []string{"diffusers-sdxl", "owned-sdxl", "native-sdxl"}
+var TASKS = []string{"text-to-image", "image-to-image", "upscale", "image-to-video", "text-to-audio", "inpaint", "image-transform"}
 
 // FAMILIES are the model families a registration may name, with the tasks each serves.
 var FAMILIES = map[string][]string{
-	"sdxl-base":         {"text-to-image", "image-to-image"},
+	"sdxl-base":         {"text-to-image", "image-to-image", "inpaint", "image-transform"},
 	"esrgan":            {"upscale"},
 	"svd":               {"image-to-video"},
 	"stable-audio-open": {"text-to-audio"},
@@ -60,6 +60,8 @@ func TaskFamily(task string) string {
 // TaskMinor is the lowest protocol minor a task needs.
 func TaskMinor(task string) int {
 	switch task {
+	case "inpaint", "image-transform":
+		return 4
 	case "image-to-image":
 		return 1
 	case "upscale":
@@ -83,12 +85,12 @@ func FamilyMinor(family string) int {
 
 // UsesImage reports whether a task takes an uploaded image input.
 func UsesImage(task string) bool {
-	return task == "image-to-image" || task == "upscale" || task == "image-to-video"
+	return task == "image-transform" || task == "inpaint" || task == "image-to-image" || task == "upscale" || task == "image-to-video"
 }
 
 // UsesPrompt reports whether a task is conditioned on a text prompt.
 func UsesPrompt(task string) bool {
-	return task != "upscale" && task != "image-to-video"
+	return task != "image-transform" && task != "upscale" && task != "image-to-video"
 }
 
 // Minor is the minor number of a negotiated protocol (media-worker/1.N).
@@ -123,12 +125,22 @@ var parameterFields = []Field{
 	{Name: "steps", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(150)})},
 	{Name: "guidance", Check: Num(NumOpts{Min: F(0), Max: F(30)})},
 	{Name: "seed", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(4294967295)})},
-	{Name: "sampler", Check: Literal("euler")},
-	{Name: "scheduler", Check: Literal("euler")},
+	{Name: "sampler", Check: Enum("euler", "euler-ancestral", "dpmpp-2m", "ddim", "unipc")},
+	{Name: "scheduler", Check: Enum("euler", "karras", "ddim", "unipc")},
 	{Name: "strength", Check: Num(NumOpts{GreaterThan: F(0), Max: F(1)}), Optional: true},
+	{Name: "preview_interval", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(50)}), Optional: true},
 	{Name: "count", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(MaxCount)}), Optional: true},
 }
 
+var transformFields = []Field{
+	{Name: "operation", Check: Enum("resize", "crop", "pad", "composite")},
+	{Name: "filter", Check: Enum("nearest", "bilinear"), Optional: true},
+	{Name: "x", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(2048)}), Optional: true},
+	{Name: "y", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(2048)}), Optional: true},
+	{Name: "background", Check: Array(Num(NumOpts{Int: true, Min: F(0), Max: F(255)}), ArrOpts{Min: 3, Max: 3}), Optional: true},
+	{Name: "opacity", Check: Num(NumOpts{Min: F(0), Max: F(1)}), Optional: true},
+}
+var TransformParameters = StrictObject(append(append([]Field{}, parameterFields[:2]...), transformFields...)...)
 var tileFields = []Field{
 	{Name: "tile", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(8192)})},
 	{Name: "tile_overlap", Check: Num(NumOpts{Int: true, Min: F(0), Max: F(64)})},
@@ -142,10 +154,11 @@ var videoFields = []Field{
 	{Name: "motion", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(255)})},
 	{Name: "noise_augmentation", Check: Num(NumOpts{Min: F(0), Max: F(1)})},
 	{Name: "decode_chunk", Check: Num(NumOpts{Int: true, Min: F(1), Max: F(16)})},
+	{Name: "encode_video", Check: Bool(), Optional: true},
 }
 
 // VideoParameterNames are the parameters an image-to-video request may carry.
-var VideoParameterNames = []string{"width", "height", "seed", "steps", "frames", "fps", "motion", "noise_augmentation", "decode_chunk"}
+var VideoParameterNames = []string{"width", "height", "seed", "steps", "frames", "fps", "motion", "noise_augmentation", "decode_chunk", "encode_video"}
 
 // MaxDiffusionSteps bounds steps on the image tasks; MaxAudioSteps on text-to-audio, whose
 // protocol range is wider. The worker's advertised limits apply within both.
@@ -168,11 +181,13 @@ var AudioParameterNames = []string{"seed", "steps", "guidance", "duration_second
 
 // TaskParameterNames are the parameters each task takes; any other parameter is refused by name.
 var TaskParameterNames = map[string][]string{
-	"text-to-image":  {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "count"},
-	"image-to-image": {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "strength"},
-	"upscale":        {"width", "height", "tile", "tile_overlap"},
-	"image-to-video": VideoParameterNames,
-	"text-to-audio":  AudioParameterNames,
+	"text-to-image":   {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "count", "preview_interval"},
+	"image-to-image":  {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "strength", "preview_interval"},
+	"inpaint":         {"width", "height", "steps", "guidance", "seed", "sampler", "scheduler", "strength", "preview_interval"},
+	"upscale":         {"width", "height", "tile", "tile_overlap"},
+	"image-to-video":  VideoParameterNames,
+	"text-to-audio":   AudioParameterNames,
+	"image-transform": {"width", "height", "operation", "filter", "x", "y", "background", "opacity"},
 }
 
 // MediaParameter reports whether a parameter belongs only to the video or audio tasks.
@@ -202,7 +217,7 @@ var AudioParameters = StrictObject(parameterFields[4], audioSteps, parameterFiel
 // PartialParameters is a request's or recipe's parameter overrides for any task. Its steps
 // bound is the widest task's (audio); the image tasks' 150 is checked at resolution.
 var PartialParameters = StrictObject(Partial(append(append(append(append([]Field{}, parameterFields[:2]...), audioSteps), parameterFields[3:]...),
-	append(append(append([]Field{}, tileFields...), videoFields...), audioFields...)...))...)
+	append(append(append(append([]Field{}, tileFields...), videoFields...), audioFields...), transformFields...)...))...)
 
 // Prompt is a non-blank prompt; diffusion tasks require one and upscale forbids it.
 var Prompt = Str(StrOpts{Min: 1, Max: 10000, Refine: func(s string) bool { return strings.TrimFunc(s, isJSSpace) != "" }})
@@ -211,12 +226,14 @@ var Inputs = StrictObject(
 	Field{Name: "prompt", Check: Prompt, Optional: true},
 	Field{Name: "negative_prompt", Check: Str(StrOpts{Max: 10000}), Optional: true},
 	Field{Name: "image", Check: InputID, Optional: true},
+	Field{Name: "mask", Check: InputID, Optional: true},
+	Field{Name: "overlay", Check: InputID, Optional: true},
 )
 
 var loadOptionFields = []Field{
 	{Name: "precision", Check: Enum("float16", "float32", "auto")},
 	{Name: "attention", Check: Literal("sdpa")},
-	{Name: "offload", Check: Literal("none")},
+	{Name: "offload", Check: Enum("none", "model", "sequential")},
 }
 
 var LoadOptions = StrictObject(loadOptionFields...)
@@ -230,6 +247,7 @@ var AdapterUse = StrictObject(
 var adapterList = Array(AdapterUse, ArrOpts{Max: MaxAdapters})
 
 var Submission = StrictObject(
+	Field{Name: "keep_loaded", Check: Bool(), Optional: true},
 	Field{Name: "recipe_id", Check: ID},
 	Field{Name: "model_id", Check: ID},
 	Field{Name: "inputs", Check: submissionInputs},
@@ -239,6 +257,7 @@ var Submission = StrictObject(
 	Field{Name: "backend_options", Check: StrictObject(
 		Field{Name: "diffusers-sdxl", Check: partialLoadOptions, Optional: true},
 		Field{Name: "owned-sdxl", Check: partialLoadOptions, Optional: true},
+		Field{Name: "native-sdxl", Check: partialLoadOptions, Optional: true},
 	), Optional: true},
 	Field{Name: "retry_of", Check: ID, Optional: true},
 	Field{Name: "authorized_fallbacks", Check: Array(Enum(FALLBACKS...), ArrOpts{Max: len(FALLBACKS)}), Optional: true},
@@ -264,6 +283,8 @@ var recipeSchemaV1 = Refine(StrictObject(
 			Field{Name: "type", Check: Literal("image")},
 			Field{Name: "required", Check: Literal(true)},
 		), Optional: true},
+		Field{Name: "mask", Check: StrictObject(Field{Name: "type", Check: Literal("image")}, Field{Name: "required", Check: Literal(true)}), Optional: true},
+		Field{Name: "overlay", Check: StrictObject(Field{Name: "type", Check: Literal("image")}, Field{Name: "required", Check: Literal(true)}), Optional: true},
 	)},
 	Field{Name: "defaults", Check: PartialParameters},
 	Field{Name: "adapters", Check: adapterList, Optional: true},
@@ -275,6 +296,8 @@ var recipeSchemaV1 = Refine(StrictObject(
 		return false
 	}
 	switch {
+	case pipeline == "inpaint":
+		return inputs.Has("prompt") && inputs.Has("image") && inputs.Has("mask") && !inputs.Has("overlay")
 	case pipeline == "image-to-image":
 		return inputs.Has("prompt") && inputs.Has("image")
 	case !UsesPrompt(pipeline):
@@ -324,6 +347,7 @@ func DefaultRecipes() []*jsonv.Object {
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"enlarge","revision":1,"pipeline":"upscale","model_family":"esrgan","inputs":{"image":{"type":"image","required":true}},"defaults":{"tile":0,"tile_overlap":16}}`),
 		// steps is the recipe's: the worker has no default for video steps (fps, motion,
 		// noise_augmentation and decode_chunk come from its task_defaults, frames from the bundle).
+		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"inpaint","revision":1,"pipeline":"inpaint","model_family":"sdxl-base","inputs":{"prompt":{"type":"string","required":true},"image":{"type":"image","required":true},"mask":{"type":"image","required":true}},"defaults":{"steps":30,"strength":0.75}}`),
 		mustParse(RecipeSchema, `{"schema_version":1,"recipe_id":"animate","revision":1,"pipeline":"image-to-video","model_family":"svd","inputs":{"image":{"type":"image","required":true}},"defaults":{"steps":25}}`),
 		// steps and duration_seconds are the recipe's: the worker requires both and defaults only
 		// guidance; the clip length is the operator's choice, refused rather than trimmed when a

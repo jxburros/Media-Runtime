@@ -27,9 +27,11 @@ var OpID = Str(StrOpts{Max: 32, Pattern: opIDPattern})
 // TaskOutputs are the base output IDs each task produces; repeated outputs expand to id_2 …
 // at execution time from the worker's task_parameters.
 var TaskOutputs = map[string][]string{
-	"text-to-image":  {"image"},
-	"image-to-image": {"image"},
-	"upscale":        {"image"},
+	"text-to-image":   {"image"},
+	"image-to-image":  {"image"},
+	"inpaint":         {"image"},
+	"image-transform": {"image"},
+	"upscale":         {"image"},
 	// video is committed only when the worker advertises it (an encoded video/mp4); the runtime
 	// never encodes one itself.
 	"image-to-video": {"frames", "poster", "video"},
@@ -50,6 +52,7 @@ var OutputMIME = map[string]string{
 var TaskParameterInputs = map[string][]string{
 	"text-to-image":  {"width", "height", "steps", "guidance", "seed", "count"},
 	"image-to-image": {"steps", "guidance", "seed", "strength"},
+	"inpaint":        {"steps", "guidance", "seed", "strength"},
 	"upscale":        {"tile", "tile_overlap"},
 	"image-to-video": {"seed", "steps", "frames", "fps", "motion", "noise_augmentation", "decode_chunk"},
 	"text-to-audio":  {"seed", "steps", "guidance", "duration_seconds"},
@@ -127,6 +130,16 @@ var recipeSchemaV2 = StrictObject(
 
 // RecipeSchema accepts schema 1 exactly as before and schema 2 linear recipes.
 func RecipeSchema(v any, path []string) (any, error) {
+	if in, ok := v.(*jsonv.Object); ok && in.Get("schema_version") == 3.0 {
+		out, err := recipeSchemaV3(v, path)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkDAG(out.(*jsonv.Object), path); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
 	if in, ok := v.(*jsonv.Object); ok && in.Get("schema_version") == 2.0 {
 		out, err := recipeSchemaV2(v, path)
 		if err != nil {
@@ -159,6 +172,14 @@ func taskInputType(task, key string) string {
 	case "prompt", "negative_prompt":
 		if UsesPrompt(task) {
 			return "string"
+		}
+	case "overlay":
+		if task == "image-transform" {
+			return "image"
+		}
+	case "mask":
+		if task == "inpaint" {
+			return "image"
 		}
 	case "image":
 		if UsesImage(task) {
@@ -211,8 +232,11 @@ func checkLinear(r *jsonv.Object, path []string) error {
 				}
 				used[name] = true
 			case "op":
+				if key != "image" {
+					return Invalid(at(at(at(here, "inputs"), key), "from"))
+				}
 				producer, earlier := ops[name]
-				if !earlier || want != "image" || !Contains(TaskOutputs[producer], output) || OutputMIME[output] != "image/png" {
+				if !earlier || want != "image" || !RecipeOutput(producer, output, r.Get("schema_version") == 3.0) || OutputType(output) != "image/png" {
 					return Invalid(at(at(at(here, "inputs"), key), "from"))
 				}
 			}
@@ -240,7 +264,7 @@ func checkLinear(r *jsonv.Object, path []string) error {
 		entry := raw.(string)
 		parts := strings.SplitN(entry, "/", 2)
 		task, ok := ops[parts[0]]
-		if !ok || !Contains(TaskOutputs[task], parts[1]) || seen[entry] {
+		if !ok || !RecipeOutput(task, parts[1], r.Get("schema_version") == 3.0) || seen[entry] {
 			return Invalid(at(at(path, "publish"), strconv.Itoa(i)))
 		}
 		seen[entry] = true
@@ -250,9 +274,11 @@ func checkLinear(r *jsonv.Object, path []string) error {
 
 func requiredInputs(task string) []string {
 	switch task {
+	case "inpaint":
+		return []string{"prompt", "image", "mask"}
 	case "image-to-image":
 		return []string{"prompt", "image"}
-	case "upscale", "image-to-video":
+	case "upscale", "image-to-video", "image-transform":
 		return []string{"image"}
 	}
 	return []string{"prompt"}
@@ -264,7 +290,14 @@ func defaultsServe(pipeline string, defaults *jsonv.Object, adapters bool) bool 
 		return false
 	}
 	switch pipeline {
-	case "image-to-image":
+	case "image-transform":
+		for _, k := range defaults.Keys() {
+			if !Contains(TaskParameterNames[pipeline], k) {
+				return false
+			}
+		}
+		return !adapters
+	case "image-to-image", "inpaint":
 		return !defaults.Has("count") && !hasTile(defaults) && !hasVideo(defaults)
 	case "upscale":
 		// An upscale takes one image; only tiling has defaults and nothing adapts the network.
@@ -308,7 +341,7 @@ func hasVideo(defaults *jsonv.Object) bool {
 // after the recipe whose inputs keep their names; its declarations are the inputs schema 1
 // accepted (negative_prompt was always optional on diffusion pipelines).
 func NormalizeRecipe(recipe *jsonv.Object) *jsonv.Object {
-	if recipe.Get("schema_version") == 2.0 {
+	if IsLinear(recipe) {
 		out := recipe.Clone()
 		if !out.Has("publish") {
 			last := out.Arr("operations")[len(out.Arr("operations"))-1].(*jsonv.Object)
@@ -418,7 +451,7 @@ var namedInputs = keyed(inputNamePattern, func(v any, path []string) (any, error
 
 // reservedInputs keep their schema-1 types in every recipe, so a submission using only these
 // names is validated exactly as before.
-var reservedInputs = map[string]string{"prompt": "string", "negative_prompt": "string", "image": "image"}
+var reservedInputs = map[string]string{"prompt": "string", "negative_prompt": "string", "image": "image", "mask": "image", "overlay": "image"}
 
 // submissionInputs accepts the schema-1 inputs exactly as before, else named schema-2 inputs
 // when the submission uses a name schema 1 does not know; otherwise the schema-1 error stands.
@@ -440,4 +473,6 @@ func submissionInputs(v any, path []string) (any, error) {
 }
 
 // IsLinear reports whether a recipe snapshot is schema 2.
-func IsLinear(recipe *jsonv.Object) bool { return recipe.Get("schema_version") == 2.0 }
+func IsLinear(recipe *jsonv.Object) bool {
+	return recipe.Get("schema_version") == 2.0 || recipe.Get("schema_version") == 3.0
+}

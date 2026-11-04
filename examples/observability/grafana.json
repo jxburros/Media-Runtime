@@ -1,0 +1,13 @@
+{
+  "title": "Media Runtime",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {"id": 1, "title": "Queue depth", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}, "targets": [{"expr": "media_runtime_queue_depth", "legendFormat": "queued"}]},
+    {"id": 2, "title": "Worker busy", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}, "targets": [{"expr": "media_runtime_worker_busy", "legendFormat": "{{worker}}"}]},
+    {"id": 3, "title": "Jobs retained by recipe and state", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}, "targets": [{"expr": "media_runtime_jobs", "legendFormat": "{{recipe}} / {{state}}"}]},
+    {"id": 4, "title": "Worker peak memory", "type": "timeseries", "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}, "fieldConfig": {"defaults": {"unit": "bytes"}}, "targets": [{"expr": "media_engine_peak_memory_bytes", "legendFormat": "{{worker}}"}]}
+  ]
+}

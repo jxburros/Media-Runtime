@@ -79,9 +79,9 @@ Use `--only text-to-image,upscale` or `--skip cancel` to pick checks.
 A check is **skipped**, not failed, when its model isn't configured or the running Engine
 doesn't advertise the task or family. That way the same run works against older releases, today's
 releases and later ones. When a planned release lands, rerun the testbench: a skip that turns into
-a pass means the feature arrived. The planned native backend shows up the same way. Today Engine
-1.0.0's `media-engine-native` passes `engine`, and Runtime 0.10.0 refuses its `native-sdxl`
-backend, which the report says plainly. Runtime 1.0.0 (phase R7) is planned to accept it.
+a pass means the feature arrived. Runtime 1.0.0 accepts Engine 1.0.0's `native-sdxl`
+backend. Its SDXL checks run normally; upscaling, video, audio and network mode remain
+unadvertised by the native binary and are checked against the Python workers.
 
 ## Poking around by hand
 

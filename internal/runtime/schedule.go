@@ -27,9 +27,24 @@ type Assignment struct {
 // FIFO is literal: when a job has no eligible idle worker, no later job is dispatched ahead of
 // it unless reorder is set, in which case later jobs may use the workers it cannot.
 func Assign(queued []*jsonv.Object, lanes []Lane, reorder bool) []Assignment {
+	return assignWithKeyLimits(queued, lanes, reorder, nil)
+}
+func assignWithKeyLimits(queued []*jsonv.Object, lanes []Lane, reorder bool, running map[string]int) []Assignment {
+	counts := map[string]int{}
+	for id, n := range running {
+		counts[id] = n
+	}
 	out := []Assignment{}
 	taken := map[string]bool{}
 	for _, job := range queued {
+		key := job.Str("key_id")
+		limit, _ := job.Num("key_concurrency_limit")
+		if key != "" && limit > 0 && counts[key] >= int(limit) {
+			if reorder {
+				continue
+			}
+			break
+		}
 		match, any := "", ""
 		for _, lane := range lanes {
 			if taken[lane.ID] || !lane.Idle || !Eligible(job, lane) {
@@ -52,6 +67,7 @@ func Assign(queued []*jsonv.Object, lanes []Lane, reorder bool) []Assignment {
 			}
 			break
 		}
+		counts[key]++
 		taken[chosen] = true
 		out = append(out, Assignment{Job: job, WorkerID: chosen})
 	}
@@ -147,7 +163,11 @@ func (r *Runtime) next(m *pool.Member) *jsonv.Object {
 		}
 		lanes = append(lanes, lane)
 	}
-	for _, a := range Assign(queued, lanes, r.Config.AllowReordering) {
+	activeKeys := map[string]int{}
+	for _, job := range r.Store.All("running") {
+		activeKeys[job.Str("key_id")]++
+	}
+	for _, a := range assignWithKeyLimits(queued, lanes, r.Config.AllowReordering, activeKeys) {
 		if a.WorkerID == m.ID {
 			return a.Job
 		}

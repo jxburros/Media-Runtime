@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+media_runtime/__init__.py
+media_runtime_client.egg-info/PKG-INFO
+media_runtime_client.egg-info/SOURCES.txt
+media_runtime_client.egg-info/dependency_links.txt
+media_runtime_client.egg-info/top_level.txt
+tests/test_client.py

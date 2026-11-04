@@ -37,6 +37,9 @@ func EngineRepo(t testing.TB) string {
 	}
 	abs, _ := filepath.Abs(repo)
 	if _, err := os.Stat(filepath.Join(abs, "tests", "serve_fixture.py")); err != nil {
+		if os.Getenv("MEDIA_ENGINE_NATIVE") != "" || os.Getenv("MEDIA_ENGINE_INFERENCE") == "1" {
+			t.Fatalf("Real inference acceptance needs Media Engine at %s; set MEDIA_ENGINE_REPO", abs)
+		}
 		t.Skipf("Media Engine fixture not found at %s; set MEDIA_ENGINE_REPO", abs)
 	}
 	return abs
@@ -70,6 +73,12 @@ func StartFixture(t testing.TB, root string, args ...string) *Fixture {
 	t.Helper()
 	engine := EngineRepo(t)
 	command := FixtureCommand(engine, root, args...)
+	return StartCommand(t, engine, command)
+}
+
+// StartCommand launches a real or fixture worker using the same startup contract.
+func StartCommand(t testing.TB, engine string, command []string) *Fixture {
+	t.Helper()
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Env = append(os.Environ(), "PYTHONPATH="+filepath.Join(engine, "src"), "MEDIA_ENGINE_TOKEN="+WorkerToken)
 	var stderr bytes.Buffer
@@ -108,6 +117,7 @@ func StartFixture(t testing.TB, root string, args ...string) *Fixture {
 		case <-done:
 		case <-time.After(5 * time.Second):
 			_ = cmd.Process.Kill()
+			<-done
 		}
 	})
 	port, _ := discovery.Num("port")

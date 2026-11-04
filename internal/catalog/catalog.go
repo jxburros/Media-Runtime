@@ -126,6 +126,24 @@ func BuildBundle(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 		return nil, c.Err(400, "missing_component", "Approved bundle directory is unavailable")
 	}
 	files := jsonv.NewObject()
+	if info, statErr := os.Stat(root); statErr == nil && info.Mode().IsRegular() {
+		if data.Str("family") != "esrgan" {
+			return nil, c.Err(400, "unsupported", "A single-file checkpoint must be converted before registration", "format")
+		}
+		if !strings.HasSuffix(root, ".safetensors") {
+			return nil, c.Err(400, "unsupported", "File handles must name safetensors weights", "artifact_handle")
+		}
+		weights, err := fileDigest(root)
+		if err != nil {
+			return nil, err
+		}
+		configuration, err := fileDigest(root + ".json")
+		if err != nil {
+			return nil, c.Err(400, "missing_component", "A file upscaler needs its .safetensors.json companion", "configuration")
+		}
+		files.Set(filepath.Base(root), weights).Set("config.json", configuration)
+		return buildSingleFile(data, root, files)
+	}
 	var walk func(relative string) error
 	walk = func(relative string) error {
 		names, err := readdir(filepath.Join(root, relative))
@@ -141,7 +159,17 @@ func BuildBundle(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 			}
 			switch {
 			case info.Mode()&os.ModeSymlink != 0:
-				return c.Err(400, "unsupported", "Bundle symlinks are not supported")
+				if !approvedSnapshotLink(root, path) {
+					return c.Err(400, "unsupported", "Bundle symlinks are not supported outside an approved Hugging Face snapshot")
+				}
+				if forbidden.MatchString(name) {
+					return c.Err(400, "unsupported", "Use a complete safetensors-only Diffusers bundle")
+				}
+				digest, err := fileDigest(path)
+				if err != nil {
+					return err
+				}
+				files.Set(key, digest)
 			case info.IsDir():
 				if err := walk(key); err != nil {
 					return err
@@ -272,7 +300,11 @@ func singleFileLayout(files *jsonv.Object) (string, bool) {
 // networkConfig reads an upscaler's config.json; ok is false unless it names an RRDB network
 // with an integer scale.
 func networkConfig(root string) (architecture string, scale float64, ok bool) {
-	config, err := readJSON(filepath.Join(root, "config.json"))
+	configPath := filepath.Join(root, "config.json")
+	if info, err := os.Stat(root); err == nil && info.Mode().IsRegular() {
+		configPath = root + ".json"
+	}
+	config, err := readJSON(configPath)
 	if err != nil {
 		return "", 0, false
 	}
@@ -399,6 +431,10 @@ func Inspect(catalog *jsonv.Object, handle string) []any {
 			continue
 		}
 		configured := catalog.Str(artifactHandle)
+		if info, err := os.Stat(configured); err == nil && info.Mode().IsRegular() {
+			entries = append(entries, inspectFile(artifactHandle, configured, info))
+			continue
+		}
 		roles := jsonv.NewObject()
 		for _, r := range ROLES {
 			roles.Set(r, jsonv.O("present", false, "safetensors", 0.0, "files", 0.0))
@@ -477,8 +513,14 @@ func Inspect(catalog *jsonv.Object, handle string) []any {
 					return err
 				}
 				if info.Mode()&os.ModeSymlink != 0 {
-					symlinks = append(symlinks, key)
-					continue
+					if !approvedSnapshotLink(root, filepath.Join(root, key)) {
+						symlinks = append(symlinks, key)
+						continue
+					}
+					info, err = os.Stat(filepath.Join(root, key))
+					if err != nil {
+						return err
+					}
 				}
 				if info.IsDir() {
 					if err := walk(key); err != nil {
@@ -622,6 +664,17 @@ func BuildAdapter(raw any, catalog *jsonv.Object) (*jsonv.Object, error) {
 	}
 	files := jsonv.NewObject()
 	err = func() error {
+		if info, err := os.Stat(root); err == nil && info.Mode().IsRegular() {
+			if !strings.HasSuffix(root, ".safetensors") {
+				return c.Err(400, "unsupported", "File handles must name safetensors weights")
+			}
+			digest, err := fileDigest(root)
+			if err != nil {
+				return err
+			}
+			files.Set(filepath.Base(root), digest)
+			return nil
+		}
 		names, err := readdir(root)
 		if err != nil {
 			return err
